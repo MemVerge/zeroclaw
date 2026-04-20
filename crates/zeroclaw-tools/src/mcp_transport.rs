@@ -149,6 +149,10 @@ impl McpTransportConn for StdioTransport {
 /// HTTP-based transport (POST requests).
 pub struct HttpTransport {
     url: String,
+    /// Per-server tool-call SSE read timeout, from `McpServerConfig.tool_timeout_secs`.
+    /// `None` falls back to `RECV_TIMEOUT_SECS` for backwards compatibility.
+    /// Does not affect init/list, which use their own wrapper in `mcp_client`.
+    tool_timeout_secs: Option<u64>,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
     session_id: Option<String>,
@@ -169,6 +173,7 @@ impl HttpTransport {
 
         Ok(Self {
             url,
+            tool_timeout_secs: config.tool_timeout_secs,
             client,
             headers: config.headers.clone(),
             session_id: None,
@@ -247,8 +252,9 @@ impl McpTransportConn for HttpTransport {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
         if is_sse {
+            let sse_timeout = self.tool_timeout_secs.unwrap_or(RECV_TIMEOUT_SECS);
             let maybe_resp = timeout(
-                Duration::from_secs(RECV_TIMEOUT_SECS),
+                Duration::from_secs(sse_timeout),
                 read_first_jsonrpc_from_sse_response(resp),
             )
             .await
