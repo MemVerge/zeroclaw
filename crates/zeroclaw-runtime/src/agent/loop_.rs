@@ -1220,9 +1220,7 @@ pub async fn run_tool_call_loop(
 
                 if calls.is_empty() {
                     let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                    if !fallback_text.is_empty() {
-                        parsed_text = fallback_text;
-                    }
+                    parsed_text = fallback_text;
                     calls = fallback_calls;
                 }
 
@@ -1355,10 +1353,15 @@ pub async fn run_tool_call_loop(
             }
         };
 
-        let display_text = if parsed_text.is_empty() {
+        // When tools were parsed from XML/prompt text but stripping removed everything,
+        // do not fall back to raw `response_text`—that would leak <tool_call>… and JSON
+        // into user-visible chunks.
+        let display_text = if !parsed_text.is_empty() {
+            parsed_text
+        } else if tool_calls.is_empty() {
             response_text.clone()
         } else {
-            parsed_text
+            String::new()
         };
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
