@@ -2,7 +2,7 @@ name: Quality Gate
 
 on:
   pull_request:
-    branches: [master]
+    branches: [master, membox]
 
 concurrency:
   group: ci-${{ github.event.pull_request.number }}
