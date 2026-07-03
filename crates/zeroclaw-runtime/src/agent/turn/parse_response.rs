@@ -29,11 +29,17 @@ pub(crate) fn build_native_assistant_history(
     let calls_json: Vec<serde_json::Value> = tool_calls
         .iter()
         .map(|tc| {
-            serde_json::json!({
+            let mut call = serde_json::json!({
                 "id": tc.id,
                 "name": tc.name,
                 "arguments": tc.arguments,
-            })
+            });
+            if let Some(extra_content) = &tc.extra_content {
+                call.as_object_mut()
+                    .unwrap()
+                    .insert("extra_content".to_string(), extra_content.clone());
+            }
+            call
         })
         .collect();
 
@@ -299,7 +305,32 @@ pub(crate) async fn interpret_chat_response(
 
 #[cfg(test)]
 mod tests {
-    use super::unforwarded_narration;
+    use super::{build_native_assistant_history, unforwarded_narration};
+    use zeroclaw_providers::ToolCall;
+
+    #[test]
+    fn native_assistant_history_preserves_tool_call_extra_content() {
+        let history = build_native_assistant_history(
+            "",
+            &[ToolCall {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: Some(serde_json::json!({
+                    "google": {
+                        "thought_signature": "sig_1"
+                    }
+                })),
+            }],
+            None,
+        );
+
+        let value = serde_json::from_str::<serde_json::Value>(&history).unwrap();
+        assert_eq!(
+            value["tool_calls"][0]["extra_content"],
+            serde_json::json!({"google": {"thought_signature": "sig_1"}})
+        );
+    }
 
     #[test]
     fn returns_suffix_when_streamed_text_is_a_prefix() {
