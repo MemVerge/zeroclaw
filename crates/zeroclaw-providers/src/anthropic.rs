@@ -833,9 +833,12 @@ impl AnthropicModelProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        // No total-request timeout: SSE bodies for long-form generations can
+        // legitimately stay open for several minutes of active streaming.
+        // `SSE_IDLE_TIMEOUT` (per-line, above) already bounds a genuinely
+        // stalled connection. See #2404.
+        zeroclaw_config::schema::build_runtime_proxy_streaming_client(
             "model_provider.anthropic",
-            120,
             10,
         )
     }
@@ -890,9 +893,46 @@ impl AnthropicModelProvider {
         let mut cached_input_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
 
-        while let Ok(Some(line)) =
-            match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
-                Ok(read) => read,
+        loop {
+            let line = match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => {
+                    // Clean EOF without a terminal `message_stop` — the
+                    // connection closed (or a proxy truncated the body)
+                    // before Anthropic signaled completion. The previous
+                    // code treated this the same as a well-formed
+                    // `message_stop` and emitted `Final`, so a short partial
+                    // reply (e.g. an intro sentence before the body was cut
+                    // off) was recorded as a successful turn. See #2404.
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "stream: SSE connection closed before message_stop"
+                    );
+                    let _ = tx
+                        .send(Err(StreamError::Http(
+                            "SSE stream ended before message_stop (truncated response)".to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+                Ok(Err(read_error)) => {
+                    // A transport read error (e.g. reqwest's total-request
+                    // timeout killing the body mid-stream) must not be
+                    // conflated with a clean end-of-stream — propagate it so
+                    // callers retry instead of recording a truncated partial
+                    // reply as success. See #2404.
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": read_error.to_string()})),
+                        "stream: SSE read error before message_stop"
+                    );
+                    let _ = tx.send(Err(StreamError::Io(read_error))).await;
+                    return;
+                }
                 Err(_) => {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -911,8 +951,8 @@ impl AnthropicModelProvider {
                         .await;
                     return;
                 }
-            }
-        {
+            };
+
             let line = line.trim().to_string();
             if !line.starts_with("data: ") {
                 continue;
@@ -1117,19 +1157,6 @@ impl AnthropicModelProvider {
                 _ => {}
             }
         }
-
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                .with_category(::zeroclaw_log::EventCategory::Provider)
-                .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                .with_attrs(::serde_json::json!({
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                })),
-            "stream: SSE parser reached end of stream, emitting Final"
-        );
-        let _ = tx.send(Ok(StreamEvent::Final)).await;
     }
 }
 
@@ -1910,6 +1937,108 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
         assert!(
             probe.is_finished(),
             "guard drop must abort the parser task immediately, not wait out the idle timeout"
+        );
+    }
+
+    /// A reader that yields one buffer of valid SSE bytes, then reports a
+    /// transport read error — models a connection killed mid-body (e.g.
+    /// reqwest's total-request timeout firing while bytes are still being
+    /// drained).
+    struct ReadErrorAfterReader {
+        data: std::io::Cursor<Vec<u8>>,
+        drained: bool,
+    }
+
+    impl tokio::io::AsyncRead for ReadErrorAfterReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.drained {
+                return std::task::Poll::Ready(Err(std::io::Error::other(
+                    "connection reset by peer",
+                )));
+            }
+            let before = buf.filled().len();
+            let inner = std::pin::Pin::new(&mut self.data);
+            let res = inner.poll_read(cx, buf);
+            if buf.filled().len() == before {
+                self.drained = true;
+                return std::task::Poll::Ready(Err(std::io::Error::other(
+                    "connection reset by peer",
+                )));
+            }
+            res
+        }
+    }
+
+    #[tokio::test]
+    async fn read_error_after_partial_text_propagates_instead_of_final() {
+        // Repro for #2404: Claude emits a short intro sentence, then the
+        // connection is killed mid-body (reqwest's total-request timeout, a
+        // proxy hiccup, etc). The parser must surface a StreamError so the
+        // caller retries — not silently emit `Final` and let the partial
+        // reply be recorded as a successful turn.
+        let partial = b"event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"I'll write that now.\"}}\n\n"
+            .to_vec();
+        let reader = tokio::io::BufReader::new(ReadErrorAfterReader {
+            data: std::io::Cursor::new(partial),
+            drained: false,
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+
+        assert!(
+            matches!(events.first(), Some(Ok(StreamEvent::TextDelta(_)))),
+            "expected the partial text delta first, got {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Err(StreamError::Io(_)))),
+            "read error must propagate as StreamError::Io, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))),
+            "must never emit Final when the stream was cut short by a read error, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_before_message_stop_is_reported_as_error_not_final() {
+        // Repro for #2404: the connection closes cleanly (EOF) but Anthropic
+        // never sent `message_stop` — e.g. a load balancer closing the
+        // socket after the body was already truncated. Must not be treated
+        // as a successful completion.
+        use std::io::Cursor;
+
+        let bytes = b"event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+
+        assert!(
+            matches!(events.last(), Some(Err(StreamError::Http(_)))),
+            "EOF before message_stop must surface an error, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))),
+            "must never emit Final on truncated EOF, got {events:?}"
         );
     }
 
