@@ -833,6 +833,14 @@ impl AnthropicModelProvider {
     }
 
     fn http_client(&self) -> Client {
+        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+            "model_provider.anthropic",
+            120,
+            10,
+        )
+    }
+
+    fn streaming_http_client(&self) -> Client {
         // No total-request timeout: SSE bodies for long-form generations can
         // legitimately stay open for several minutes of active streaming.
         // `SSE_IDLE_TIMEOUT` (per-line, above) already bounds a genuinely
@@ -1637,7 +1645,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         let body = Self::build_streaming_request(&native_request);
-        let client = self.http_client();
+        let client = self.streaming_http_client();
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
 
