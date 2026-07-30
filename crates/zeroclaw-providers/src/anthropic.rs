@@ -639,6 +639,7 @@ impl AnthropicModelProvider {
             }
         }
 
+        Self::degrade_orphaned_tool_results(&mut native_messages);
         Self::backfill_orphaned_tool_uses(&mut native_messages);
 
         // Always use Blocks format with cache_control for system prompts
@@ -651,6 +652,91 @@ impl AnthropicModelProvider {
         });
 
         (system_prompt, native_messages)
+    }
+
+    /// Preserve orphaned tool output as ordinary user text so the final
+    /// Anthropic payload cannot contain a `tool_result` without a matching
+    /// `tool_use` in the immediately preceding assistant message.
+    fn degrade_orphaned_tool_results(messages: &mut [NativeMessage]) {
+        for index in 0..messages.len() {
+            let declared_ids = Self::preceding_tool_use_ids(messages, index);
+            let orphaned_ids = Self::degrade_unmatched_results(&mut messages[index], &declared_ids);
+            if !orphaned_ids.is_empty() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Validate)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                        .with_attrs(::serde_json::json!({
+                            "message_index": index,
+                            "orphan_tool_result_ids": orphaned_ids,
+                        })),
+                    "anthropic: degraded orphaned tool_result blocks to user text"
+                );
+            }
+        }
+    }
+
+    fn preceding_tool_use_ids(
+        messages: &[NativeMessage],
+        index: usize,
+    ) -> std::collections::HashSet<String> {
+        let Some(previous_index) = index.checked_sub(1) else {
+            return std::collections::HashSet::new();
+        };
+        messages
+            .get(previous_index)
+            .filter(|message| message.role == "assistant")
+            .into_iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                NativeContentOut::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn degrade_unmatched_results(
+        message: &mut NativeMessage,
+        declared_ids: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        let mut matched_results = Vec::new();
+        let mut remaining_blocks = Vec::new();
+        let mut orphaned_ids = Vec::new();
+        for block in std::mem::take(&mut message.content) {
+            match block {
+                NativeContentOut::ToolResult {
+                    tool_use_id,
+                    content,
+                    cache_control,
+                } if declared_ids.contains(&tool_use_id) => {
+                    matched_results.push(NativeContentOut::ToolResult {
+                        tool_use_id,
+                        content,
+                        cache_control,
+                    });
+                }
+                NativeContentOut::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    remaining_blocks.push(Self::orphaned_tool_result_text(&tool_use_id, content));
+                    orphaned_ids.push(tool_use_id);
+                }
+                other => remaining_blocks.push(other),
+            }
+        }
+        matched_results.append(&mut remaining_blocks);
+        message.content = matched_results;
+        orphaned_ids
+    }
+
+    fn orphaned_tool_result_text(tool_use_id: &str, content: String) -> NativeContentOut {
+        NativeContentOut::Text {
+            text: format!("[Tool result for {tool_use_id}]\n{content}"),
+            cache_control: None,
+        }
     }
 
     /// Pair any orphaned `tool_use` with a stub `tool_result` so interrupted
@@ -3306,6 +3392,133 @@ data: {\"type\":\"message_stop\"}\n\n";
             native_msgs[2].content.len(),
             2,
             "Expected 2 tool_result blocks in merged message"
+        );
+    }
+
+    #[test]
+    fn convert_messages_degrades_leading_orphaned_tool_result() {
+        let messages = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "toolu_orphan",
+                "content": "created /tmp/image.png"
+            })
+            .to_string(),
+        )];
+
+        let (_, native_messages) = AnthropicModelProvider::convert_messages(&messages);
+
+        assert_eq!(native_messages.len(), 1);
+        assert!(matches!(
+            native_messages[0].content.first(),
+            Some(NativeContentOut::Text { text, .. })
+                if text.contains("toolu_orphan") && text.contains("created /tmp/image.png")
+        ));
+        assert!(
+            !native_messages[0]
+                .content
+                .iter()
+                .any(|block| matches!(block, NativeContentOut::ToolResult { .. }))
+        );
+    }
+
+    #[test]
+    fn convert_messages_preserves_valid_result_and_degrades_second_round_orphan() {
+        let messages = vec![
+            ChatMessage::user("Create an image."),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "toolu_search", "name": "search_tools", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "toolu_search",
+                    "content": "create_image activated"
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "toolu_create_image",
+                    "content": "created /tmp/image.png"
+                })
+                .to_string(),
+            ),
+        ];
+
+        let (_, native_messages) = AnthropicModelProvider::convert_messages(&messages);
+        let result_message = native_messages.last().expect("result message present");
+
+        assert!(matches!(
+            result_message.content.first(),
+            Some(NativeContentOut::ToolResult { tool_use_id, .. })
+                if tool_use_id == "toolu_search"
+        ));
+        assert!(matches!(
+            result_message.content.get(1),
+            Some(NativeContentOut::Text { text, .. })
+                if text.contains("toolu_create_image") && text.contains("created /tmp/image.png")
+        ));
+    }
+
+    #[test]
+    fn convert_messages_serializes_two_live_tool_rounds_with_valid_adjacency() {
+        let messages = vec![
+            ChatMessage::user("Create an image."),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "toolu_search", "name": "search_tools", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "toolu_search",
+                    "content": "create_image activated"
+                })
+                .to_string(),
+            ),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "toolu_create_image",
+                            "name": "create_image",
+                            "arguments": "{\"prompt\":\"lighthouse\"}"
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "toolu_create_image",
+                    "content": "created /tmp/lighthouse.png"
+                })
+                .to_string(),
+            ),
+        ];
+
+        let (_, native_messages) = AnthropicModelProvider::convert_messages(&messages);
+        let wire_messages = serde_json::to_value(&native_messages).expect("messages serialize");
+
+        assert_eq!(wire_messages[1]["content"][0]["id"], "toolu_search");
+        assert_eq!(
+            wire_messages[2]["content"][0]["tool_use_id"],
+            "toolu_search"
+        );
+        assert_eq!(wire_messages[3]["content"][0]["id"], "toolu_create_image");
+        assert_eq!(
+            wire_messages[4]["content"][0]["tool_use_id"],
+            "toolu_create_image"
         );
     }
 
