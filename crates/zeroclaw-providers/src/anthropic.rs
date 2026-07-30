@@ -858,6 +858,17 @@ impl AnthropicModelProvider {
         )
     }
 
+    fn streaming_http_client(&self) -> Client {
+        // No total-request timeout: SSE bodies for long-form generations can
+        // legitimately stay open for several minutes of active streaming.
+        // `SSE_IDLE_TIMEOUT` (per-line, above) already bounds a genuinely
+        // stalled connection. See #2404.
+        zeroclaw_config::schema::build_runtime_proxy_streaming_client(
+            "model_provider.anthropic",
+            10,
+        )
+    }
+
     /// Build a streaming request body from a `NativeChatRequest`.
     fn build_streaming_request(request: &NativeChatRequest) -> anyhow::Result<serde_json::Value> {
         let mut body = serde_json::to_value(request)
@@ -1612,7 +1623,7 @@ impl ModelProvider for AnthropicModelProvider {
                     .boxed();
             }
         };
-        let client = self.http_client();
+        let client = self.streaming_http_client();
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
 
@@ -1904,6 +1915,77 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
         assert!(
             probe.is_finished(),
             "guard drop must abort the parser task immediately, not wait out the idle timeout"
+        );
+    }
+
+    /// A reader that yields one buffer of valid SSE bytes, then reports a
+    /// transport read error — models a connection killed mid-body (e.g.
+    /// reqwest's total-request timeout firing while bytes are still being
+    /// drained).
+    struct ReadErrorAfterReader {
+        data: std::io::Cursor<Vec<u8>>,
+        drained: bool,
+    }
+
+    impl tokio::io::AsyncRead for ReadErrorAfterReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.drained {
+                return std::task::Poll::Ready(Err(std::io::Error::other(
+                    "connection reset by peer",
+                )));
+            }
+            let before = buf.filled().len();
+            let inner = std::pin::Pin::new(&mut self.data);
+            let res = inner.poll_read(cx, buf);
+            if buf.filled().len() == before {
+                self.drained = true;
+                return std::task::Poll::Ready(Err(std::io::Error::other(
+                    "connection reset by peer",
+                )));
+            }
+            res
+        }
+    }
+
+    #[tokio::test]
+    async fn read_error_after_partial_text_propagates_instead_of_final() {
+        // Repro for #2404: Claude emits a short intro sentence, then the
+        // connection is killed mid-body (reqwest's total-request timeout, a
+        // proxy hiccup, etc). The parser must surface a StreamError so the
+        // caller retries — not silently emit `Final` and let the partial
+        // reply be recorded as a successful turn.
+        let partial = b"event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"I'll write that now.\"}}\n\n"
+            .to_vec();
+        let reader = tokio::io::BufReader::new(ReadErrorAfterReader {
+            data: std::io::Cursor::new(partial),
+            drained: false,
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+
+        assert!(
+            matches!(events.first(), Some(Ok(StreamEvent::TextDelta(_)))),
+            "expected the partial text delta first, got {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Err(StreamError::Http(_)))),
+            "read error must propagate as StreamError::Http, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))),
+            "must never emit Final when the stream was cut short by a read error, got {events:?}"
         );
     }
 
