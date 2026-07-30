@@ -9141,6 +9141,43 @@ pub fn build_runtime_proxy_client_with_timeouts(
     client
 }
 
+/// Build a proxy-aware client for long-lived streaming requests: a bounded
+/// connect timeout, but deliberately **no** total-request timeout. Streamed
+/// SSE bodies can legitimately stay open far longer than a typical request
+/// (e.g. a multi-minute long-form generation); a `.timeout()` covers the
+/// whole request/response lifecycle in reqwest, including body reads, so it
+/// kills an actively-streaming connection just as readily as a stalled one.
+/// Callers are expected to enforce their own per-read idle timeout instead
+/// (see `SSE_IDLE_TIMEOUT` in the Anthropic provider) so a genuinely stalled
+/// connection is still bounded. See #2404.
+pub fn build_runtime_proxy_streaming_client(
+    service_key: &str,
+    connect_timeout_secs: u64,
+) -> reqwest::Client {
+    let cache_key = runtime_proxy_cache_key(service_key, None, Some(connect_timeout_secs));
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return client;
+    }
+
+    let builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
+    let builder = apply_runtime_proxy_to_builder(builder, service_key);
+    let client = builder.build().unwrap_or_else(|error| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(
+                    ::serde_json::json!({"service_key": service_key, "error": format!("{}", error)})
+                ),
+            "Failed to build proxied streaming client: "
+        );
+        reqwest::Client::new()
+    });
+    set_runtime_proxy_cached_client(cache_key, client.clone());
+    client
+}
+
 /// Build an HTTP client for a channel, using an explicit per-channel proxy URL
 /// when configured.  Falls back to the global runtime proxy when `proxy_url` is
 /// `None` or empty.
@@ -25030,6 +25067,52 @@ api_token = "tok"
 
         set_runtime_proxy_config(ProxyConfig::default());
         assert!(!runtime_proxy_cache_contains(&cache_key));
+    }
+
+    #[test]
+    async fn streaming_client_uses_a_distinct_cache_key_from_total_timeout_client() {
+        // #2404: the streaming client must never share a cache entry with the
+        // total-timeout client for the same service_key — otherwise whichever
+        // one builds first would silently apply its timeout policy to both
+        // callers.
+        let service_key = format!(
+            "model_provider.streaming_cache_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let streaming_cache_key = runtime_proxy_cache_key(&service_key, None, Some(10));
+        let total_timeout_cache_key = runtime_proxy_cache_key(&service_key, Some(120), Some(10));
+        assert_ne!(streaming_cache_key, total_timeout_cache_key);
+
+        clear_runtime_proxy_client_cache();
+        assert!(!runtime_proxy_cache_contains(&streaming_cache_key));
+
+        let _ = build_runtime_proxy_streaming_client(&service_key, 10);
+        assert!(runtime_proxy_cache_contains(&streaming_cache_key));
+        assert!(!runtime_proxy_cache_contains(&total_timeout_cache_key));
+    }
+
+    #[test]
+    async fn streaming_client_reuses_cached_instance() {
+        let service_key = format!(
+            "model_provider.streaming_reuse_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let cache_key = runtime_proxy_cache_key(&service_key, None, Some(10));
+
+        clear_runtime_proxy_client_cache();
+        assert!(!runtime_proxy_cache_contains(&cache_key));
+
+        let _ = build_runtime_proxy_streaming_client(&service_key, 10);
+        assert!(runtime_proxy_cache_contains(&cache_key));
+
+        let _ = build_runtime_proxy_streaming_client(&service_key, 10);
+        assert!(runtime_proxy_cache_contains(&cache_key));
     }
 
     #[test]
