@@ -1,6 +1,6 @@
 use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
-    build_responses_input, convert_tools, first_nonempty, process_sse_chunk,
+    build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
 };
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
@@ -702,6 +702,8 @@ struct ResponsesApiBody {
     output: Vec<serde_json::Value>,
     #[serde(default)]
     output_text: Option<String>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 fn extract_responses_api_text(body: &ResponsesApiBody) -> Option<String> {
@@ -1067,7 +1069,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         Ok(ProviderChatResponse {
             text: extract_responses_api_text(&body),
             tool_calls: extract_responses_api_tool_calls(&body),
-            usage: None,
+            usage: parse_responses_usage(body.usage.as_ref()),
             reasoning_content: None,
         })
     }
@@ -1180,6 +1182,56 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiResponsesModelProvider 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn responses_chat_propagates_usage() {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/responses",
+            post(|| async {
+                Json(serde_json::json!({
+                    "output_text": "ok",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 120,
+                        "input_tokens_details": {"cached_tokens": 45},
+                        "output_tokens": 30
+                    }
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let api_url = format!("http://{addr}");
+        let provider = OpenAiResponsesModelProvider::new("test", Some(&api_url), Some("test-key"));
+        let messages = vec![ChatMessage::user("hello")];
+
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-4o-mini",
+                None,
+            )
+            .await
+            .expect("chat should succeed");
+
+        let usage = response
+            .usage
+            .expect("provider-reported usage should propagate");
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.cached_input_tokens, Some(45));
+        assert_eq!(usage.output_tokens, Some(30));
+        server_handle.abort();
+    }
 
     #[test]
     fn creates_with_key() {
