@@ -793,6 +793,25 @@ fn is_retryable_stream_error(error: &StreamError) -> bool {
     }
 }
 
+fn is_context_window_stream_error(error: &StreamError) -> bool {
+    match error {
+        StreamError::Http(message) | StreamError::ModelProvider(message) => {
+            is_context_window_exceeded(&anyhow::Error::msg(message.clone()))
+        }
+        StreamError::Io(_) | StreamError::Json(_) | StreamError::InvalidSse(_) => false,
+    }
+}
+
+fn truncate_stream_context(request: &mut StructuredStreamRequest) -> bool {
+    let dropped = truncate_for_context(&mut request.messages);
+    if dropped == 0 {
+        return false;
+    }
+
+    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": request.provider_name, "model": request.model, "dropped": dropped, "remaining": request.messages.len()})), "Context window exceeded; truncated history and retrying stream");
+    true
+}
+
 async fn forward_stream_attempt(
     request: &StructuredStreamRequest,
     tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
@@ -849,15 +868,43 @@ fn log_stream_retry(
     );
 }
 
+fn log_terminal_stream_error(request: &StructuredStreamRequest, error: &StreamError) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "model_provider": request.provider_name,
+                "model": request.model,
+                "error": error.to_string(),
+            })),
+        "Provider stream failed"
+    );
+}
+
 async fn forward_structured_stream(
-    request: StructuredStreamRequest,
+    mut request: StructuredStreamRequest,
     tx: tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
 ) {
     let mut backoff_ms = request.base_backoff_ms;
+    let mut context_truncated = false;
     for attempt in 0..=request.max_retries {
         match forward_stream_attempt(&request, &tx).await {
             StreamAttemptOutcome::Complete | StreamAttemptOutcome::ConsumerDropped => return,
             StreamAttemptOutcome::Terminal(error) => {
+                log_terminal_stream_error(&request, &error);
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
+            StreamAttemptOutcome::Retry(error) if is_context_window_stream_error(&error) => {
+                if !context_truncated
+                    && attempt < request.max_retries
+                    && truncate_stream_context(&mut request)
+                {
+                    context_truncated = true;
+                    continue;
+                }
+                log_terminal_stream_error(&request, &error);
                 let _ = tx.send(Err(error)).await;
                 return;
             }
@@ -867,6 +914,7 @@ async fn forward_structured_stream(
                 backoff_ms = backoff_ms.saturating_mul(2).min(10_000);
             }
             StreamAttemptOutcome::Retry(error) => {
+                log_terminal_stream_error(&request, &error);
                 let _ = tx.send(Err(error)).await;
                 return;
             }
@@ -3883,6 +3931,8 @@ mod tests {
         BeforeOutputOnce,
         BeforeOutputAlways,
         BeforeOutputNonRetryable,
+        ContextWindowUntilTruncated,
+        ContextWindowAlways,
         AfterOutput,
     }
 
@@ -3909,12 +3959,31 @@ mod tests {
 
         fn stream_chat(
             &self,
-            _request: ChatRequest<'_>,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
             let attempt = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            let history_too_long = request
+                .messages
+                .iter()
+                .filter(|message| message.role != "system")
+                .count()
+                > 2;
+            if matches!(self.failure_mode, StreamFailureMode::ContextWindowAlways)
+                || (matches!(
+                    self.failure_mode,
+                    StreamFailureMode::ContextWindowUntilTruncated
+                ) && history_too_long)
+            {
+                return stream::once(async {
+                    Err(StreamError::ModelProvider(
+                        "maximum context length exceeded".to_string(),
+                    ))
+                })
+                .boxed();
+            }
             if matches!(
                 self.failure_mode,
                 StreamFailureMode::BeforeOutputNonRetryable
@@ -3984,10 +4053,17 @@ mod tests {
         model_provider: &ReliableModelProvider,
     ) -> Vec<StreamResult<StreamEvent>> {
         let messages = vec![ChatMessage::user("hello")];
+        collect_interrupting_stream_with_messages(model_provider, &messages).await
+    }
+
+    async fn collect_interrupting_stream_with_messages(
+        model_provider: &ReliableModelProvider,
+        messages: &[ChatMessage],
+    ) -> Vec<StreamResult<StreamEvent>> {
         model_provider
             .stream_chat(
                 ChatRequest {
-                    messages: &messages,
+                    messages,
                     tools: None,
                     thinking: None,
                 },
@@ -4029,6 +4105,49 @@ mod tests {
             events.as_slice(),
             [Ok(StreamEvent::TextDelta(chunk)), Err(StreamError::Http(error))]
                 if chunk.delta == "partial" && error == "connection reset"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_truncates_context_once_before_retrying() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::ContextWindowUntilTruncated,
+            2,
+        );
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("old question"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("current question"),
+            ChatMessage::assistant("current answer"),
+        ];
+        let events = collect_interrupting_stream_with_messages(&model_provider, &messages).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final)]
+                if chunk.delta == "recovered"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_stops_when_context_cannot_be_reduced() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::ContextWindowAlways,
+            2,
+        );
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::ModelProvider(error))]
+                if error == "maximum context length exceeded"
         ));
     }
 
