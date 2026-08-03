@@ -2,15 +2,19 @@ use super::ModelProvider;
 use super::dispatch::ProviderDispatch;
 use super::stream_guard::AbortOnDrop;
 use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
+    ChatMessage, ChatRequest, ChatResponse, NativeThinkingParams, StreamChunk, StreamError,
+    StreamEvent, StreamOptions, StreamResult,
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
+use zeroclaw_api::tool::ToolSpec;
 
 /// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
@@ -721,8 +725,8 @@ fn is_empty_completion(resp: &ChatResponse) -> bool {
 }
 
 enum ReliableModelProviderEntryProvider {
-    Direct(Box<dyn ModelProvider>),
-    Pinned(crate::model_pin::ModelPinnedProvider),
+    Direct(Arc<dyn ModelProvider>),
+    Pinned(Arc<crate::model_pin::ModelPinnedProvider>),
 }
 
 impl ReliableModelProviderEntryProvider {
@@ -737,6 +741,13 @@ impl ReliableModelProviderEntryProvider {
         match self {
             Self::Direct(_) => requested_model,
             Self::Pinned(provider) => provider.pinned_model(),
+        }
+    }
+
+    fn to_shared(&self) -> Arc<dyn ModelProvider> {
+        match self {
+            Self::Direct(provider) => Arc::clone(provider),
+            Self::Pinned(provider) => Arc::clone(provider) as Arc<dyn ModelProvider>,
         }
     }
 }
@@ -756,7 +767,7 @@ impl ReliableModelProviderEntry {
         Self {
             display_name: display_name.into(),
             cooldown_key: cooldown_key.into(),
-            provider: ReliableModelProviderEntryProvider::Direct(provider),
+            provider: ReliableModelProviderEntryProvider::Direct(Arc::from(provider)),
         }
     }
 
@@ -774,12 +785,12 @@ impl ReliableModelProviderEntry {
         Self {
             display_name: display_name.into(),
             cooldown_key: cooldown_key.into(),
-            provider: ReliableModelProviderEntryProvider::Pinned(
+            provider: ReliableModelProviderEntryProvider::Pinned(Arc::new(
                 crate::model_pin::ModelPinnedProvider::builder(alias)
                     .pinned_model(pinned_model)
                     .inner(inner)
                     .build(),
-            ),
+            )),
         }
     }
 
@@ -791,6 +802,10 @@ impl ReliableModelProviderEntry {
 
     fn provider(&self) -> &dyn ModelProvider {
         self.provider.as_model_provider()
+    }
+
+    fn shared_provider(&self) -> Arc<dyn ModelProvider> {
+        self.provider.to_shared()
     }
 }
 
@@ -999,6 +1014,180 @@ impl ReliableModelProvider {
         );
         tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
         *backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+    }
+}
+
+struct StructuredStreamRequest {
+    provider_name: String,
+    model_provider: Arc<dyn ModelProvider>,
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<ToolSpec>>,
+    thinking: Option<NativeThinkingParams>,
+    model: String,
+    temperature: Option<f64>,
+    options: StreamOptions,
+    max_retries: u32,
+    base_backoff_ms: u64,
+}
+
+impl StructuredStreamRequest {
+    fn open_stream(&self) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        ProviderDispatch::from_ref(&*self.model_provider).stream_chat(
+            ChatRequest {
+                messages: &self.messages,
+                tools: self.tools.as_deref(),
+                thinking: self.thinking,
+            },
+            &self.model,
+            self.temperature,
+            self.options,
+        )
+    }
+}
+
+enum StreamAttemptOutcome {
+    Complete,
+    Retry(StreamError),
+    Terminal(StreamError),
+    ConsumerDropped,
+}
+
+fn is_retryable_stream_error(error: &StreamError) -> bool {
+    match error {
+        StreamError::Io(_) => true,
+        StreamError::Http(message) | StreamError::ModelProvider(message) => {
+            !is_non_retryable(&anyhow::Error::msg(message.clone()))
+        }
+        StreamError::Json(_) | StreamError::InvalidSse(_) => false,
+    }
+}
+
+fn is_context_window_stream_error(error: &StreamError) -> bool {
+    match error {
+        StreamError::Http(message) | StreamError::ModelProvider(message) => {
+            is_context_window_exceeded(&anyhow::Error::msg(message.clone()))
+        }
+        StreamError::Io(_) | StreamError::Json(_) | StreamError::InvalidSse(_) => false,
+    }
+}
+
+fn truncate_stream_context(request: &mut StructuredStreamRequest) -> bool {
+    let dropped = truncate_for_context(&mut request.messages);
+    if dropped == 0 {
+        return false;
+    }
+
+    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": request.provider_name, "model": request.model, "dropped": dropped, "remaining": request.messages.len()})), "Context window exceeded; truncated history and retrying stream");
+    true
+}
+
+async fn forward_stream_attempt(
+    request: &StructuredStreamRequest,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+) -> StreamAttemptOutcome {
+    let mut provider_stream = request.open_stream();
+    let mut emitted_event = false;
+
+    while let Some(result) = provider_stream.next().await {
+        match result {
+            Ok(event) => {
+                let is_final = matches!(event, StreamEvent::Final);
+                emitted_event = true;
+                if tx.send(Ok(event)).await.is_err() {
+                    return StreamAttemptOutcome::ConsumerDropped;
+                }
+                if is_final {
+                    return StreamAttemptOutcome::Complete;
+                }
+            }
+            Err(error) if !emitted_event && is_retryable_stream_error(&error) => {
+                return StreamAttemptOutcome::Retry(error);
+            }
+            Err(error) => return StreamAttemptOutcome::Terminal(error),
+        }
+    }
+
+    let error = StreamError::ModelProvider("stream ended before final event".to_string());
+    if emitted_event {
+        StreamAttemptOutcome::Terminal(error)
+    } else {
+        StreamAttemptOutcome::Retry(error)
+    }
+}
+
+fn log_stream_retry(
+    request: &StructuredStreamRequest,
+    attempt: u32,
+    backoff_ms: u64,
+    error: &StreamError,
+) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "model_provider": request.provider_name,
+                "model": request.model,
+                "attempt": attempt,
+                "max_attempts": request.max_retries + 1,
+                "backoff_ms": backoff_ms,
+                "error": error.to_string(),
+            })),
+        "Provider stream failed before emitting output; retrying"
+    );
+}
+
+fn log_terminal_stream_error(request: &StructuredStreamRequest, error: &StreamError) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "model_provider": request.provider_name,
+                "model": request.model,
+                "error": error.to_string(),
+            })),
+        "Provider stream failed"
+    );
+}
+
+async fn forward_structured_stream(
+    mut request: StructuredStreamRequest,
+    tx: tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+) {
+    let mut backoff_ms = request.base_backoff_ms;
+    let mut context_truncated = false;
+    for attempt in 0..=request.max_retries {
+        match forward_stream_attempt(&request, &tx).await {
+            StreamAttemptOutcome::Complete | StreamAttemptOutcome::ConsumerDropped => return,
+            StreamAttemptOutcome::Terminal(error) => {
+                log_terminal_stream_error(&request, &error);
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
+            StreamAttemptOutcome::Retry(error) if is_context_window_stream_error(&error) => {
+                if !context_truncated
+                    && attempt < request.max_retries
+                    && truncate_stream_context(&mut request)
+                {
+                    context_truncated = true;
+                    continue;
+                }
+                log_terminal_stream_error(&request, &error);
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
+            StreamAttemptOutcome::Retry(error) if attempt < request.max_retries => {
+                log_stream_retry(&request, attempt + 1, backoff_ms, &error);
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = backoff_ms.saturating_mul(2).min(10_000);
+            }
+            StreamAttemptOutcome::Retry(error) => {
+                log_terminal_stream_error(&request, &error);
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
+        }
     }
 }
 
@@ -1958,30 +2147,20 @@ impl ModelProvider for ReliableModelProvider {
                 &served_model,
             );
 
-            let req = ChatRequest {
-                messages: request.messages,
-                tools: request.tools,
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+            let retry_request = StructuredStreamRequest {
+                provider_name: provider_clone,
+                model_provider: entry.shared_provider(),
+                messages: request.messages.to_vec(),
+                tools: request.tools.map(<[ToolSpec]>::to_vec),
                 thinking: request.thinking,
-            };
-            let stream = ProviderDispatch::from_ref(model_provider).stream_chat(
-                req,
-                &current_model,
+                model: current_model,
                 temperature,
                 options,
-            );
-            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
-
-            let handle = ::zeroclaw_spawn::spawn!(async move {
-                let mut stream = stream;
-                while let Some(event) = stream.next().await {
-                    if let Err(ref e) = event {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_clone, "model": current_model, "e": e.to_string()})), "Streaming error: ");
-                    }
-                    if tx.send(event).await.is_err() {
-                        break;
-                    }
-                }
-            });
+                max_retries: self.max_retries,
+                base_backoff_ms: self.base_backoff_ms,
+            };
+            let handle = ::zeroclaw_spawn::spawn!(forward_structured_stream(retry_request, tx));
 
             let guard = AbortOnDrop::new(handle.abort_handle());
             return stream_with_success_recording(rx, guard, fallback_record, |event| {
@@ -4906,6 +5085,265 @@ mod tests {
         assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
         assert_streaming_fallback_record(fallback);
+    }
+
+    #[derive(Clone, Copy)]
+    enum StreamFailureMode {
+        BeforeOutputOnce,
+        BeforeOutputAlways,
+        BeforeOutputNonRetryable,
+        ContextWindowUntilTruncated,
+        ContextWindowAlways,
+        AfterOutput,
+    }
+
+    struct InterruptingStreamMock {
+        stream_calls: Arc<AtomicUsize>,
+        failure_mode: StreamFailureMode,
+    }
+
+    #[async_trait]
+    impl ModelProvider for InterruptingStreamMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            let attempt = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            let history_too_long = request
+                .messages
+                .iter()
+                .filter(|message| message.role != "system")
+                .count()
+                > 2;
+            if matches!(self.failure_mode, StreamFailureMode::ContextWindowAlways)
+                || (matches!(
+                    self.failure_mode,
+                    StreamFailureMode::ContextWindowUntilTruncated
+                ) && history_too_long)
+            {
+                return stream::once(async {
+                    Err(StreamError::ModelProvider(
+                        "maximum context length exceeded".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+            if matches!(
+                self.failure_mode,
+                StreamFailureMode::BeforeOutputNonRetryable
+            ) {
+                return stream::once(async {
+                    Err(StreamError::ModelProvider(
+                        "400 Bad Request: invalid tool schema".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+            if matches!(self.failure_mode, StreamFailureMode::AfterOutput) {
+                return stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("partial"))),
+                    Err(StreamError::Http("connection reset".to_string())),
+                ])
+                .boxed();
+            }
+            if attempt == 0 || matches!(self.failure_mode, StreamFailureMode::BeforeOutputAlways) {
+                return stream::once(async {
+                    Err(StreamError::Http("connection reset".to_string()))
+                })
+                .boxed();
+            }
+            stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("recovered"))),
+                Ok(StreamEvent::Final),
+            ])
+            .boxed()
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for InterruptingStreamMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "InterruptingStreamMock"
+        }
+    }
+
+    fn interrupting_provider(
+        stream_calls: Arc<AtomicUsize>,
+        failure_mode: StreamFailureMode,
+        max_retries: u32,
+    ) -> ReliableModelProvider {
+        ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(InterruptingStreamMock {
+                    stream_calls,
+                    failure_mode,
+                }),
+            )],
+            max_retries,
+            1,
+        )
+    }
+
+    async fn collect_interrupting_stream(
+        model_provider: &ReliableModelProvider,
+    ) -> Vec<StreamResult<StreamEvent>> {
+        let messages = vec![ChatMessage::user("hello")];
+        collect_interrupting_stream_with_messages(model_provider, &messages).await
+    }
+
+    async fn collect_interrupting_stream_with_messages(
+        model_provider: &ReliableModelProvider,
+        messages: &[ChatMessage],
+    ) -> Vec<StreamResult<StreamEvent>> {
+        model_provider
+            .stream_chat(
+                ChatRequest {
+                    messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "model",
+                Some(0.0),
+                StreamOptions::new(true),
+            )
+            .collect()
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_chat_retries_interruption_before_output() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::BeforeOutputOnce,
+            1,
+        );
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final)]
+                if chunk.delta == "recovered"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_does_not_retry_interruption_after_output() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider =
+            interrupting_provider(Arc::clone(&stream_calls), StreamFailureMode::AfterOutput, 2);
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(chunk)), Err(StreamError::Http(error))]
+                if chunk.delta == "partial" && error == "connection reset"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_truncates_context_once_before_retrying() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::ContextWindowUntilTruncated,
+            2,
+        );
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("old question"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("current question"),
+            ChatMessage::assistant("current answer"),
+        ];
+        let events = collect_interrupting_stream_with_messages(&model_provider, &messages).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final)]
+                if chunk.delta == "recovered"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_stops_when_context_cannot_be_reduced() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::ContextWindowAlways,
+            2,
+        );
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::ModelProvider(error))]
+                if error == "maximum context length exceeded"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_chat_stops_after_retry_budget_is_exhausted() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::BeforeOutputAlways,
+            2,
+        );
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 3);
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::Http(error))] if error == "connection reset"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_does_not_retry_non_retryable_error_before_output() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::BeforeOutputNonRetryable,
+            2,
+        );
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::ModelProvider(error))] if error.contains("400 Bad Request")
+        ));
     }
 
     // ── stream_chat_with_history failover tests ──────────────────────
