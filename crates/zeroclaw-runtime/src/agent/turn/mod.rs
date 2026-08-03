@@ -82,7 +82,7 @@ pub use execution::{
 };
 pub(crate) use history_append::append_tool_round_to_history;
 pub(crate) use history_window::preflight_history_maintenance;
-pub use knobs::{LoopKnobs, MaxIterationBehavior};
+pub use knobs::{LoopKnobs, MaxIterationBehavior, StreamFailureBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
 pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
@@ -578,6 +578,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             &prepared_messages.messages,
             request_tools,
             should_consume_provider_stream,
+            knobs.stream_failure_behavior,
             iteration,
         )
         .await?;

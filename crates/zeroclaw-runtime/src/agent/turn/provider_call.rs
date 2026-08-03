@@ -3,6 +3,7 @@
 
 use super::context::TurnCtx;
 use super::events::StreamDelta;
+use super::knobs::StreamFailureBehavior;
 use super::outcome::{StreamInterruptedAfterOutput, ToolLoopCancelled, is_tool_loop_cancelled};
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
@@ -166,6 +167,7 @@ pub(crate) async fn call_provider(
     prepared_messages: &[ChatMessage],
     request_tools: Option<&[ToolSpec]>,
     should_consume_provider_stream: bool,
+    stream_failure_behavior: StreamFailureBehavior,
     iteration: usize,
 ) -> Result<ProviderCallOutcome> {
     let mut streamed_live_deltas = false;
@@ -216,6 +218,9 @@ pub(crate) async fn call_provider(
                 // consumers). Surfaced as the inner chat_result so the
                 // loop's Err arm records the observer failure, exactly as
                 // the pre-consolidation streaming engine did.
+                Err(stream_err)
+            }
+            Err(stream_err) if stream_failure_behavior == StreamFailureBehavior::ReturnError => {
                 Err(stream_err)
             }
             Err(stream_err) => {
@@ -317,6 +322,160 @@ pub(crate) async fn call_provider(
         streamed_protocol_suppressed,
         streamed_visible_text,
     })
+}
+
+#[cfg(test)]
+mod stream_failure_tests {
+    use super::super::context::TurnCtx;
+    use super::super::knobs::{LoopKnobs, StreamFailureBehavior};
+    use super::call_provider;
+    use crate::observability::NoopObserver;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_config::schema::PacingConfig;
+    use zeroclaw_providers::traits::{StreamError, StreamEvent, StreamOptions, StreamResult};
+    use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
+
+    struct FailingStreamProvider {
+        chat_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelProvider for FailingStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be called")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some("fallback response".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![Err(
+                StreamError::ModelProvider("stream failed".to_string()),
+            )]))
+        }
+    }
+
+    impl Attributable for FailingStreamProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "failing-stream-provider"
+        }
+    }
+
+    fn test_ctx<'a>(observer: &'a NoopObserver, pacing: &'a PacingConfig) -> TurnCtx<'a> {
+        TurnCtx {
+            observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: None,
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "stream-failure-test",
+            agent_alias: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn default_behavior_falls_back_to_non_streaming_chat() {
+        let provider = FailingStreamProvider {
+            chat_calls: AtomicUsize::new(0),
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = test_ctx(&observer, &pacing);
+        let messages = [ChatMessage::user("hello")];
+
+        let outcome = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &messages,
+            None,
+            true,
+            LoopKnobs::default().stream_failure_behavior,
+            0,
+        )
+        .await
+        .expect("provider dispatch should complete");
+
+        let response = outcome
+            .chat_result
+            .expect("default behavior should use the non-streaming response");
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn return_error_behavior_does_not_issue_non_streaming_request() {
+        let provider = FailingStreamProvider {
+            chat_calls: AtomicUsize::new(0),
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = test_ctx(&observer, &pacing);
+        let messages = [ChatMessage::user("hello")];
+
+        let outcome = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &messages,
+            None,
+            true,
+            StreamFailureBehavior::ReturnError,
+            0,
+        )
+        .await
+        .expect("provider dispatch should surface the stream result");
+
+        let error = outcome
+            .chat_result
+            .expect_err("stream error should be returned without fallback");
+        assert!(error.to_string().contains("stream failed"));
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[cfg(test)]
