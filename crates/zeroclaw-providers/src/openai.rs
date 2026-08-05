@@ -727,6 +727,8 @@ struct ResponsesApiRequest {
     model: String,
     input: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    store: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -941,6 +943,7 @@ pub struct OpenAiResponsesModelProvider {
     credential: Option<String>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
+    store: Option<bool>,
     /// HTTP request timeout in seconds for non-streaming LLM API calls.
     /// Streaming SSE calls use `streaming_client` which sets only a
     /// connect timeout so long-running responses aren't killed mid-stream.
@@ -954,7 +957,7 @@ pub struct OpenAiResponsesModelProvider {
 /// Only `alias` is required. `api_url` defaults to the OpenAI Responses
 /// endpoint; if a custom URL is supplied, `/responses` is appended when
 /// not already present so callers can pass either shape. Every runtime
-/// override (`timeout_secs` / `max_tokens` / `reasoning_effort` /
+/// override (`timeout_secs` / `max_tokens` / `reasoning_effort` / `store` /
 /// `extra_headers`) is set via a chain method on this builder before
 /// [`Self::build`] — the built provider itself has no post-construction
 /// mutators.
@@ -965,6 +968,7 @@ pub struct OpenAiResponsesBuilder {
     credential: Option<String>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
+    store: Option<bool>,
     timeout_secs: Option<u64>,
     extra_headers: std::collections::HashMap<String, String>,
 }
@@ -994,6 +998,13 @@ impl OpenAiResponsesBuilder {
 
     pub fn reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
         self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    /// Control whether OpenAI retains the generated response for later retrieval.
+    /// `None` preserves the API default; `Some(false)` requests stateless handling.
+    pub fn store(mut self, store: Option<bool>) -> Self {
+        self.store = store;
         self
     }
 
@@ -1037,6 +1048,7 @@ impl OpenAiResponsesBuilder {
             credential: self.credential,
             max_tokens: self.max_tokens,
             reasoning_effort: self.reasoning_effort,
+            store: self.store,
             timeout_secs: self.timeout_secs.unwrap_or(120),
             extra_headers: self.extra_headers,
         }
@@ -1053,6 +1065,7 @@ impl OpenAiResponsesModelProvider {
             credential: None,
             max_tokens: None,
             reasoning_effort: None,
+            store: None,
             timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
         }
@@ -1077,6 +1090,7 @@ impl OpenAiResponsesModelProvider {
         ResponsesApiRequest {
             model: model.to_string(),
             input,
+            store: self.store,
             instructions,
             stream,
             tools,
@@ -1299,6 +1313,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let count_tokens = options.count_tokens;
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
+        let store = self.store;
         let client = self.streaming_client();
         let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
@@ -1321,6 +1336,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             let req = ResponsesApiRequest {
                 model,
                 input,
+                store,
                 instructions,
                 stream: true,
                 tools,
@@ -1727,6 +1743,72 @@ mod tests {
             .credential(Some("  \t  "))
             .build();
         assert!(p.credential.is_none());
+    }
+
+    #[test]
+    fn responses_request_omits_store_by_default() {
+        let provider = OpenAiResponsesModelProvider::builder("test").build();
+        let request = provider.build_request(None, Vec::new(), None, "gpt-5", None, false);
+        let json = serde_json::to_value(request).unwrap();
+
+        assert!(json.get("store").is_none());
+    }
+
+    #[test]
+    fn responses_request_serializes_explicit_store_setting() {
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .store(Some(false))
+            .build();
+        let request = provider.build_request(None, Vec::new(), None, "gpt-5", None, false);
+        let json = serde_json::to_value(request).unwrap();
+
+        assert_eq!(json.get("store"), Some(&serde_json::json!(false)));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_serializes_explicit_store_setting() {
+        use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
+        use tokio::{net::TcpListener, sync::mpsc};
+
+        async fn capture(
+            State(sender): State<mpsc::UnboundedSender<serde_json::Value>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> impl IntoResponse {
+            sender.send(body).unwrap();
+            ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
+        }
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/responses", post(capture))
+            .with_state(sender);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{address}"))
+            .credential(Some("test-key"))
+            .store(Some(false))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "gpt-5",
+            None,
+            StreamOptions::new(true),
+        );
+        let _ = stream.next().await;
+        let body = receiver.recv().await.unwrap();
+
+        assert_eq!(body.get("store"), Some(&serde_json::json!(false)));
+        server_handle.abort();
     }
 
     #[tokio::test]
