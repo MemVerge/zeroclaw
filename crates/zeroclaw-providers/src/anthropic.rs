@@ -26,6 +26,10 @@ pub struct AnthropicModelProvider {
     base_url: String,
     max_tokens: u32,
     timeout_secs: u64,
+    /// Provider-level reasoning effort forwarded from `[runtime] reasoning_effort`.
+    /// Serialized verbatim as Anthropic's top-level `output_config.effort`.
+    /// Independent of per-request thinking.
+    reasoning_effort: Option<String>,
 }
 
 #[cfg(test)]
@@ -79,17 +83,75 @@ struct NativeChatRequest {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<NativeThinkingConfig>,
+    /// Anthropic places reasoning effort under a top-level `output_config`
+    /// object, not inside `thinking`. `None` omits the field entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
 }
 
 #[derive(Debug, Serialize)]
-struct NativeThinkingConfig {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    budget_tokens: u32,
+#[serde(tag = "type", rename_all = "lowercase")]
+enum NativeThinkingConfig {
+    Enabled { budget_tokens: u32 },
+    Adaptive,
 }
 
-fn anthropic_model_supports_native_thinking(model: &str) -> bool {
-    !model.contains("claude-opus-4-7")
+#[derive(Debug, Serialize)]
+struct OutputConfig {
+    effort: String,
+}
+
+/// Returns true for models that require `thinking: {type:"adaptive"}` and
+/// reject the fixed-budget `{type:"enabled", budget_tokens}` shape with HTTP
+/// 400. Unknown models default to `true` (forward-compatible: every Anthropic
+/// release from 4.7 onward is adaptive-only, so defaulting unknowns to adaptive
+/// keeps new models working without a list update).
+///
+/// Per Anthropic's extended-thinking docs, `enabled` is rejected starting at
+/// Claude 4.7; Claude 3.x and every Claude 4 minor below 7 (including the
+/// original bare Claude 4 and Claude 4.1) are manual-only and must use
+/// `enabled` with a `budget_tokens`.
+fn anthropic_model_requires_adaptive_thinking(model: &str) -> bool {
+    let id = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    !is_legacy_thinking_model(&id)
+}
+
+/// True for models that predate adaptive thinking and must use the fixed-budget
+/// `{type:"enabled", budget_tokens}` shape: Claude 3.x, and the Claude 4
+/// generation whose minor version is below 7.
+///
+/// New-style Claude IDs are `claude-{family}-{major}[-{minor}][-{date}]`. The
+/// original bare Claude 4 has no minor (e.g. `claude-sonnet-4`,
+/// `claude-opus-4-20250514`) and is minor-less, so it is legacy; so are the
+/// `4-1` through `4-6` minors. Claude 4.7 and later stay adaptive. Older
+/// `claude-3-*` naming is matched by prefix and never places `4` in the major
+/// slot, so it cannot collide with the new-style branch.
+fn is_legacy_thinking_model(id: &str) -> bool {
+    // Old `claude-3-*` naming covers every Claude 3 variant, dated or not.
+    if id.starts_with("claude-3") {
+        return true;
+    }
+    // New-style `claude-{family}-{major}[-{minor}][-{date}]`.
+    let mut tokens = id.split('-');
+    if tokens.next() != Some("claude") {
+        return false;
+    }
+    let _ = tokens.next(); // family: sonnet / opus / haiku / ...
+    if tokens.next() != Some("4") {
+        return false; // major 5+, non-numeric, or absent -> adaptive default
+    }
+    match tokens.next() {
+        // bare `claude-sonnet-4`
+        None => true,
+        // `claude-{family}-4-{YYYYMMDD}` with no minor
+        Some(date) if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) => true,
+        // `claude-{family}-4-{minor}[-{date}]`: manual-only iff minor < 7
+        Some(minor) => minor.parse::<u32>().is_ok_and(|m| m < 7),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -243,6 +305,7 @@ pub struct AnthropicBuilder {
     base_url: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
+    reasoning_effort: Option<String>,
 }
 
 impl AnthropicBuilder {
@@ -278,6 +341,15 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Provider-level reasoning effort, forwarded from `[runtime] reasoning_effort`.
+    /// Serialized verbatim as Anthropic's top-level `output_config.effort`.
+    /// Mirrors the Azure/OpenAI `reasoning_effort` builder method for
+    /// cross-provider parity.
+    pub fn reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -289,6 +361,7 @@ impl AnthropicBuilder {
             timeout_secs: self
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+            reasoning_effort: self.reasoning_effort,
         }
     }
 }
@@ -303,6 +376,7 @@ impl AnthropicModelProvider {
             base_url: None,
             max_tokens: None,
             timeout_secs: None,
+            reasoning_effort: None,
         }
     }
 
@@ -842,12 +916,22 @@ impl AnthropicModelProvider {
                     }
                 }
                 "thinking" => {
-                    if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref())
-                        && !thinking.is_empty()
-                    {
+                    // Preserve signed thinking blocks for multi-turn/tool-use
+                    // replay. On adaptive models `display` defaults to
+                    // "omitted": the response returns `thinking: ""` with an
+                    // encrypted `signature` that must be replayed unchanged or
+                    // the continuation 400s. Keep the block whenever it carries
+                    // a signature, even when the thinking text is empty.
+                    let thinking = block
+                        .thinking
+                        .as_deref()
+                        .or(block.text.as_deref())
+                        .unwrap_or("");
+                    let signature = block.signature.as_deref().unwrap_or("");
+                    if !thinking.is_empty() || !signature.is_empty() {
                         let json_block = serde_json::json!({
                             "thinking": thinking,
-                            "signature": block.signature.as_deref().unwrap_or(""),
+                            "signature": signature,
                         });
                         thinking_parts.push(json_block.to_string());
                     }
@@ -892,7 +976,7 @@ impl AnthropicModelProvider {
     /// Resolve thinking parameters for an API request. Returns the effective
     /// temperature (forced to 1.0 when thinking is active), the thinking
     /// config for the request body, and the effective max_tokens (raised to
-    /// meet budget_tokens minimum when needed).
+    /// meet budget_tokens minimum when the model uses the fixed-budget shape).
     fn resolve_thinking(
         &self,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
@@ -900,7 +984,22 @@ impl AnthropicModelProvider {
         model: &str,
     ) -> (Option<f64>, Option<NativeThinkingConfig>, u32) {
         match thinking {
-            Some(params) if anthropic_model_supports_native_thinking(model) => {
+            Some(_) if anthropic_model_requires_adaptive_thinking(model) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"model": model})),
+                    "Adaptive thinking enabled; forcing temperature=1.0"
+                );
+                // Adaptive thinking carries no budget_tokens; max_tokens is
+                // unconstrained by a thinking budget, so it stays as configured.
+                (
+                    Some(1.0),
+                    Some(NativeThinkingConfig::Adaptive),
+                    self.max_tokens,
+                )
+            }
+            Some(params) => {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -912,25 +1011,11 @@ impl AnthropicModelProvider {
                 let max_tokens = self.max_tokens.max(min_required);
                 (
                     Some(1.0),
-                    Some(NativeThinkingConfig {
-                        kind: "enabled",
+                    Some(NativeThinkingConfig::Enabled {
                         budget_tokens: params.budget_tokens,
                     }),
                     max_tokens,
                 )
-            }
-            Some(_) => {
-                // Caller asked for native thinking but the model rejects the
-                // fixed-budget request shape. Drop to prompt-based reasoning
-                // (the agent loop's prefix already injected) and keep the
-                // caller-supplied temperature so per-model guards still apply.
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"model": model})),
-                    "Native extended thinking requested but model only supports adaptive thinking; falling back to prompt-based reasoning"
-                );
-                (temperature, None, self.max_tokens)
             }
             None => (temperature, None, self.max_tokens),
         }
@@ -1303,6 +1388,10 @@ impl ModelProvider for AnthropicModelProvider {
             tool_choice: None,
             stream: None,
             thinking: None,
+            output_config: self
+                .reasoning_effort
+                .clone()
+                .map(|effort| OutputConfig { effort }),
         };
 
         let mut request = self
@@ -1411,6 +1500,10 @@ impl ModelProvider for AnthropicModelProvider {
             tool_choice,
             stream: None,
             thinking: thinking_config,
+            output_config: self
+                .reasoning_effort
+                .clone()
+                .map(|effort| OutputConfig { effort }),
         };
 
         let req = self
@@ -1600,6 +1693,10 @@ impl ModelProvider for AnthropicModelProvider {
                 tool_choice,
                 stream: None,
                 thinking: thinking_config,
+                output_config: self
+                    .reasoning_effort
+                    .clone()
+                    .map(|effort| OutputConfig { effort }),
             };
             // Serialize eagerly so the request body is owned and `'static`
             // across the async boundary.
@@ -1700,6 +1797,10 @@ impl ModelProvider for AnthropicModelProvider {
             tool_choice,
             stream: Some(true),
             thinking: thinking_config,
+            output_config: self
+                .reasoning_effort
+                .clone()
+                .map(|effort| OutputConfig { effort }),
         };
 
         let body = match Self::build_streaming_request(&native_request) {
@@ -2375,25 +2476,64 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn anthropic_model_supports_native_thinking_excludes_opus_4_7() {
+    fn anthropic_thinking_mode_adaptive_for_opus_4_7() {
         // Opus 4.7 only supports adaptive thinking; fixed-budget returns 400.
-        assert!(!anthropic_model_supports_native_thinking("claude-opus-4-7"));
-        assert!(!anthropic_model_supports_native_thinking(
+        assert!(anthropic_model_requires_adaptive_thinking(
+            "claude-opus-4-7"
+        ));
+        assert!(anthropic_model_requires_adaptive_thinking(
             "claude-opus-4-7-20260101"
         ));
     }
 
     #[test]
-    fn anthropic_model_supports_native_thinking_allows_other_models() {
-        assert!(anthropic_model_supports_native_thinking("claude-opus-4-6"));
-        assert!(anthropic_model_supports_native_thinking(
-            "claude-sonnet-4-6"
-        ));
-        assert!(anthropic_model_supports_native_thinking("claude-haiku-4-5"));
+    fn anthropic_thinking_mode_enabled_for_legacy_models() {
+        // Legacy families keep the fixed-budget `{type:"enabled"}` shape.
+        // Claude 4.1 is listed by Anthropic among the earlier Claude 4 models
+        // and is manual-only, so both its dated and undated IDs are legacy.
+        for id in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-opus-4-1",
+            "claude-opus-4-1-20250805",
+            "claude-3-opus",
+        ] {
+            assert!(
+                !anthropic_model_requires_adaptive_thinking(id),
+                "{id} is a legacy (manual-thinking) model and must not be adaptive"
+            );
+        }
     }
 
     #[test]
-    fn resolve_thinking_drops_native_for_opus_4_7() {
+    fn anthropic_thinking_mode_enabled_for_bare_claude_4_aliases() {
+        // The original Claude 4 generation (no minor version) predates adaptive
+        // thinking and must use the fixed-budget `{type:"enabled"}` shape. The
+        // canonical dated ID is the one used in the deployment example.
+        for id in [
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250514",
+            "claude-sonnet-4",
+            "claude-opus-4",
+        ] {
+            assert!(
+                !anthropic_model_requires_adaptive_thinking(id),
+                "{id} is a bare Claude 4 model and must use enabled thinking"
+            );
+        }
+        // Boundary guard: Claude 4.7 is the first adaptive-only release, so a
+        // minor version is not by itself enough to stay adaptive.
+        for id in ["claude-opus-4-7", "claude-opus-4-7-20260101"] {
+            assert!(
+                anthropic_model_requires_adaptive_thinking(id),
+                "{id} is Claude 4.7+ and must be adaptive"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_thinking_emits_adaptive_for_opus_4_7() {
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
             .build();
@@ -2402,32 +2542,178 @@ data: {\"type\":\"message_stop\"}\n\n";
         };
         let (temp, config, max_tokens) =
             provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
+        let config = config.expect("adaptive model should emit a thinking config");
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""type":"adaptive""#), "got: {json}");
         assert!(
-            config.is_none(),
-            "native thinking should be gated off for opus-4-7"
+            !json.contains("budget_tokens"),
+            "adaptive must not carry budget_tokens, got: {json}"
         );
-        // Caller-supplied temperature is preserved (so per-model omit guard
-        // can still take effect downstream).
-        assert!((temp.unwrap() - 0.7_f64).abs() < f64::EPSILON);
+        // Forced to 1.0 per Anthropic thinking contract.
+        assert!((temp.unwrap() - 1.0_f64).abs() < f64::EPSILON);
+        // Adaptive has no budget, so max_tokens is not raised.
         assert_eq!(max_tokens, provider.max_tokens);
     }
 
     #[test]
-    fn resolve_thinking_keeps_native_for_supported_models() {
+    fn resolve_thinking_emits_enabled_for_legacy_models() {
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
             .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 10_000,
         };
-        let (temp, config, _) =
-            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
+        // Every manual-thinking model emits `{type:"enabled", budget_tokens}`,
+        // including Claude 4.1 (regression: it must not flip to adaptive).
+        for model in ["claude-sonnet-4-6", "claude-opus-4-1-20250805"] {
+            let (temp, config, _) = provider.resolve_thinking(Some(params), Some(0.7_f64), model);
+            let config = config.expect("legacy model should emit a thinking config");
+            let json = serde_json::to_string(&config).unwrap();
+            assert!(json.contains(r#""type":"enabled""#), "{model}: got {json}");
+            assert!(
+                json.contains(r#""budget_tokens":10000"#),
+                "{model}: got {json}"
+            );
+            // Forced to 1.0 per Anthropic native-thinking contract.
+            assert!((temp.unwrap() - 1.0_f64).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn output_config_serializes_with_effort_when_supported() {
+        let req = NativeChatRequest {
+            model: "claude-opus-5".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: None,
+            output_config: Some(OutputConfig {
+                effort: "high".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&req).unwrap();
         assert!(
-            config.is_some(),
-            "native thinking should activate on supported models"
+            json.contains(r#""output_config":{"effort":"high"}"#),
+            "expected output_config.effort, got: {json}"
         );
-        // Forced to 1.0 per Anthropic native-thinking contract.
+    }
+
+    #[test]
+    fn output_config_omitted_when_none() {
+        let req = NativeChatRequest {
+            model: "claude-opus-5".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: None,
+            output_config: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("output_config"),
+            "output_config should be omitted when None, got: {json}"
+        );
+    }
+
+    #[test]
+    fn resolve_thinking_emits_adaptive_for_fable5_no_budget() {
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+        };
+        let (temp, config, max_tokens) =
+            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5");
+        let config = config.expect("fable-5 should emit an adaptive thinking config");
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""type":"adaptive""#), "got: {json}");
+        assert!(
+            !json.contains("budget_tokens"),
+            "adaptive must not carry budget_tokens, got: {json}"
+        );
         assert!((temp.unwrap() - 1.0_f64).abs() < f64::EPSILON);
+        assert_eq!(max_tokens, provider.max_tokens);
+    }
+
+    #[test]
+    fn adaptive_regression_for_modern_models() {
+        // Previously the denylist only excluded opus-4-7, so these modern
+        // adaptive-only models wrongly received `{type:"enabled"}` and 400'd.
+        for id in ["claude-fable-5", "claude-opus-5", "claude-opus-4-8"] {
+            assert!(
+                anthropic_model_requires_adaptive_thinking(id),
+                "{id} should require adaptive thinking"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn output_config_reaches_wire_via_chat() {
+        use axum::{Json, Router, routing::post};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    *cap.lock() = Some(body);
+                    Json(serde_json::json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "model": "claude-opus-5",
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 10, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let model_provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+
+        let result = model_provider
+            .chat_with_system(None, "hi", "claude-opus-5", None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "chat_with_system failed: {:?}",
+            result.err()
+        );
+
+        let body = captured.lock().take().expect("No request captured");
+        assert_eq!(
+            body["output_config"]["effort"], "high",
+            "output_config.effort should reach the wire, got: {}",
+            body["output_config"]
+        );
+
+        server_handle.abort();
     }
 
     #[test]
@@ -2442,6 +2728,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tool_choice: None,
             stream: None,
             thinking: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("max_tokens"));
@@ -2463,6 +2750,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tool_choice: None,
             stream: None,
             thinking: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -2908,6 +3196,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tool_choice: None,
             stream: None,
             thinking: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -2936,6 +3225,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tool_choice: None,
             stream: None,
             thinking: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -3027,6 +3317,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
             timeout_secs: 120,
+            reasoning_effort: None,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
@@ -3196,7 +3487,10 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn native_response_drops_empty_thinking_blocks() {
+    fn native_response_preserves_signed_empty_thinking_blocks() {
+        // Adaptive models default to `display:"omitted"` → `thinking:""`
+        // with an encrypted `signature`. The signature must be preserved for
+        // tool-result replay, or the continuation request 400s.
         let json = r#"{
             "content": [
                 {"type": "thinking", "thinking": "", "signature": "sig_xyz"},
@@ -3205,7 +3499,66 @@ data: {\"type\":\"message_stop\"}\n\n";
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicModelProvider::parse_native_response(resp);
-        assert!(result.reasoning_content.is_none());
+        let reasoning = result
+            .reasoning_content
+            .expect("omitted thinking block must be preserved with its signature");
+        assert!(
+            reasoning.contains(r#""signature":"sig_xyz""#),
+            "signature missing from reasoning_content: {reasoning}"
+        );
+        assert!(
+            reasoning.contains(r#""thinking":""#),
+            "empty thinking text missing from reasoning_content: {reasoning}"
+        );
+    }
+
+    #[test]
+    fn signed_empty_thinking_round_trips_into_assistant_history() {
+        // Full continuation path: a tool-use turn whose thinking was omitted
+        // (empty text, signature present) must survive response → stored
+        // reasoning_content → assistant-history rebuild, so the next request
+        // replays the signed thinking block before the tool result.
+        let response_json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "sig_omitted"},
+                {"type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "Paris"}}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(response_json).unwrap();
+        let parsed = AnthropicModelProvider::parse_native_response(resp);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("omitted thinking must be preserved for replay");
+
+        // Rebuild the stored assistant message and feed it back through the
+        // history parser.
+        let assistant = serde_json::json!({
+            "content": null,
+            "reasoning_content": reasoning,
+            "tool_calls": parsed.tool_calls,
+        })
+        .to_string();
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("assistant message should parse");
+        // The signed thinking block must come first, ahead of the tool_use,
+        // with empty text and the signature intact.
+        match blocks.first() {
+            Some(NativeContentOut::Thinking {
+                thinking,
+                signature,
+            }) => {
+                assert!(
+                    thinking.is_empty(),
+                    "round-tripped thinking must stay empty"
+                );
+                assert_eq!(
+                    signature.as_deref(),
+                    Some("sig_omitted"),
+                    "signature must survive the round trip"
+                );
+            }
+            other => panic!("expected signed Thinking block first, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3716,6 +4069,80 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(
             elapsed < Duration::from_secs(3),
             "request waited for the server response instead of using configured timeout: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_factory_forwards_reasoning_effort_to_output_config() {
+        use crate::ModelProviderRuntimeOptions;
+        use crate::factory::FamilyProviderFactory;
+        use axum::{Json, Router, routing::post};
+        use parking_lot::Mutex;
+        use serde_json::json;
+        use std::sync::Arc;
+        use zeroclaw_config::schema::AnthropicModelProviderConfig;
+
+        // Capture the outbound request body so we can prove the factory handoff
+        // (ModelProviderRuntimeOptions.reasoning_effort -> output_config.effort)
+        // reaches the wire. The builder-level path is covered by
+        // `output_config_reaches_wire_via_chat`; this exercises create_provider.
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    *cap.lock() = Some(body);
+                    Json(json!({
+                        "id": "msg_effort",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "model": "claude-opus-5",
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let opts = ModelProviderRuntimeOptions {
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        let provider = AnthropicModelProviderConfig::default()
+            .create_provider(
+                "native",
+                Some("test-key"),
+                Some(&format!("http://{addr}")),
+                &opts,
+            )
+            .expect("anthropic provider should build");
+
+        let result = provider
+            .chat_with_system(None, "hi", "claude-opus-5", None)
+            .await;
+        server.abort();
+        assert!(
+            result.is_ok(),
+            "chat_with_system failed: {:?}",
+            result.err()
+        );
+
+        let body = captured.lock().take().expect("no request captured");
+        assert_eq!(
+            body["output_config"]["effort"], "high",
+            "factory should forward reasoning_effort as output_config.effort, got: {}",
+            body["output_config"]
         );
     }
 }

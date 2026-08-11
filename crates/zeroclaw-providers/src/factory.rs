@@ -969,6 +969,10 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         if let Some(ts) = opts.provider_timeout_secs {
             b = b.timeout_secs(ts);
         }
+        // Parity with Azure/OpenAI: forward the provider-level reasoning effort.
+        // The Anthropic provider maps it to `output_config.effort` for supported
+        // models and ignores it otherwise.
+        b = b.reasoning_effort(opts.reasoning_effort.clone());
         Ok(Box::new(b.build()))
     }
 }
