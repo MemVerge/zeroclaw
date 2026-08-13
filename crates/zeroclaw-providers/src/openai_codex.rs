@@ -93,6 +93,7 @@ struct ResponsesResponse {
 #[derive(Debug, Default)]
 pub(crate) struct ResponsesStreamState {
     pub(crate) saw_text_delta: bool,
+    pub(crate) saw_reasoning_delta: bool,
     pub(crate) saw_completion: bool,
     pub(crate) text_accumulator: String,
     pub(crate) fallback_text: Option<String>,
@@ -714,6 +715,17 @@ pub(crate) fn process_responses_stream_event(
 
     let mut emitted = Vec::new();
     match event.get("type").and_then(Value::as_str) {
+        Some("response.reasoning_summary_text.delta") => {
+            if let Some(reasoning) = nonempty_preserve(event.get("delta").and_then(Value::as_str)) {
+                state.saw_reasoning_delta = true;
+                emitted.push(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning)));
+            }
+        }
+        Some("response.reasoning_summary_text.done") if !state.saw_reasoning_delta => {
+            if let Some(reasoning) = nonempty_preserve(event.get("text").and_then(Value::as_str)) {
+                emitted.push(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning)));
+            }
+        }
         Some("response.output_text.delta") => {
             if let Some(text) = nonempty_preserve(event.get("delta").and_then(Value::as_str)) {
                 state.saw_text_delta = true;
@@ -2266,6 +2278,46 @@ data: [DONE]
         )
         .unwrap();
         assert!(!state.saw_completion);
+    }
+
+    #[test]
+    fn process_sse_chunk_emits_reasoning_summary_delta() {
+        let mut state = ResponsesStreamState::default();
+
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Checking sources\"}",
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(state.saw_reasoning_delta);
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::TextDelta(StreamChunk {
+                delta,
+                reasoning: Some(reasoning),
+                ..
+            })] if delta.is_empty() && reasoning == "Checking sources"
+        ));
+    }
+
+    #[test]
+    fn process_sse_chunk_uses_reasoning_done_as_delta_fallback() {
+        let mut state = ResponsesStreamState::default();
+
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"Checked sources\"}",
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::TextDelta(StreamChunk {
+                reasoning: Some(reasoning),
+                ..
+            })] if reasoning == "Checked sources"
+        ));
     }
 
     #[test]
