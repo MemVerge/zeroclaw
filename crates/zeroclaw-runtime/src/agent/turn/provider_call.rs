@@ -320,6 +320,7 @@ mod stream_failure_tests {
     #[derive(Clone, Copy)]
     enum StreamScenario {
         FailBeforeOutput,
+        FailAfterReasoning,
         WaitForCancellation,
         FailAfterOutput,
     }
@@ -373,6 +374,10 @@ mod stream_failure_tests {
                         StreamError::ModelProvider("stream failed".to_string()),
                     )]))
                 }
+                StreamScenario::FailAfterReasoning => Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::reasoning("checking"))),
+                    Err(StreamError::ModelProvider("stream failed".to_string())),
+                ])),
                 StreamScenario::WaitForCancellation => Box::pin(futures_util::stream::pending()),
                 StreamScenario::FailAfterOutput => Box::pin(futures_util::stream::iter(vec![
                     Ok(StreamEvent::TextDelta(StreamChunk::delta("partial"))),
@@ -443,6 +448,41 @@ mod stream_failure_tests {
             .chat_result
             .expect("default behavior should use the non-streaming response");
         assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn default_behavior_falls_back_after_reasoning_only_output() {
+        let provider = ScriptedStreamProvider {
+            chat_calls: AtomicUsize::new(0),
+            stream_scenario: StreamScenario::FailAfterReasoning,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(2);
+        let mut ctx = test_ctx(&observer, &pacing);
+        ctx.event_tx = Some(&event_tx);
+        let messages = [ChatMessage::user("hello")];
+
+        let outcome = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &messages,
+            None,
+            true,
+            LoopKnobs::default().stream_failure_behavior,
+            0,
+        )
+        .await
+        .expect("provider dispatch should complete");
+
+        let response = outcome.chat_result.expect("fallback response");
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TurnEvent::Thinking { delta }) if delta == "checking"
+        ));
         assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 1);
     }
 

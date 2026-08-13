@@ -1226,9 +1226,20 @@ impl AnthropicModelProvider {
                                     tool_input_json.push_str(json);
                                 }
                             }
-                            // TODO: handle "thinking_delta" events for streaming
-                            // extended thinking content. Currently thinking blocks
-                            // are only captured in non-streaming parse_native_response().
+                            "thinking_delta" => {
+                                if let Some(thinking) =
+                                    delta.get("thinking").and_then(|value| value.as_str())
+                                    && !thinking.is_empty()
+                                    && tx
+                                        .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                                            thinking.to_string(),
+                                        ))))
+                                        .await
+                                        .is_err()
+                                {
+                                    return;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1916,6 +1927,37 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":27}}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    fn fake_anthropic_thinking_sse() -> &'static [u8] {
+        b"event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Checking sources\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    #[tokio::test]
+    async fn streaming_thinking_delta_is_emitted_as_reasoning() {
+        use std::io::Cursor;
+
+        let reader = tokio::io::BufReader::new(Cursor::new(fake_anthropic_thinking_sse()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(4);
+
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let event = rx
+            .recv()
+            .await
+            .expect("reasoning event")
+            .expect("valid event");
+        assert!(matches!(
+            event,
+            StreamEvent::TextDelta(StreamChunk {
+                delta,
+                reasoning: Some(reasoning),
+                ..
+            }) if delta.is_empty() && reasoning == "Checking sources"
+        ));
     }
 
     #[tokio::test]

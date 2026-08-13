@@ -822,6 +822,15 @@ fn extract_responses_api_tool_calls(body: &ResponsesApiBody) -> Vec<ProviderTool
 /// Drive a Responses API SSE connection to completion, emitting events on `tx`.
 /// `request_builder` must already have URL, auth headers, `Accept: text/event-stream`,
 /// and the JSON body attached. Sends `StreamEvent::Final` on clean stream end.
+fn prepare_stream_chunk(chunk: &StreamChunk, count_tokens: bool) -> StreamChunk {
+    let chunk = chunk.clone();
+    if count_tokens {
+        chunk.with_token_estimate()
+    } else {
+        chunk
+    }
+}
+
 pub(crate) async fn run_responses_sse(
     request_builder: reqwest::RequestBuilder,
     tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
@@ -883,13 +892,8 @@ pub(crate) async fn run_responses_sse(
                 Ok(events) => {
                     for event in events {
                         if let StreamEvent::TextDelta(ref chunk) = event {
-                            let event = if count_tokens {
-                                StreamEvent::TextDelta(
-                                    StreamChunk::delta(chunk.delta.clone()).with_token_estimate(),
-                                )
-                            } else {
-                                event
-                            };
+                            let event =
+                                StreamEvent::TextDelta(prepare_stream_chunk(chunk, count_tokens));
                             if tx.send(Ok(event)).await.is_err() {
                                 return;
                             }
@@ -1481,6 +1485,16 @@ mod tests {
             .credential(None)
             .build();
         assert_eq!(p.responses_url, RESPONSES_URL);
+    }
+
+    #[test]
+    fn token_estimation_preserves_reasoning_content() {
+        let chunk = StreamChunk::reasoning("Checking sources");
+
+        let counted = prepare_stream_chunk(&chunk, true);
+
+        assert_eq!(counted.reasoning.as_deref(), Some("Checking sources"));
+        assert!(counted.delta.is_empty());
     }
 
     #[test]

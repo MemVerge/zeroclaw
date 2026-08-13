@@ -93,6 +93,7 @@ struct ResponsesResponse {
 #[derive(Debug, Default)]
 pub(crate) struct ResponsesStreamState {
     pub(crate) saw_text_delta: bool,
+    pub(crate) reasoning_parts_with_deltas: HashSet<(String, u64)>,
     pub(crate) saw_completion: bool,
     pub(crate) text_accumulator: String,
     pub(crate) fallback_text: Option<String>,
@@ -704,6 +705,13 @@ impl std::fmt::Display for ResponsesStreamApiError {
 
 impl std::error::Error for ResponsesStreamApiError {}
 
+fn reasoning_summary_part_key(event: &Value) -> Option<(String, u64)> {
+    Some((
+        event.get("item_id")?.as_str()?.to_string(),
+        event.get("summary_index")?.as_u64()?,
+    ))
+}
+
 pub(crate) fn process_responses_stream_event(
     event: Value,
     state: &mut ResponsesStreamState,
@@ -714,6 +722,24 @@ pub(crate) fn process_responses_stream_event(
 
     let mut emitted = Vec::new();
     match event.get("type").and_then(Value::as_str) {
+        Some("response.reasoning_summary_text.delta") => {
+            if let Some(reasoning) = nonempty_preserve(event.get("delta").and_then(Value::as_str)) {
+                if let Some(key) = reasoning_summary_part_key(&event) {
+                    state.reasoning_parts_with_deltas.insert(key);
+                }
+                emitted.push(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning)));
+            }
+        }
+        Some("response.reasoning_summary_text.done") => {
+            let already_streamed = reasoning_summary_part_key(&event)
+                .is_some_and(|key| state.reasoning_parts_with_deltas.contains(&key));
+            if !already_streamed
+                && let Some(reasoning) =
+                    nonempty_preserve(event.get("text").and_then(Value::as_str))
+            {
+                emitted.push(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning)));
+            }
+        }
         Some("response.output_text.delta") => {
             if let Some(text) = nonempty_preserve(event.get("delta").and_then(Value::as_str)) {
                 state.saw_text_delta = true;
@@ -2266,6 +2292,80 @@ data: [DONE]
         )
         .unwrap();
         assert!(!state.saw_completion);
+    }
+
+    #[test]
+    fn process_sse_chunk_emits_reasoning_summary_delta() {
+        let mut state = ResponsesStreamState::default();
+
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"item-1\",\"summary_index\":0,\"delta\":\"Checking sources\"}",
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(
+            state
+                .reasoning_parts_with_deltas
+                .contains(&("item-1".to_string(), 0))
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::TextDelta(StreamChunk {
+                delta,
+                reasoning: Some(reasoning),
+                ..
+            })] if delta.is_empty() && reasoning == "Checking sources"
+        ));
+    }
+
+    #[test]
+    fn process_sse_chunk_uses_reasoning_done_as_delta_fallback() {
+        let mut state = ResponsesStreamState::default();
+
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"Checked sources\"}",
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::TextDelta(StreamChunk {
+                reasoning: Some(reasoning),
+                ..
+            })] if reasoning == "Checked sources"
+        ));
+    }
+
+    #[test]
+    fn reasoning_done_fallback_is_scoped_to_its_summary_part() {
+        let mut state = ResponsesStreamState::default();
+        let first = process_sse_chunk(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"item-1\",\"summary_index\":0,\"delta\":\"First part\"}",
+            &mut state,
+        )
+        .unwrap();
+        let duplicate_done = process_sse_chunk(
+            "data: {\"type\":\"response.reasoning_summary_text.done\",\"item_id\":\"item-1\",\"summary_index\":0,\"text\":\"First part\"}",
+            &mut state,
+        )
+        .unwrap();
+        let second_done = process_sse_chunk(
+            "data: {\"type\":\"response.reasoning_summary_text.done\",\"item_id\":\"item-1\",\"summary_index\":1,\"text\":\"Second part\"}",
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(first.len(), 1);
+        assert!(duplicate_done.is_empty());
+        assert!(matches!(
+            second_done.as_slice(),
+            [StreamEvent::TextDelta(StreamChunk {
+                reasoning: Some(reasoning),
+                ..
+            })] if reasoning == "Second part"
+        ));
     }
 
     #[test]

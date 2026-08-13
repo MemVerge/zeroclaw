@@ -196,7 +196,6 @@ pub(crate) async fn consume_provider_streaming_response(
                     // Thinking is surfaced as its own TurnEvent variant; it
                     // must never reach the Chunk/draft text surfaces.
                     if let Some(tx) = event_tx {
-                        visible_event_output = true;
                         let _ = tx
                             .send(TurnEvent::Thinking {
                                 delta: reasoning.to_string(),
