@@ -15,6 +15,7 @@ use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispat
 pub(crate) struct StreamedChatOutcome {
     pub(crate) response_text: String,
     pub(crate) reasoning_content: String,
+    pub(crate) replay_reasoning_content: String,
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) forwarded_live_deltas: bool,
     /// Visible text already delivered live on the draft/event sinks. The loop
@@ -147,6 +148,14 @@ pub(crate) async fn consume_provider_streaming_response(
             StreamEvent::Final => break,
             StreamEvent::Usage(usage) => {
                 outcome.usage = Some(usage);
+            }
+            StreamEvent::ReasoningContent(content) => {
+                if !content.is_empty() {
+                    if !outcome.replay_reasoning_content.is_empty() {
+                        outcome.replay_reasoning_content.push('\n');
+                    }
+                    outcome.replay_reasoning_content.push_str(&content);
+                }
             }
             StreamEvent::ToolCall(tool_call) => {
                 outcome.tool_calls.push(tool_call);
@@ -327,6 +336,10 @@ mod tests {
                 extra_content: None,
             };
             Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::reasoning("Checking"))),
+                Ok(StreamEvent::ReasoningContent(
+                    r#"{"thinking":"Checking","signature":"sig_1"}"#.to_string(),
+                )),
                 Ok(StreamEvent::TextDelta(StreamChunk::delta("Let me "))),
                 Ok(StreamEvent::ToolCall(tool_call)),
                 Ok(StreamEvent::TextDelta(StreamChunk::delta(
@@ -368,6 +381,30 @@ mod tests {
         assert!(
             forwarded.contains("check the count."),
             "narration emitted after the native tool call must be forwarded live; forwarded={forwarded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn separates_visible_reasoning_from_replay_content() {
+        let provider = ToolThenTextProvider;
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+
+        assert_eq!(outcome.reasoning_content, "Checking");
+        assert_eq!(
+            outcome.replay_reasoning_content,
+            r#"{"thinking":"Checking","signature":"sig_1"}"#
         );
     }
 }

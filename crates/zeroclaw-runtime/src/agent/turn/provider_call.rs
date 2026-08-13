@@ -175,11 +175,12 @@ pub(crate) async fn call_provider(
                 streamed_live_deltas = streamed.forwarded_live_deltas;
                 streamed_protocol_suppressed = streamed.suppressed_protocol;
                 streamed_visible_text = streamed.forwarded_visible_text;
-                let reasoning_content = if streamed.reasoning_content.is_empty() {
-                    None
+                let replay_content = if streamed.replay_reasoning_content.is_empty() {
+                    streamed.reasoning_content
                 } else {
-                    Some(streamed.reasoning_content)
+                    streamed.replay_reasoning_content
                 };
+                let reasoning_content = (!replay_content.is_empty()).then_some(replay_content);
                 Ok(zeroclaw_providers::ChatResponse {
                     text: Some(streamed.response_text),
                     tool_calls: streamed.tool_calls,

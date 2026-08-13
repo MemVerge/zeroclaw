@@ -274,6 +274,9 @@ impl StreamChunk {
 pub enum StreamEvent {
     /// Text delta from the assistant.
     TextDelta(StreamChunk),
+    /// Opaque provider reasoning state required for replay in a later request.
+    /// Unlike [`StreamChunk::reasoning`], this content must not be displayed.
+    ReasoningContent(String),
     /// Structured tool call emitted during streaming.
     ToolCall(ToolCall),
     /// A tool call that was already executed by the model_provider (e.g. Claude Code proxy).
