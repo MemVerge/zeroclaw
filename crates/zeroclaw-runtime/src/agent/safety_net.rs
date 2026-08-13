@@ -1432,7 +1432,7 @@ impl ModelProvider for StreamThenHangProvider {
         Ok("ok".into())
     }
     async fn chat(&self, _: ChatRequest<'_>, _: &str, _: Option<f64>) -> Result<ChatResponse> {
-        Ok(text_response("non-streamed fallback (must not be reached)"))
+        Ok(text_response("non-streamed fallback"))
     }
     fn supports_streaming(&self) -> bool {
         true
@@ -1547,10 +1547,11 @@ async fn safety_net_cancel_after_streamed_output_persists_partial() {
 }
 
 #[tokio::test]
-async fn safety_net_stream_error_persists_only_forwarded_text() {
+async fn safety_net_reasoning_only_error_falls_back_without_persisting_withheld_text() {
     let provider = StreamThenHangProvider {
         events: parking_lot::Mutex::new(vec![
-            // Thinking marks event-visible output without any forwarded text.
+            // Thinking is visible to the caller but is not final answer text,
+            // so it must not disable the non-streaming fallback.
             Ok(zeroclaw_api::model_provider::StreamEvent::TextDelta(
                 zeroclaw_api::model_provider::StreamChunk {
                     delta: String::new(),
@@ -1574,19 +1575,27 @@ async fn safety_net_stream_error_persists_only_forwarded_text() {
             .turn_streamed_with_steering_state("stream then die", tx, None, None)
             .await
     });
-    while rx.recv().await.is_some() {}
-    let err = handle
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let outcome = handle
         .await
         .expect("task join")
-        .expect_err("stream error after visible output must fail the turn (no fallback retry)");
+        .expect("reasoning without answer text must retain the non-streaming fallback");
 
     assert_eq!(
-        err.committed_response,
-        crate::i18n::get_english_cli_string_with_args("turn-stream-interrupted", &[]),
-        "nothing was forwarded, so nothing may be committed as delivered"
+        outcome.response, "non-streamed fallback",
+        "reasoning alone must not disable the non-streaming reliability fallback"
     );
     assert!(
-        !err.new_messages.iter().any(|m| matches!(
+        events.iter().any(
+            |event| matches!(event, TurnEvent::Thinking { delta } if delta == "working on it")
+        ),
+        "reasoning must still be surfaced as a Thinking event before fallback"
+    );
+    assert!(
+        !outcome.new_messages.iter().any(|m| matches!(
             m,
             ConversationMessage::Chat(c) if c.content.contains("tool_call")
         )),
