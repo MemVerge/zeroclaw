@@ -748,6 +748,14 @@ struct ResponsesApiRequest {
 #[derive(Debug, Serialize)]
 struct ResponsesApiReasoning {
     effort: String,
+    summary: &'static str,
+}
+
+fn responses_api_reasoning(effort: Option<&str>) -> Option<ResponsesApiReasoning> {
+    effort.map(|effort| ResponsesApiReasoning {
+        effort: effort.to_string(),
+        summary: "auto",
+    })
 }
 
 fn has_responses_tools(tools: Option<&[ResponsesToolSpec]>) -> bool {
@@ -1085,12 +1093,7 @@ impl OpenAiResponsesModelProvider {
         stream: bool,
     ) -> ResponsesApiRequest {
         let has_tools = has_responses_tools(tools.as_deref());
-        let reasoning = self
-            .reasoning_effort
-            .as_deref()
-            .map(|effort| ResponsesApiReasoning {
-                effort: effort.to_string(),
-            });
+        let reasoning = responses_api_reasoning(self.reasoning_effort.as_deref());
         ResponsesApiRequest {
             model: model.to_string(),
             input,
@@ -1332,11 +1335,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             let tools = convert_tools(tools_owned.as_deref());
             let tools_count = tools.as_ref().map_or(0, Vec::len);
             let has_tools = has_responses_tools(tools.as_deref());
-            let reasoning = reasoning_effort
-                .as_deref()
-                .map(|effort| ResponsesApiReasoning {
-                    effort: effort.to_string(),
-                });
+            let reasoning = responses_api_reasoning(reasoning_effort.as_deref());
             let req = ResponsesApiRequest {
                 model,
                 input,
@@ -2421,6 +2420,11 @@ mod tests {
             reasoning.get("effort").and_then(serde_json::Value::as_str),
             Some("high"),
             ".reasoning_effort(Some(\"high\")) must surface as reasoning.effort = \"high\" on the wire body"
+        );
+        assert_eq!(
+            reasoning.get("summary").and_then(serde_json::Value::as_str),
+            Some("auto"),
+            "reasoning requests must opt into displayable Responses summaries"
         );
     }
 
