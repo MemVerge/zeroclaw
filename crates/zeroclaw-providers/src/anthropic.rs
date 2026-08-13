@@ -93,7 +93,13 @@ struct NativeChatRequest {
 #[serde(tag = "type", rename_all = "lowercase")]
 enum NativeThinkingConfig {
     Enabled { budget_tokens: u32 },
-    Adaptive,
+    Adaptive { display: ThinkingDisplay },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ThinkingDisplay {
+    Summarized,
 }
 
 #[derive(Debug, Serialize)]
@@ -1029,11 +1035,14 @@ impl AnthropicModelProvider {
                         .with_attrs(::serde_json::json!({"model": model})),
                     "Adaptive thinking enabled; forcing temperature=1.0"
                 );
-                // Adaptive thinking carries no budget_tokens; max_tokens is
-                // unconstrained by a thinking budget, so it stays as configured.
+                // Claude 4.7 defaults adaptive thinking display to `omitted`.
+                // Request the only generally available visible form explicitly;
+                // Anthropic does not expose raw chain-of-thought through this API.
                 (
                     Some(1.0),
-                    Some(NativeThinkingConfig::Adaptive),
+                    Some(NativeThinkingConfig::Adaptive {
+                        display: ThinkingDisplay::Summarized,
+                    }),
                     self.max_tokens,
                 )
             }
@@ -1914,6 +1923,8 @@ data: {\"type\":\"message_stop\"}\n\n"
     fn fake_anthropic_thinking_sse() -> &'static [u8] {
         b"event: content_block_delta\n\
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Checking sources\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" in detail\"}}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n"
     }
@@ -1948,18 +1959,32 @@ data: {\"type\":\"message_stop\"}\n\n"
 
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
 
-        let event = rx
+        let first = rx
             .recv()
             .await
-            .expect("reasoning event")
+            .expect("first reasoning event")
             .expect("valid event");
         assert!(matches!(
-            event,
+            first,
             StreamEvent::TextDelta(StreamChunk {
                 delta,
                 reasoning: Some(reasoning),
                 ..
             }) if delta.is_empty() && reasoning == "Checking sources"
+        ));
+
+        let second = rx
+            .recv()
+            .await
+            .expect("second reasoning event")
+            .expect("valid event");
+        assert!(matches!(
+            second,
+            StreamEvent::TextDelta(StreamChunk {
+                delta,
+                reasoning: Some(reasoning),
+                ..
+            }) if delta.is_empty() && reasoning == " in detail"
         ));
     }
 
@@ -2636,6 +2661,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains(r#""type":"adaptive""#), "got: {json}");
         assert!(
+            json.contains(r#""display":"summarized""#),
+            "Claude 4.7 defaults display to omitted, got: {json}"
+        );
+        assert!(
             !json.contains("budget_tokens"),
             "adaptive must not carry budget_tokens, got: {json}"
         );
@@ -2726,6 +2755,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         let config = config.expect("fable-5 should emit an adaptive thinking config");
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains(r#""type":"adaptive""#), "got: {json}");
+        assert!(
+            json.contains(r#""display":"summarized""#),
+            "adaptive thinking must opt into visible summaries, got: {json}"
+        );
         assert!(
             !json.contains("budget_tokens"),
             "adaptive must not carry budget_tokens, got: {json}"
