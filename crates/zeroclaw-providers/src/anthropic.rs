@@ -145,6 +145,52 @@ impl StreamingThinkingBlock {
     }
 }
 
+#[derive(Debug)]
+enum StreamingReasoningBlock {
+    Thinking(StreamingThinkingBlock),
+    Redacted { index: u64, data: String },
+}
+
+impl StreamingReasoningBlock {
+    fn from_start(index: u64, block: &serde_json::Value) -> Option<Self> {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("thinking") => Some(Self::Thinking(StreamingThinkingBlock::from_start(
+                index, block,
+            ))),
+            Some("redacted_thinking") => {
+                block
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|data| Self::Redacted {
+                        index,
+                        data: data.to_string(),
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    fn index(&self) -> u64 {
+        match self {
+            Self::Thinking(block) => block.index,
+            Self::Redacted { index, .. } => *index,
+        }
+    }
+
+    fn replay_content(self) -> Option<String> {
+        match self {
+            Self::Thinking(block) => block.replay_content(),
+            Self::Redacted { data, .. } => Some(
+                serde_json::json!({
+                    "type": "redacted_thinking",
+                    "data": data,
+                })
+                .to_string(),
+            ),
+        }
+    }
+}
+
 /// Returns true for models that require `thinking: {type:"adaptive"}` and
 /// reject the fixed-budget `{type:"enabled", budget_tokens}` shape with HTTP
 /// 400. Unknown models default to `true` (forward-compatible: every Anthropic
@@ -247,6 +293,8 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -328,6 +376,9 @@ struct NativeContentIn {
     /// Signature for integrity verification of thinking blocks.
     #[serde(default)]
     signature: Option<String>,
+    /// Opaque encrypted payload for safety-redacted thinking blocks.
+    #[serde(default)]
+    data: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -500,8 +551,34 @@ impl AnthropicModelProvider {
                 }
                 NativeContentOut::ToolUse { .. }
                 | NativeContentOut::Image { .. }
-                | NativeContentOut::Thinking { .. } => {}
+                | NativeContentOut::Thinking { .. }
+                | NativeContentOut::RedactedThinking { .. } => {}
             }
+        }
+    }
+
+    fn parse_reasoning_content_block(block: &serde_json::Value) -> Option<NativeContentOut> {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("redacted_thinking") => {
+                block
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|data| NativeContentOut::RedactedThinking {
+                        data: data.to_string(),
+                    })
+            }
+            _ => Some(NativeContentOut::Thinking {
+                thinking: block
+                    .get("thinking")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                signature: block
+                    .get("signature")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|signature| !signature.is_empty())
+                    .map(str::to_string),
+            }),
         }
     }
 
@@ -549,21 +626,10 @@ impl AnthropicModelProvider {
             .filter(|r| !r.is_empty())
         {
             for part in reasoning.split('\n') {
-                if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
-                    let thinking = block
-                        .get("thinking")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let signature = block
-                        .get("signature")
-                        .and_then(|s| s.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string());
-                    blocks.push(NativeContentOut::Thinking {
-                        thinking,
-                        signature,
-                    });
+                if let Ok(block) = serde_json::from_str::<serde_json::Value>(part)
+                    && let Some(block) = Self::parse_reasoning_content_block(&block)
+                {
+                    blocks.push(block);
                 }
             }
         }
@@ -980,6 +1046,17 @@ impl AnthropicModelProvider {
                         thinking_parts.push(json_block.to_string());
                     }
                 }
+                "redacted_thinking" => {
+                    if let Some(data) = block.data {
+                        thinking_parts.push(
+                            serde_json::json!({
+                                "type": "redacted_thinking",
+                                "data": data,
+                            })
+                            .to_string(),
+                        );
+                    }
+                }
                 "tool_use" => {
                     let name = block.name.unwrap_or_default();
                     if name.is_empty() {
@@ -1125,7 +1202,7 @@ impl AnthropicModelProvider {
         let mut tool_name: Option<String> = None;
         let mut tool_input_json = String::new();
         let mut tool_index: Option<u64> = None;
-        let mut thinking_block: Option<StreamingThinkingBlock> = None;
+        let mut reasoning_block: Option<StreamingReasoningBlock> = None;
 
         let mut input_tokens: Option<u64> = None;
         let mut output_tokens: Option<u64> = None;
@@ -1227,8 +1304,8 @@ impl AnthropicModelProvider {
                             .get("type")
                             .and_then(|t| t.as_str())
                             .unwrap_or_default();
-                        if block_type == "thinking" {
-                            thinking_block = Some(StreamingThinkingBlock::from_start(index, block));
+                        if let Some(block) = StreamingReasoningBlock::from_start(index, block) {
+                            reasoning_block = Some(block);
                         } else if block_type == "tool_use" {
                             if let Some(id) = tool_id.take() {
                                 let name = tool_name.take().unwrap_or_default();
@@ -1290,8 +1367,9 @@ impl AnthropicModelProvider {
                                 if let Some(thinking) =
                                     delta.get("thinking").and_then(|value| value.as_str())
                                 {
-                                    if let Some(block) =
-                                        thinking_block.as_mut().filter(|block| block.index == index)
+                                    if let Some(StreamingReasoningBlock::Thinking(block)) =
+                                        reasoning_block.as_mut()
+                                        && block.index == index
                                     {
                                         block.thinking.push_str(thinking);
                                     }
@@ -1310,8 +1388,9 @@ impl AnthropicModelProvider {
                             "signature_delta" => {
                                 if let Some(signature) =
                                     delta.get("signature").and_then(|value| value.as_str())
-                                    && let Some(block) =
-                                        thinking_block.as_mut().filter(|block| block.index == index)
+                                    && let Some(StreamingReasoningBlock::Thinking(block)) =
+                                        reasoning_block.as_mut()
+                                    && block.index == index
                                 {
                                     block.signature.push_str(signature);
                                 }
@@ -1325,12 +1404,12 @@ impl AnthropicModelProvider {
                         .get("index")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or_default();
-                    if thinking_block
+                    if reasoning_block
                         .as_ref()
-                        .is_some_and(|block| block.index == index)
-                        && let Some(content) = thinking_block
+                        .is_some_and(|block| block.index() == index)
+                        && let Some(content) = reasoning_block
                             .take()
-                            .and_then(StreamingThinkingBlock::replay_content)
+                            .and_then(StreamingReasoningBlock::replay_content)
                     {
                         let _ = tx.send(Ok(StreamEvent::ReasoningContent(content))).await;
                     }
@@ -1950,6 +2029,23 @@ event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n"
     }
 
+    fn fake_redacted_thinking_tool_sse() -> &'static [u8] {
+        b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque_redacted_data\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"search\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"rust\\\"}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":12}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n"
+    }
+
     #[tokio::test]
     async fn streaming_thinking_delta_is_emitted_as_reasoning() {
         use std::io::Cursor;
@@ -2019,6 +2115,39 @@ data: {\"type\":\"message_stop\"}\n\n"
         let replay: serde_json::Value = serde_json::from_str(&replay).expect("valid replay JSON");
         assert_eq!(replay["thinking"], "Checking sources");
         assert_eq!(replay["signature"], "sig_abc");
+
+        let tool = rx
+            .recv()
+            .await
+            .expect("tool call")
+            .expect("valid tool call");
+        assert!(matches!(
+            tool,
+            StreamEvent::ToolCall(ProviderToolCall { id, name, arguments, .. })
+                if id == "tool_1" && name == "search" && arguments == r#"{"q":"rust"}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_redacted_thinking_is_replayable_without_visible_reasoning() {
+        use std::io::Cursor;
+
+        let reader = tokio::io::BufReader::new(Cursor::new(fake_redacted_thinking_tool_sse()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let replay = rx
+            .recv()
+            .await
+            .expect("replay block")
+            .expect("valid replay");
+        let StreamEvent::ReasoningContent(replay) = replay else {
+            panic!("expected opaque reasoning content");
+        };
+        let replay: serde_json::Value = serde_json::from_str(&replay).expect("valid replay JSON");
+        assert_eq!(replay["type"], "redacted_thinking");
+        assert_eq!(replay["data"], "opaque_redacted_data");
 
         let tool = rx
             .recv()
@@ -3682,6 +3811,36 @@ data: {\"type\":\"message_stop\"}\n\n";
             }
             other => panic!("expected signed Thinking block first, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn redacted_thinking_round_trips_into_assistant_history() {
+        let response_json = r#"{
+            "content": [
+                {"type": "redacted_thinking", "data": "opaque_redacted_data"},
+                {"type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "Paris"}}
+            ]
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(response_json).unwrap();
+        let parsed = AnthropicModelProvider::parse_native_response(response);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("redacted thinking must be preserved for replay");
+        let preserved: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(preserved["type"], "redacted_thinking");
+        assert_eq!(preserved["data"], "opaque_redacted_data");
+
+        let assistant = serde_json::json!({
+            "content": null,
+            "reasoning_content": reasoning,
+            "tool_calls": parsed.tool_calls,
+        })
+        .to_string();
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("assistant message should parse");
+        let replayed = serde_json::to_value(blocks.first().expect("redacted block first")).unwrap();
+        assert_eq!(replayed["type"], "redacted_thinking");
+        assert_eq!(replayed["data"], "opaque_redacted_data");
     }
 
     #[test]
