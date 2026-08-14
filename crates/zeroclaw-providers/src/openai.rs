@@ -362,10 +362,10 @@ impl OpenAiModelProvider {
                         })
                         .collect::<Vec<_>>();
                     let content = crate::request_payload::non_empty_string_field(&value, "content");
-                    let reasoning_content = value
-                        .get("reasoning_content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
+                    let reasoning_content = crate::request_payload::reasoning_content_for_wire(
+                        &value,
+                        "reasoning_content",
+                    );
                     return NativeMessage {
                         role: "assistant".to_string(),
                         content,
@@ -2128,6 +2128,28 @@ mod tests {
             native[0].reasoning_content.as_deref(),
             Some("Let me think...")
         );
+    }
+
+    #[test]
+    fn convert_messages_drops_foreign_provider_replay_envelope() {
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let envelope = serde_json::json!({
+            "provider": "anthropic",
+            "kind": "content_blocks",
+            "version": 1,
+            "blocks": [{"type": "redacted_thinking", "data": "opaque"}],
+        });
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{"id": "tc_1", "name": "shell", "arguments": "{}"}],
+            "reasoning_content": envelope.to_string(),
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiModelProvider::convert_messages(&messages);
+
+        assert!(native[0].reasoning_content.is_none());
     }
 
     #[test]
