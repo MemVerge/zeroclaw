@@ -362,10 +362,10 @@ impl AzureOpenAiModelProvider {
                         })
                         .collect::<Vec<_>>();
                     let content = crate::request_payload::non_empty_string_field(&value, "content");
-                    let reasoning_content = crate::request_payload::reasoning_content_for_wire(
-                        &value,
-                        "reasoning_content",
-                    );
+                    let reasoning_content = value
+                        .get("reasoning_content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string);
                     return NativeMessage {
                         role: "assistant".to_string(),
                         content,

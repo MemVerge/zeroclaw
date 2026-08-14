@@ -1244,9 +1244,10 @@ impl BedrockModelProvider {
         // with reasoning content blocks (including signatures) before any
         // tool_use blocks. The reasoning_content field stores JSON-encoded
         // thinking blocks from the original response.
-        if let Some(reasoning) =
-            crate::request_payload::reasoning_content_for_wire(&value, "reasoning_content")
-                .filter(|reasoning| !reasoning.is_empty())
+        if let Some(reasoning) = value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|r| !r.is_empty())
         {
             // reasoning_content may contain multiple JSON blocks joined by \n
             for part in reasoning.split('\n') {

@@ -955,9 +955,14 @@ impl OpenAiCompatibleModelProvider {
         if !self.replay_assistant_reasoning {
             return (None, None);
         }
-        let reasoning_content =
-            crate::request_payload::reasoning_content_for_wire(value, "reasoning_content");
-        let reasoning = crate::request_payload::reasoning_content_for_wire(value, "reasoning");
+        let reasoning_content = value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+        let reasoning = value
+            .get("reasoning")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
         (reasoning_content, reasoning)
     }
 }
