@@ -16,8 +16,116 @@ const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
 const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// Legacy replay metadata accepted for histories written by earlier builds.
+/// New histories use [`AnthropicReplayEnvelope`] so persistence does not rely
+/// on tool-call extension fields or offsets into normalized display text.
+const ANTHROPIC_BLOCK_INDEX_KEY: &str = "__anthropic_content_block_index";
+const ANTHROPIC_EXTRA_CONTENT_KEY: &str = "anthropic";
+const ANTHROPIC_TEXT_BLOCK_MARKER: &str = "__anthropic_text_block";
+const ANTHROPIC_TEXT_START_KEY: &str = "start";
+const ANTHROPIC_TEXT_END_KEY: &str = "end";
+const ANTHROPIC_REPLAY_PROVIDER: &str = "anthropic";
+const ANTHROPIC_REPLAY_KIND: &str = "content_blocks";
+const ANTHROPIC_REPLAY_VERSION: u8 = 1;
 
 use crate::stream_guard::AbortOnDrop;
+
+fn anthropic_tool_call_index(extra: Option<&serde_json::Value>) -> Option<u64> {
+    extra?
+        .get(ANTHROPIC_EXTRA_CONTENT_KEY)?
+        .get(ANTHROPIC_BLOCK_INDEX_KEY)?
+        .as_u64()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Provider-wire source of truth for Anthropic continuation blocks.
+/// `ChatResponse.text` remains the independently normalized display value.
+struct AnthropicReplayEnvelope {
+    provider: String,
+    kind: String,
+    version: u8,
+    blocks: Vec<AnthropicReplayBlock>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicReplayBlock {
+    Thinking {
+        index: u64,
+        thinking: String,
+        signature: String,
+    },
+    Text {
+        index: u64,
+        text: String,
+    },
+    ToolUse {
+        index: u64,
+        id: String,
+    },
+    RedactedThinking {
+        index: u64,
+        data: String,
+    },
+}
+
+impl AnthropicReplayEnvelope {
+    fn encode(blocks: Vec<AnthropicReplayBlock>) -> Option<String> {
+        if blocks.is_empty() {
+            return None;
+        }
+        serde_json::to_string(&Self {
+            provider: ANTHROPIC_REPLAY_PROVIDER.to_string(),
+            kind: ANTHROPIC_REPLAY_KIND.to_string(),
+            version: ANTHROPIC_REPLAY_VERSION,
+            blocks,
+        })
+        .ok()
+    }
+
+    fn encode_reasoning_history(blocks: Vec<AnthropicReplayBlock>) -> Option<String> {
+        if !blocks.iter().any(AnthropicReplayBlock::is_reasoning) {
+            return None;
+        }
+        Self::encode(blocks)
+    }
+
+    fn decode(content: &str) -> Option<Vec<AnthropicReplayBlock>> {
+        let mut blocks = content
+            .lines()
+            .filter_map(Self::decode_snapshot)
+            .flatten()
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(AnthropicReplayBlock::index);
+        let has_duplicate_index = blocks
+            .windows(2)
+            .any(|pair| pair[0].index() == pair[1].index());
+        (!blocks.is_empty() && !has_duplicate_index).then_some(blocks)
+    }
+
+    fn decode_snapshot(content: &str) -> Option<Vec<AnthropicReplayBlock>> {
+        let envelope = serde_json::from_str::<Self>(content).ok()?;
+        (envelope.provider == ANTHROPIC_REPLAY_PROVIDER
+            && envelope.kind == ANTHROPIC_REPLAY_KIND
+            && envelope.version == ANTHROPIC_REPLAY_VERSION)
+            .then_some(envelope.blocks)
+    }
+}
+
+impl AnthropicReplayBlock {
+    fn index(&self) -> u64 {
+        match self {
+            Self::Thinking { index, .. }
+            | Self::Text { index, .. }
+            | Self::ToolUse { index, .. }
+            | Self::RedactedThinking { index, .. } => *index,
+        }
+    }
+
+    fn is_reasoning(&self) -> bool {
+        matches!(self, Self::Thinking { .. } | Self::RedactedThinking { .. })
+    }
+}
 
 pub struct AnthropicModelProvider {
     /// `[providers.models.anthropic.<alias>]` config-key alias.
@@ -131,17 +239,57 @@ impl StreamingThinkingBlock {
         }
     }
 
-    fn replay_content(self) -> Option<String> {
+    fn replay_block(self) -> Option<AnthropicReplayBlock> {
         if self.thinking.is_empty() && self.signature.is_empty() {
             return None;
         }
-        Some(
-            serde_json::json!({
-                "thinking": self.thinking,
-                "signature": self.signature,
-            })
-            .to_string(),
-        )
+        Some(AnthropicReplayBlock::Thinking {
+            index: self.index,
+            thinking: self.thinking,
+            signature: self.signature,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum StreamingReasoningBlock {
+    Thinking(StreamingThinkingBlock),
+    Redacted { index: u64, data: String },
+}
+
+impl StreamingReasoningBlock {
+    fn from_start(index: u64, block: &serde_json::Value) -> Option<Self> {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("thinking") => Some(Self::Thinking(StreamingThinkingBlock::from_start(
+                index, block,
+            ))),
+            Some("redacted_thinking") => {
+                block
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|data| Self::Redacted {
+                        index,
+                        data: data.to_string(),
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    fn index(&self) -> u64 {
+        match self {
+            Self::Thinking(block) => block.index,
+            Self::Redacted { index, .. } => *index,
+        }
+    }
+
+    fn replay_block(self) -> Option<AnthropicReplayBlock> {
+        match self {
+            Self::Thinking(block) => block.replay_block(),
+            Self::Redacted { index, data } => {
+                Some(AnthropicReplayBlock::RedactedThinking { index, data })
+            }
+        }
     }
 }
 
@@ -247,6 +395,44 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
+}
+
+#[derive(Debug)]
+struct IndexedNativeContent {
+    /// Original position in Anthropic's assistant `content` array.
+    index: Option<u64>,
+    block: NativeContentOut,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndexedTextSpan {
+    index: u64,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Default)]
+struct StreamingTextBlock {
+    index: u64,
+    text: String,
+}
+
+impl StreamingTextBlock {
+    fn new(index: u64, initial_text: &str) -> Self {
+        Self {
+            index,
+            text: initial_text.to_string(),
+        }
+    }
+
+    fn replay_block(self) -> AnthropicReplayBlock {
+        AnthropicReplayBlock::Text {
+            index: self.index,
+            text: self.text,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -328,6 +514,9 @@ struct NativeContentIn {
     /// Signature for integrity verification of thinking blocks.
     #[serde(default)]
     signature: Option<String>,
+    /// Opaque encrypted payload for safety-redacted thinking blocks.
+    #[serde(default)]
+    data: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -500,9 +689,210 @@ impl AnthropicModelProvider {
                 }
                 NativeContentOut::ToolUse { .. }
                 | NativeContentOut::Image { .. }
-                | NativeContentOut::Thinking { .. } => {}
+                | NativeContentOut::Thinking { .. }
+                | NativeContentOut::RedactedThinking { .. } => {}
             }
         }
+    }
+
+    fn parse_reasoning_content_block(block: &serde_json::Value) -> Option<IndexedNativeContent> {
+        let index = block
+            .get(ANTHROPIC_BLOCK_INDEX_KEY)
+            .and_then(serde_json::Value::as_u64);
+        let block = match block.get("type").and_then(serde_json::Value::as_str) {
+            Some(ANTHROPIC_TEXT_BLOCK_MARKER) => return None,
+            Some("redacted_thinking") => block
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .map(|data| NativeContentOut::RedactedThinking {
+                    data: data.to_string(),
+                })?,
+            Some("thinking") => NativeContentOut::Thinking {
+                thinking: block
+                    .get("thinking")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                signature: block
+                    .get("signature")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|signature| !signature.is_empty())
+                    .map(str::to_string),
+            },
+            None if block.get("thinking").is_some() || block.get("signature").is_some() => {
+                NativeContentOut::Thinking {
+                    thinking: block
+                        .get("thinking")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    signature: block
+                        .get("signature")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|signature| !signature.is_empty())
+                        .map(str::to_string),
+                }
+            }
+            _ => return None,
+        };
+        Some(IndexedNativeContent { index, block })
+    }
+
+    fn native_tool_call(call: ProviderToolCall) -> NativeContentOut {
+        let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+        NativeContentOut::ToolUse {
+            id: call.id,
+            name: call.name,
+            input,
+            cache_control: None,
+        }
+    }
+
+    fn parse_text_span(block: &serde_json::Value) -> Option<IndexedTextSpan> {
+        if block.get("type").and_then(serde_json::Value::as_str)
+            != Some(ANTHROPIC_TEXT_BLOCK_MARKER)
+        {
+            return None;
+        }
+        Some(IndexedTextSpan {
+            index: block.get(ANTHROPIC_BLOCK_INDEX_KEY)?.as_u64()?,
+            start: usize::try_from(block.get(ANTHROPIC_TEXT_START_KEY)?.as_u64()?).ok()?,
+            end: usize::try_from(block.get(ANTHROPIC_TEXT_END_KEY)?.as_u64()?).ok()?,
+        })
+    }
+
+    fn indexed_tool_call(call: ProviderToolCall) -> IndexedNativeContent {
+        let index = anthropic_tool_call_index(call.extra_content.as_ref());
+        IndexedNativeContent {
+            index,
+            block: Self::native_tool_call(call),
+        }
+    }
+
+    fn rebuild_replay_envelope(
+        replay: Vec<AnthropicReplayBlock>,
+        mut tool_calls: Vec<ProviderToolCall>,
+    ) -> Option<Vec<NativeContentOut>> {
+        let mut blocks = Vec::with_capacity(replay.len());
+        for block in replay {
+            blocks.push(match block {
+                AnthropicReplayBlock::Thinking {
+                    thinking,
+                    signature,
+                    ..
+                } => NativeContentOut::Thinking {
+                    thinking,
+                    signature: (!signature.is_empty()).then_some(signature),
+                },
+                AnthropicReplayBlock::Text { text, .. } => NativeContentOut::Text {
+                    text,
+                    cache_control: None,
+                },
+                AnthropicReplayBlock::RedactedThinking { data, .. } => {
+                    NativeContentOut::RedactedThinking { data }
+                }
+                AnthropicReplayBlock::ToolUse { id, .. } => {
+                    let position = tool_calls.iter().position(|call| call.id == id)?;
+                    Self::native_tool_call(tool_calls.remove(position))
+                }
+            });
+        }
+        tool_calls.is_empty().then_some(blocks)
+    }
+
+    fn ordered_indexed_blocks(mut blocks: Vec<IndexedNativeContent>) -> Vec<NativeContentOut> {
+        blocks.sort_by_key(|block| block.index);
+        blocks.into_iter().map(|block| block.block).collect()
+    }
+
+    fn append_text_block(blocks: &mut Vec<NativeContentOut>, text: Option<&str>) {
+        if let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) {
+            blocks.push(NativeContentOut::Text {
+                text: text.to_string(),
+                cache_control: None,
+            });
+        }
+    }
+
+    fn parse_reasoning_blocks(value: &serde_json::Value) -> Vec<IndexedNativeContent> {
+        value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .into_iter()
+            .flat_map(str::lines)
+            .filter_map(|part| serde_json::from_str::<serde_json::Value>(part).ok())
+            .filter_map(|block| Self::parse_reasoning_content_block(&block))
+            .collect()
+    }
+
+    fn parse_text_spans(value: &serde_json::Value) -> Vec<IndexedTextSpan> {
+        value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .into_iter()
+            .flat_map(str::lines)
+            .filter_map(|part| serde_json::from_str::<serde_json::Value>(part).ok())
+            .filter_map(|block| Self::parse_text_span(&block))
+            .collect()
+    }
+
+    fn indexed_text_blocks(
+        text: Option<&str>,
+        mut spans: Vec<IndexedTextSpan>,
+    ) -> Option<Vec<IndexedNativeContent>> {
+        let Some(text) = text else {
+            return spans.is_empty().then_some(Vec::new());
+        };
+        if spans.is_empty() {
+            return None;
+        }
+        spans.sort_by_key(|span| span.start);
+        let mut cursor = 0;
+        let mut blocks = Vec::with_capacity(spans.len());
+        for span in spans {
+            let gap = text.get(cursor..span.start)?;
+            if !gap.is_empty() && gap != "\n" {
+                return None;
+            }
+            let part = text.get(span.start..span.end)?;
+            blocks.push(IndexedNativeContent {
+                index: Some(span.index),
+                block: NativeContentOut::Text {
+                    text: part.to_string(),
+                    cache_control: None,
+                },
+            });
+            cursor = span.end;
+        }
+        (cursor == text.len()).then_some(blocks)
+    }
+
+    fn rebuild_assistant_blocks(
+        reasoning: Vec<IndexedNativeContent>,
+        tools: Vec<IndexedNativeContent>,
+        text: Option<&str>,
+        text_spans: Vec<IndexedTextSpan>,
+    ) -> Vec<NativeContentOut> {
+        let indexed_text = Self::indexed_text_blocks(text, text_spans);
+        let can_restore_order = indexed_text.is_some()
+            && reasoning
+                .iter()
+                .chain(&tools)
+                .all(|block| block.index.is_some());
+        if can_restore_order {
+            return Self::ordered_indexed_blocks(
+                reasoning
+                    .into_iter()
+                    .chain(indexed_text.unwrap_or_default())
+                    .chain(tools)
+                    .collect(),
+            );
+        }
+        let mut blocks = reasoning.into_iter().map(|block| block.block).collect();
+        Self::append_text_block(&mut blocks, text);
+        blocks.extend(tools.into_iter().map(|block| block.block));
+        blocks
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -536,60 +926,30 @@ impl AnthropicModelProvider {
         let tool_calls = value
             .get("tool_calls")
             .and_then(|v| serde_json::from_value::<Vec<ProviderToolCall>>(v.clone()).ok())?;
-
-        let mut blocks = Vec::new();
-
-        // When extended thinking is enabled, assistant messages must start
-        // with thinking blocks (including signatures) before any tool_use
-        // blocks. The reasoning_content field stores JSON-encoded thinking
-        // blocks from the original response.
-        if let Some(reasoning) = value
+        let reasoning_content = value
             .get("reasoning_content")
-            .and_then(serde_json::Value::as_str)
-            .filter(|r| !r.is_empty())
+            .and_then(serde_json::Value::as_str);
+        if let Some(replay) = reasoning_content.and_then(AnthropicReplayEnvelope::decode)
+            && let Some(blocks) = Self::rebuild_replay_envelope(replay, tool_calls.clone())
         {
-            for part in reasoning.split('\n') {
-                if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
-                    let thinking = block
-                        .get("thinking")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let signature = block
-                        .get("signature")
-                        .and_then(|s| s.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string());
-                    blocks.push(NativeContentOut::Thinking {
-                        thinking,
-                        signature,
-                    });
-                }
-            }
+            return Some(blocks);
         }
-
-        if let Some(text) = value
+        let text = value
             .get("content")
             .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-        {
-            blocks.push(NativeContentOut::Text {
-                text: text.to_string(),
-                cache_control: None,
-            });
-        }
-        for call in tool_calls {
-            let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-            blocks.push(NativeContentOut::ToolUse {
-                id: call.id,
-                name: call.name,
-                input,
-                cache_control: None,
-            });
-        }
-        Some(blocks)
+            .filter(|text| !text.trim().is_empty());
+        let reasoning_blocks = Self::parse_reasoning_blocks(&value);
+        let text_spans = Self::parse_text_spans(&value);
+        let tool_blocks = tool_calls
+            .into_iter()
+            .map(Self::indexed_tool_call)
+            .collect::<Vec<_>>();
+        Some(Self::rebuild_assistant_blocks(
+            reasoning_blocks,
+            tool_blocks,
+            text,
+            text_spans,
+        ))
     }
 
     fn parse_tool_result_message(content: &str) -> Option<NativeMessage> {
@@ -929,8 +1289,8 @@ impl AnthropicModelProvider {
     }
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
-        let mut text_parts = Vec::new();
-        let mut thinking_parts = Vec::new();
+        let mut text = String::new();
+        let mut replay_blocks = Vec::new();
         let mut tool_calls = Vec::new();
 
         let usage = response.usage.map(|u| {
@@ -950,13 +1310,22 @@ impl AnthropicModelProvider {
             }
         });
 
-        for block in response.content {
+        for (index, block) in response.content.into_iter().enumerate() {
+            let index = u64::try_from(index).unwrap_or(u64::MAX);
             match block.kind.as_str() {
                 "text" => {
-                    if let Some(text) = block.text.map(|t| t.trim().to_string())
-                        && !text.is_empty()
-                    {
-                        text_parts.push(text);
+                    if let Some(raw_text) = block.text {
+                        replay_blocks.push(AnthropicReplayBlock::Text {
+                            index,
+                            text: raw_text.clone(),
+                        });
+                        let part = raw_text.trim().to_string();
+                        if !part.is_empty() {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&part);
+                        }
                     }
                 }
                 "thinking" => {
@@ -973,11 +1342,16 @@ impl AnthropicModelProvider {
                         .unwrap_or("");
                     let signature = block.signature.as_deref().unwrap_or("");
                     if !thinking.is_empty() || !signature.is_empty() {
-                        let json_block = serde_json::json!({
-                            "thinking": thinking,
-                            "signature": signature,
+                        replay_blocks.push(AnthropicReplayBlock::Thinking {
+                            index,
+                            thinking: thinking.to_string(),
+                            signature: signature.to_string(),
                         });
-                        thinking_parts.push(json_block.to_string());
+                    }
+                }
+                "redacted_thinking" => {
+                    if let Some(data) = block.data {
+                        replay_blocks.push(AnthropicReplayBlock::RedactedThinking { index, data });
                     }
                 }
                 "tool_use" => {
@@ -988,8 +1362,13 @@ impl AnthropicModelProvider {
                     let arguments = block
                         .input
                         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                    let id = block.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    replay_blocks.push(AnthropicReplayBlock::ToolUse {
+                        index,
+                        id: id.clone(),
+                    });
                     tool_calls.push(ProviderToolCall {
-                        id: block.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        id,
                         name,
                         arguments: arguments.to_string(),
                         extra_content: None,
@@ -999,18 +1378,10 @@ impl AnthropicModelProvider {
             }
         }
 
-        let reasoning_content = if thinking_parts.is_empty() {
-            None
-        } else {
-            Some(thinking_parts.join("\n"))
-        };
+        let reasoning_content = AnthropicReplayEnvelope::encode_reasoning_history(replay_blocks);
 
         ProviderChatResponse {
-            text: if text_parts.is_empty() {
-                None
-            } else {
-                Some(text_parts.join("\n"))
-            },
+            text: (!text.is_empty()).then_some(text),
             tool_calls,
             usage,
             reasoning_content,
@@ -1125,7 +1496,10 @@ impl AnthropicModelProvider {
         let mut tool_name: Option<String> = None;
         let mut tool_input_json = String::new();
         let mut tool_index: Option<u64> = None;
-        let mut thinking_block: Option<StreamingThinkingBlock> = None;
+        let mut reasoning_block: Option<StreamingReasoningBlock> = None;
+        let mut text_block: Option<StreamingTextBlock> = None;
+        let mut replay_blocks = Vec::new();
+        let mut saw_replay_reasoning = false;
 
         let mut input_tokens: Option<u64> = None;
         let mut output_tokens: Option<u64> = None;
@@ -1227,12 +1601,24 @@ impl AnthropicModelProvider {
                             .get("type")
                             .and_then(|t| t.as_str())
                             .unwrap_or_default();
-                        if block_type == "thinking" {
-                            thinking_block = Some(StreamingThinkingBlock::from_start(index, block));
+                        if let Some(block) = StreamingReasoningBlock::from_start(index, block) {
+                            reasoning_block = Some(block);
+                        } else if block_type == "text" {
+                            let initial_text = block
+                                .get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default();
+                            text_block = Some(StreamingTextBlock::new(index, initial_text));
                         } else if block_type == "tool_use" {
                             if let Some(id) = tool_id.take() {
                                 let name = tool_name.take().unwrap_or_default();
                                 let input = std::mem::take(&mut tool_input_json);
+                                if let Some(index) = tool_index.take() {
+                                    replay_blocks.push(AnthropicReplayBlock::ToolUse {
+                                        index,
+                                        id: id.clone(),
+                                    });
+                                }
                                 let _ = tx
                                     .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
                                         id,
@@ -1267,16 +1653,22 @@ impl AnthropicModelProvider {
                             .unwrap_or_default();
                         match delta_type {
                             "text_delta" => {
-                                if let Some(text) = delta.get("text").and_then(|t| t.as_str())
-                                    && !text.is_empty()
-                                    && tx
-                                        .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
-                                            text.to_string(),
-                                        ))))
-                                        .await
-                                        .is_err()
-                                {
-                                    return;
+                                if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                    if let Some(block) = text_block.as_mut()
+                                        && block.index == index
+                                    {
+                                        block.text.push_str(text);
+                                    }
+                                    if !text.is_empty()
+                                        && tx
+                                            .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                                                text.to_string(),
+                                            ))))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                             "input_json_delta" => {
@@ -1290,8 +1682,9 @@ impl AnthropicModelProvider {
                                 if let Some(thinking) =
                                     delta.get("thinking").and_then(|value| value.as_str())
                                 {
-                                    if let Some(block) =
-                                        thinking_block.as_mut().filter(|block| block.index == index)
+                                    if let Some(StreamingReasoningBlock::Thinking(block)) =
+                                        reasoning_block.as_mut()
+                                        && block.index == index
                                     {
                                         block.thinking.push_str(thinking);
                                     }
@@ -1310,8 +1703,9 @@ impl AnthropicModelProvider {
                             "signature_delta" => {
                                 if let Some(signature) =
                                     delta.get("signature").and_then(|value| value.as_str())
-                                    && let Some(block) =
-                                        thinking_block.as_mut().filter(|block| block.index == index)
+                                    && let Some(StreamingReasoningBlock::Thinking(block)) =
+                                        reasoning_block.as_mut()
+                                    && block.index == index
                                 {
                                     block.signature.push_str(signature);
                                 }
@@ -1325,14 +1719,24 @@ impl AnthropicModelProvider {
                         .get("index")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or_default();
-                    if thinking_block
+                    let mut replay_changed = false;
+                    if reasoning_block
+                        .as_ref()
+                        .is_some_and(|block| block.index() == index)
+                        && let Some(block) = reasoning_block
+                            .take()
+                            .and_then(StreamingReasoningBlock::replay_block)
+                    {
+                        replay_blocks.push(block);
+                        replay_changed = true;
+                    }
+                    if text_block
                         .as_ref()
                         .is_some_and(|block| block.index == index)
-                        && let Some(content) = thinking_block
-                            .take()
-                            .and_then(StreamingThinkingBlock::replay_content)
+                        && let Some(block) = text_block.take()
                     {
-                        let _ = tx.send(Ok(StreamEvent::ReasoningContent(content))).await;
+                        replay_blocks.push(block.replay_block());
+                        replay_changed = true;
                     }
                     if tool_index == Some(index)
                         && let Some(id) = tool_id.take()
@@ -1340,6 +1744,11 @@ impl AnthropicModelProvider {
                         let name = tool_name.take().unwrap_or_default();
                         let input = std::mem::take(&mut tool_input_json);
                         tool_index = None;
+                        replay_blocks.push(AnthropicReplayBlock::ToolUse {
+                            index,
+                            id: id.clone(),
+                        });
+                        replay_changed = true;
                         let _ = tx
                             .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
                                 id,
@@ -1348,6 +1757,16 @@ impl AnthropicModelProvider {
                                 extra_content: None,
                             })))
                             .await;
+                    }
+                    let completed_reasoning =
+                        replay_blocks.iter().any(AnthropicReplayBlock::is_reasoning);
+                    if replay_changed && (saw_replay_reasoning || completed_reasoning) {
+                        saw_replay_reasoning = true;
+                        if let Some(content) =
+                            AnthropicReplayEnvelope::encode(std::mem::take(&mut replay_blocks))
+                        {
+                            let _ = tx.send(Ok(StreamEvent::ReasoningContent(content))).await;
+                        }
                     }
                 }
                 "message_delta" => {
@@ -1905,6 +2324,14 @@ mod tests {
     use super::*;
     use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
 
+    fn replay_blocks(reasoning_content: &str) -> Vec<serde_json::Value> {
+        AnthropicReplayEnvelope::decode(reasoning_content)
+            .expect("valid replay envelope")
+            .into_iter()
+            .map(|block| serde_json::to_value(block).unwrap())
+            .collect()
+    }
+
     fn fake_anthropic_sse() -> &'static [u8] {
         b"event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":314,\"cache_read_input_tokens\":42,\"cache_creation_input_tokens\":100}}}\n\n\
@@ -1946,6 +2373,66 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":12}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    fn fake_redacted_thinking_tool_sse() -> &'static [u8] {
+        b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque_redacted_data\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"search\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"rust\\\"}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":12}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    fn fake_interleaved_reasoning_tool_sse() -> &'static [u8] {
+        b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"first\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_1\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" I'll search. \"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"search\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"one\\\"}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":2}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque_redacted_data\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":3}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":4,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\u7b2c\\u4e8c\\u4e2a\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\u6765\\u6e90\\u3002\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":4}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":5,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_2\",\"name\":\"search\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":5,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"two\\\"}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":5}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n"
     }
@@ -2008,28 +2495,132 @@ data: {\"type\":\"message_stop\"}\n\n"
                 if reasoning == "Checking sources"
         ));
 
-        let replay = rx
-            .recv()
-            .await
-            .expect("replay block")
-            .expect("valid replay");
-        let StreamEvent::ReasoningContent(replay) = replay else {
-            panic!("expected opaque reasoning content");
-        };
-        let replay: serde_json::Value = serde_json::from_str(&replay).expect("valid replay JSON");
-        assert_eq!(replay["thinking"], "Checking sources");
-        assert_eq!(replay["signature"], "sig_abc");
+        let mut replay = Vec::new();
+        let mut tool = None;
+        while let Ok(event) = rx.try_recv() {
+            match event.expect("valid stream event") {
+                StreamEvent::ReasoningContent(content) => replay.push(content),
+                StreamEvent::ToolCall(call) => tool = Some(call),
+                _ => {}
+            }
+        }
+        let blocks = replay_blocks(&replay.join("\n"));
+        assert_eq!(blocks[0]["thinking"], "Checking sources");
+        assert_eq!(blocks[0]["signature"], "sig_abc");
+        let tool = tool.expect("tool call");
+        assert_eq!(tool.id, "tool_1");
+        assert_eq!(tool.name, "search");
+        assert_eq!(tool.arguments, r#"{"q":"rust"}"#);
+        assert!(tool.extra_content.is_none());
+    }
 
-        let tool = rx
-            .recv()
-            .await
-            .expect("tool call")
-            .expect("valid tool call");
-        assert!(matches!(
-            tool,
-            StreamEvent::ToolCall(ProviderToolCall { id, name, arguments, .. })
-                if id == "tool_1" && name == "search" && arguments == r#"{"q":"rust"}"#
-        ));
+    #[tokio::test]
+    async fn streaming_replay_snapshot_survives_disconnect_after_tool_block() {
+        use std::io::Cursor;
+
+        let stream = std::str::from_utf8(fake_signed_thinking_tool_sse()).unwrap();
+        let partial = stream
+            .split_once("event: message_delta")
+            .expect("fixture contains message delta")
+            .0;
+        let reader = tokio::io::BufReader::new(Cursor::new(partial.as_bytes()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut replay = Vec::new();
+        let mut tool_calls = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                Ok(StreamEvent::ReasoningContent(content)) => replay.push(content),
+                Ok(StreamEvent::ToolCall(call)) => tool_calls.push(call),
+                _ => {}
+            }
+        }
+        let assistant = serde_json::json!({
+            "content": null,
+            "reasoning_content": replay.join("\n"),
+            "tool_calls": tool_calls,
+        })
+        .to_string();
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("completed blocks remain replayable after disconnect");
+        let replayed = serde_json::to_value(blocks).unwrap();
+
+        assert_eq!(replayed[0]["type"], "thinking");
+        assert_eq!(replayed[0]["signature"], "sig_abc");
+        assert_eq!(replayed[1]["type"], "tool_use");
+        assert_eq!(replayed[1]["id"], "tool_1");
+    }
+
+    #[tokio::test]
+    async fn streaming_redacted_thinking_is_replayable_without_visible_reasoning() {
+        use std::io::Cursor;
+
+        let reader = tokio::io::BufReader::new(Cursor::new(fake_redacted_thinking_tool_sse()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut replay = Vec::new();
+        let mut tool = None;
+        while let Ok(event) = rx.try_recv() {
+            match event.expect("valid stream event") {
+                StreamEvent::ReasoningContent(content) => replay.push(content),
+                StreamEvent::ToolCall(call) => tool = Some(call),
+                StreamEvent::TextDelta(chunk) => {
+                    assert!(chunk.reasoning.is_none(), "redacted data must stay hidden")
+                }
+                _ => {}
+            }
+        }
+        let blocks = replay_blocks(&replay.join("\n"));
+        assert_eq!(blocks[0]["type"], "redacted_thinking");
+        assert_eq!(blocks[0]["data"], "opaque_redacted_data");
+        let tool = tool.expect("tool call");
+        assert_eq!(tool.id, "tool_1");
+        assert_eq!(tool.name, "search");
+        assert_eq!(tool.arguments, r#"{"q":"rust"}"#);
+        assert!(tool.extra_content.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_interleaved_reasoning_keeps_original_tool_order_on_replay() {
+        use std::io::Cursor;
+
+        let reader = tokio::io::BufReader::new(Cursor::new(fake_interleaved_reasoning_tool_sse()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut reasoning = Vec::new();
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event.expect("valid stream event") {
+                StreamEvent::ReasoningContent(content) => reasoning.push(content),
+                StreamEvent::TextDelta(chunk) => text.push_str(&chunk.delta),
+                StreamEvent::ToolCall(call) => tool_calls.push(call),
+                _ => {}
+            }
+        }
+        let assistant = serde_json::json!({
+            "content": text.trim(),
+            "reasoning_content": reasoning.join("\n"),
+            "tool_calls": tool_calls,
+        })
+        .to_string();
+
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("assistant message should parse");
+        let replayed = serde_json::to_value(blocks).unwrap();
+        assert_eq!(replayed[0]["type"], "thinking");
+        assert_eq!(replayed[1]["type"], "text");
+        assert_eq!(replayed[1]["text"], " I'll search. ");
+        assert_eq!(replayed[2]["id"], "tu_1");
+        assert_eq!(replayed[3]["type"], "redacted_thinking");
+        assert_eq!(replayed[4]["type"], "text");
+        assert_eq!(replayed[4]["text"], "第二个来源。");
+        assert_eq!(replayed[5]["id"], "tu_2");
     }
 
     #[tokio::test]
@@ -3598,13 +4189,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicModelProvider::parse_native_response(resp);
         let reasoning = result.reasoning_content.expect("thinking preserved");
-        let parsed: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        let blocks = replay_blocks(&reasoning);
         assert_eq!(
-            parsed.get("thinking").and_then(|v| v.as_str()),
+            blocks[0].get("thinking").and_then(|v| v.as_str()),
             Some("  \nStep 1: consider the request.\nStep 2: respond.\n  ")
         );
         assert_eq!(
-            parsed.get("signature").and_then(|v| v.as_str()),
+            blocks[0].get("signature").and_then(|v| v.as_str()),
             Some("sig_abc123")
         );
     }
@@ -3682,6 +4273,262 @@ data: {\"type\":\"message_stop\"}\n\n";
             }
             other => panic!("expected signed Thinking block first, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn redacted_thinking_round_trips_into_assistant_history() {
+        let response_json = r#"{
+            "content": [
+                {"type": "redacted_thinking", "data": "opaque_redacted_data"},
+                {"type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "Paris"}}
+            ]
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(response_json).unwrap();
+        let parsed = AnthropicModelProvider::parse_native_response(response);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("redacted thinking must be preserved for replay");
+        let preserved = replay_blocks(&reasoning);
+        assert_eq!(preserved[0]["type"], "redacted_thinking");
+        assert_eq!(preserved[0]["data"], "opaque_redacted_data");
+
+        let assistant = serde_json::json!({
+            "content": null,
+            "reasoning_content": reasoning,
+            "tool_calls": parsed.tool_calls,
+        })
+        .to_string();
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("assistant message should parse");
+        let replayed = serde_json::to_value(blocks.first().expect("redacted block first")).unwrap();
+        assert_eq!(replayed["type"], "redacted_thinking");
+        assert_eq!(replayed["data"], "opaque_redacted_data");
+    }
+
+    #[test]
+    fn interleaved_reasoning_keeps_original_tool_order_on_replay() {
+        let response_json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "first", "signature": "sig_1"},
+                {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "one"}},
+                {"type": "redacted_thinking", "data": "opaque_redacted_data"},
+                {"type": "tool_use", "id": "tu_2", "name": "search", "input": {"q": "two"}}
+            ]
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(response_json).unwrap();
+        let parsed = AnthropicModelProvider::parse_native_response(response);
+        assert!(
+            parsed
+                .tool_calls
+                .iter()
+                .all(|call| call.extra_content.is_none()),
+            "replay ordering must not depend on tool-call extension persistence"
+        );
+        let assistant = serde_json::json!({
+            "content": null,
+            "reasoning_content": parsed.reasoning_content,
+            "tool_calls": parsed.tool_calls,
+        })
+        .to_string();
+
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("assistant message should parse");
+        let replayed = serde_json::to_value(blocks).unwrap();
+
+        assert_eq!(replayed[0]["type"], "thinking");
+        assert_eq!(replayed[1]["type"], "tool_use");
+        assert_eq!(replayed[1]["id"], "tu_1");
+        assert_eq!(replayed[2]["type"], "redacted_thinking");
+        assert_eq!(replayed[3]["type"], "tool_use");
+        assert_eq!(replayed[3]["id"], "tu_2");
+        assert!(replayed.as_array().unwrap().iter().all(|block| {
+            block.get("index").is_none()
+                && block.get("provider").is_none()
+                && block.get("kind").is_none()
+                && block.get(ANTHROPIC_BLOCK_INDEX_KEY).is_none()
+                && block.get("extra_content").is_none()
+        }));
+    }
+
+    #[test]
+    fn interleaved_reasoning_with_text_keeps_complete_block_order_on_replay() {
+        let response_json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "first", "signature": "sig_1"},
+                {"type": "text", "text": "I'll search."},
+                {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "one"}},
+                {"type": "redacted_thinking", "data": "opaque_redacted_data"},
+                {"type": "text", "text": "第二个来源。"},
+                {"type": "tool_use", "id": "tu_2", "name": "search", "input": {"q": "two"}}
+            ]
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(response_json).unwrap();
+        let parsed = AnthropicModelProvider::parse_native_response(response);
+        let assistant = serde_json::json!({
+            "content": parsed.text,
+            "reasoning_content": parsed.reasoning_content,
+            "tool_calls": parsed.tool_calls,
+        })
+        .to_string();
+
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("assistant message should parse");
+        let replayed = serde_json::to_value(blocks).unwrap();
+
+        assert_eq!(replayed[0]["type"], "thinking");
+        assert_eq!(replayed[1]["text"], "I'll search.");
+        assert_eq!(replayed[2]["id"], "tu_1");
+        assert_eq!(replayed[3]["type"], "redacted_thinking");
+        assert_eq!(replayed[4]["text"], "第二个来源。");
+        assert_eq!(replayed[5]["id"], "tu_2");
+        assert!(replayed.as_array().unwrap().iter().all(|block| {
+            block.get("index").is_none()
+                && block.get("provider").is_none()
+                && block.get("kind").is_none()
+                && block.get(ANTHROPIC_BLOCK_INDEX_KEY).is_none()
+                && block.get("extra_content").is_none()
+        }));
+    }
+
+    #[test]
+    fn invalid_text_span_falls_back_without_losing_assistant_blocks() {
+        let damaged_reasoning = [
+            serde_json::json!({
+                "type": "thinking",
+                "thinking": "first",
+                "signature": "sig_1",
+                ANTHROPIC_BLOCK_INDEX_KEY: 0,
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": ANTHROPIC_TEXT_BLOCK_MARKER,
+                ANTHROPIC_BLOCK_INDEX_KEY: 1,
+                ANTHROPIC_TEXT_START_KEY: 0,
+                ANTHROPIC_TEXT_END_KEY: usize::MAX,
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        let assistant = serde_json::json!({
+            "content": "I'll search.",
+            "reasoning_content": damaged_reasoning,
+            "tool_calls": [{
+                "id": "tu_1",
+                "name": "search",
+                "arguments": "{\"q\":\"one\"}",
+                "extra_content": {
+                    ANTHROPIC_EXTRA_CONTENT_KEY: {ANTHROPIC_BLOCK_INDEX_KEY: 2},
+                },
+            }],
+        })
+        .to_string();
+
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("invalid span should use the compatible fallback");
+        let replayed = serde_json::to_value(blocks).unwrap();
+
+        assert_eq!(replayed.as_array().unwrap().len(), 3);
+        assert_eq!(replayed[0]["type"], "thinking");
+        assert_eq!(replayed[0]["thinking"], "first");
+        assert_eq!(replayed[1]["type"], "text");
+        assert_eq!(replayed[1]["text"], "I'll search.");
+        assert_eq!(replayed[2]["type"], "tool_use");
+        assert_eq!(replayed[2]["id"], "tu_1");
+    }
+
+    #[test]
+    fn legacy_indexed_history_keeps_exact_block_order() {
+        let reasoning = [
+            serde_json::json!({
+                "type": "thinking",
+                "thinking": "first",
+                "signature": "sig_1",
+                ANTHROPIC_BLOCK_INDEX_KEY: 0,
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": ANTHROPIC_TEXT_BLOCK_MARKER,
+                ANTHROPIC_BLOCK_INDEX_KEY: 1,
+                ANTHROPIC_TEXT_START_KEY: 0,
+                ANTHROPIC_TEXT_END_KEY: 12,
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        let assistant = serde_json::json!({
+            "content": "I'll search.",
+            "reasoning_content": reasoning,
+            "tool_calls": [{
+                "id": "tu_1",
+                "name": "search",
+                "arguments": "{}",
+                "extra_content": {
+                    ANTHROPIC_EXTRA_CONTENT_KEY: {ANTHROPIC_BLOCK_INDEX_KEY: 2},
+                },
+            }],
+        })
+        .to_string();
+
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("legacy assistant message should parse");
+        let replayed = serde_json::to_value(blocks).unwrap();
+
+        assert_eq!(replayed[0]["type"], "thinking");
+        assert_eq!(replayed[1]["type"], "text");
+        assert_eq!(replayed[2]["type"], "tool_use");
+    }
+
+    #[test]
+    fn foreign_provider_replay_envelope_is_not_sent_as_thinking() {
+        let foreign = serde_json::json!({
+            "provider": "openai_codex",
+            "kind": "responses_output_items",
+            "items": [{"type": "reasoning", "id": "rs_1"}],
+        });
+        let assistant = serde_json::json!({
+            "content": "Previous provider answer",
+            "reasoning_content": foreign.to_string(),
+            "tool_calls": [{
+                "id": "tu_1",
+                "name": "search",
+                "arguments": "{}",
+            }],
+        })
+        .to_string();
+
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("assistant message should parse");
+        let replayed = serde_json::to_value(blocks).unwrap();
+
+        assert_eq!(replayed.as_array().unwrap().len(), 2);
+        assert_eq!(replayed[0]["type"], "text");
+        assert_eq!(replayed[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn legacy_unindexed_reasoning_history_keeps_compatible_replay_order() {
+        let reasoning = [
+            serde_json::json!({"thinking": "legacy", "signature": "sig"}).to_string(),
+            serde_json::json!({"type": "redacted_thinking", "data": "opaque"}).to_string(),
+        ]
+        .join("\n");
+        let assistant = serde_json::json!({
+            "content": null,
+            "reasoning_content": reasoning,
+            "tool_calls": [{
+                "id": "tu_1",
+                "name": "search",
+                "arguments": "{}",
+            }],
+        })
+        .to_string();
+
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("legacy assistant message should parse");
+        let replayed = serde_json::to_value(blocks).unwrap();
+        assert_eq!(replayed[0]["type"], "thinking");
+        assert_eq!(replayed[1]["type"], "redacted_thinking");
+        assert_eq!(replayed[2]["id"], "tu_1");
     }
 
     #[test]
