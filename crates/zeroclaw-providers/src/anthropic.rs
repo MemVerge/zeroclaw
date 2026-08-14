@@ -20,6 +20,9 @@ const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90)
 /// and are stripped when [`NativeContentOut`] is serialized for Anthropic.
 const ANTHROPIC_BLOCK_INDEX_KEY: &str = "__anthropic_content_block_index";
 const ANTHROPIC_EXTRA_CONTENT_KEY: &str = "anthropic";
+const ANTHROPIC_TEXT_BLOCK_MARKER: &str = "__anthropic_text_block";
+const ANTHROPIC_TEXT_START_KEY: &str = "start";
+const ANTHROPIC_TEXT_END_KEY: &str = "end";
 
 use crate::stream_guard::AbortOnDrop;
 
@@ -326,6 +329,33 @@ struct IndexedNativeContent {
     block: NativeContentOut,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct IndexedTextSpan {
+    index: u64,
+    start: usize,
+    end: usize,
+}
+
+impl IndexedTextSpan {
+    fn empty(index: u64, offset: usize) -> Self {
+        Self {
+            index,
+            start: offset,
+            end: offset,
+        }
+    }
+
+    fn replay_content(self) -> String {
+        serde_json::json!({
+            "type": ANTHROPIC_TEXT_BLOCK_MARKER,
+            ANTHROPIC_BLOCK_INDEX_KEY: self.index,
+            ANTHROPIC_TEXT_START_KEY: self.start,
+            ANTHROPIC_TEXT_END_KEY: self.end,
+        })
+        .to_string()
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct NativeToolSpec {
     name: String,
@@ -591,6 +621,7 @@ impl AnthropicModelProvider {
             .get(ANTHROPIC_BLOCK_INDEX_KEY)
             .and_then(serde_json::Value::as_u64);
         let block = match block.get("type").and_then(serde_json::Value::as_str) {
+            Some(ANTHROPIC_TEXT_BLOCK_MARKER) => return None,
             Some("redacted_thinking") => block
                 .get("data")
                 .and_then(serde_json::Value::as_str)
@@ -611,6 +642,19 @@ impl AnthropicModelProvider {
             },
         };
         Some(IndexedNativeContent { index, block })
+    }
+
+    fn parse_text_span(block: &serde_json::Value) -> Option<IndexedTextSpan> {
+        if block.get("type").and_then(serde_json::Value::as_str)
+            != Some(ANTHROPIC_TEXT_BLOCK_MARKER)
+        {
+            return None;
+        }
+        Some(IndexedTextSpan {
+            index: block.get(ANTHROPIC_BLOCK_INDEX_KEY)?.as_u64()?,
+            start: usize::try_from(block.get(ANTHROPIC_TEXT_START_KEY)?.as_u64()?).ok()?,
+            end: usize::try_from(block.get(ANTHROPIC_TEXT_END_KEY)?.as_u64()?).ok()?,
+        })
     }
 
     fn indexed_tool_call(call: ProviderToolCall) -> IndexedNativeContent {
@@ -653,18 +697,68 @@ impl AnthropicModelProvider {
             .collect()
     }
 
+    fn parse_text_spans(value: &serde_json::Value) -> Vec<IndexedTextSpan> {
+        value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .into_iter()
+            .flat_map(str::lines)
+            .filter_map(|part| serde_json::from_str::<serde_json::Value>(part).ok())
+            .filter_map(|block| Self::parse_text_span(&block))
+            .collect()
+    }
+
+    fn indexed_text_blocks(
+        text: Option<&str>,
+        mut spans: Vec<IndexedTextSpan>,
+    ) -> Option<Vec<IndexedNativeContent>> {
+        let Some(text) = text else {
+            return spans.is_empty().then_some(Vec::new());
+        };
+        if spans.is_empty() {
+            return None;
+        }
+        spans.sort_by_key(|span| span.start);
+        let mut cursor = 0;
+        let mut blocks = Vec::with_capacity(spans.len());
+        for span in spans {
+            let gap = text.get(cursor..span.start)?;
+            if !gap.is_empty() && gap != "\n" {
+                return None;
+            }
+            let part = text.get(span.start..span.end)?;
+            blocks.push(IndexedNativeContent {
+                index: Some(span.index),
+                block: NativeContentOut::Text {
+                    text: part.to_string(),
+                    cache_control: None,
+                },
+            });
+            cursor = span.end;
+        }
+        (cursor == text.len()).then_some(blocks)
+    }
+
     fn rebuild_assistant_blocks(
         reasoning: Vec<IndexedNativeContent>,
         tools: Vec<IndexedNativeContent>,
         text: Option<&str>,
+        text_spans: Vec<IndexedTextSpan>,
     ) -> Vec<NativeContentOut> {
-        let can_restore_order = text.is_none()
+        let indexed_text = Self::indexed_text_blocks(text, text_spans);
+        let can_restore_order = indexed_text.is_some()
             && reasoning
                 .iter()
                 .chain(&tools)
                 .all(|block| block.index.is_some());
         if can_restore_order {
-            return Self::ordered_indexed_blocks(reasoning.into_iter().chain(tools).collect());
+            return Self::ordered_indexed_blocks(
+                reasoning
+                    .into_iter()
+                    .chain(indexed_text.unwrap_or_default())
+                    .chain(tools)
+                    .collect(),
+            );
         }
         let mut blocks = reasoning.into_iter().map(|block| block.block).collect();
         Self::append_text_block(&mut blocks, text);
@@ -706,9 +800,9 @@ impl AnthropicModelProvider {
         let text = value
             .get("content")
             .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty());
+            .filter(|text| !text.trim().is_empty());
         let reasoning_blocks = Self::parse_reasoning_blocks(&value);
+        let text_spans = Self::parse_text_spans(&value);
         let tool_blocks = tool_calls
             .into_iter()
             .map(Self::indexed_tool_call)
@@ -717,6 +811,7 @@ impl AnthropicModelProvider {
             reasoning_blocks,
             tool_blocks,
             text,
+            text_spans,
         ))
     }
 
@@ -1057,7 +1152,8 @@ impl AnthropicModelProvider {
     }
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
-        let mut text_parts = Vec::new();
+        let mut text = String::new();
+        let mut text_spans = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
@@ -1082,10 +1178,19 @@ impl AnthropicModelProvider {
             let index = u64::try_from(index).unwrap_or(u64::MAX);
             match block.kind.as_str() {
                 "text" => {
-                    if let Some(text) = block.text.map(|t| t.trim().to_string())
-                        && !text.is_empty()
+                    if let Some(part) = block.text.map(|t| t.trim().to_string())
+                        && !part.is_empty()
                     {
-                        text_parts.push(text);
+                        if !text_spans.is_empty() {
+                            text.push('\n');
+                        }
+                        let start = text.len();
+                        text.push_str(&part);
+                        text_spans.push(IndexedTextSpan {
+                            index,
+                            start,
+                            end: text.len(),
+                        });
                     }
                 }
                 "thinking" => {
@@ -1142,6 +1247,15 @@ impl AnthropicModelProvider {
             }
         }
 
+        if !thinking_parts.is_empty() && !tool_calls.is_empty() {
+            thinking_parts.extend(
+                text_spans
+                    .iter()
+                    .copied()
+                    .map(IndexedTextSpan::replay_content),
+            );
+        }
+
         let reasoning_content = if thinking_parts.is_empty() {
             None
         } else {
@@ -1149,11 +1263,7 @@ impl AnthropicModelProvider {
         };
 
         ProviderChatResponse {
-            text: if text_parts.is_empty() {
-                None
-            } else {
-                Some(text_parts.join("\n"))
-            },
+            text: (!text.is_empty()).then_some(text),
             tool_calls,
             usage,
             reasoning_content,
@@ -1269,6 +1379,11 @@ impl AnthropicModelProvider {
         let mut tool_input_json = String::new();
         let mut tool_index: Option<u64> = None;
         let mut reasoning_block: Option<StreamingReasoningBlock> = None;
+        let mut text_block: Option<IndexedTextSpan> = None;
+        let mut text_spans = Vec::new();
+        let mut streamed_text_bytes = 0;
+        let mut saw_replay_reasoning = false;
+        let mut saw_tool_use = false;
 
         let mut input_tokens: Option<u64> = None;
         let mut output_tokens: Option<u64> = None;
@@ -1372,6 +1487,8 @@ impl AnthropicModelProvider {
                             .unwrap_or_default();
                         if let Some(block) = StreamingReasoningBlock::from_start(index, block) {
                             reasoning_block = Some(block);
+                        } else if block_type == "text" {
+                            text_block = Some(IndexedTextSpan::empty(index, streamed_text_bytes));
                         } else if block_type == "tool_use" {
                             if let Some(id) = tool_id.take() {
                                 let name = tool_name.take().unwrap_or_default();
@@ -1384,6 +1501,7 @@ impl AnthropicModelProvider {
                                         extra_content: tool_index.map(anthropic_tool_call_metadata),
                                     })))
                                     .await;
+                                saw_tool_use = true;
                             }
                             tool_id = block
                                 .get("id")
@@ -1410,16 +1528,24 @@ impl AnthropicModelProvider {
                             .unwrap_or_default();
                         match delta_type {
                             "text_delta" => {
-                                if let Some(text) = delta.get("text").and_then(|t| t.as_str())
-                                    && !text.is_empty()
-                                    && tx
-                                        .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
-                                            text.to_string(),
-                                        ))))
-                                        .await
-                                        .is_err()
-                                {
-                                    return;
+                                if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                    streamed_text_bytes =
+                                        streamed_text_bytes.saturating_add(text.len());
+                                    if let Some(block) = text_block.as_mut()
+                                        && block.index == index
+                                    {
+                                        block.end = streamed_text_bytes;
+                                    }
+                                    if !text.is_empty()
+                                        && tx
+                                            .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                                                text.to_string(),
+                                            ))))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                             "input_json_delta" => {
@@ -1478,6 +1604,14 @@ impl AnthropicModelProvider {
                             .and_then(StreamingReasoningBlock::replay_content)
                     {
                         let _ = tx.send(Ok(StreamEvent::ReasoningContent(content))).await;
+                        saw_replay_reasoning = true;
+                    }
+                    if text_block
+                        .as_ref()
+                        .is_some_and(|block| block.index == index)
+                        && let Some(block) = text_block.take()
+                    {
+                        text_spans.push(block);
                     }
                     if tool_index == Some(index)
                         && let Some(id) = tool_id.take()
@@ -1493,6 +1627,7 @@ impl AnthropicModelProvider {
                                 extra_content: Some(anthropic_tool_call_metadata(index)),
                             })))
                             .await;
+                        saw_tool_use = true;
                     }
                 }
                 "message_delta" => {
@@ -1554,6 +1689,13 @@ impl AnthropicModelProvider {
                                 cached_input_tokens,
                             })))
                             .await;
+                    }
+                    if saw_replay_reasoning && saw_tool_use {
+                        for span in std::mem::take(&mut text_spans) {
+                            let _ = tx
+                                .send(Ok(StreamEvent::ReasoningContent(span.replay_content())))
+                                .await;
+                        }
                     }
                     let _ = tx.send(Ok(StreamEvent::Final)).await;
                     return;
@@ -2122,21 +2264,35 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signat
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
 event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"search\",\"input\":{}}}\n\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
 event: content_block_delta\n\
-data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"one\\\"}\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" I'll search. \"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
 event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque_redacted_data\"}}\n\n\
+data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"search\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"one\\\"}\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":2}\n\n\
 event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_2\",\"name\":\"search\",\"input\":{}}}\n\n\
-event: content_block_delta\n\
-data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"two\\\"}\"}}\n\n\
+data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque_redacted_data\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":3}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":4,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\u7b2c\\u4e8c\\u4e2a\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\u6765\\u6e90\\u3002\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":4}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":5,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_2\",\"name\":\"search\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":5,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"two\\\"}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":5}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n"
     }
@@ -2265,16 +2421,18 @@ data: {\"type\":\"message_stop\"}\n\n"
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
 
         let mut reasoning = Vec::new();
+        let mut text = String::new();
         let mut tool_calls = Vec::new();
         while let Ok(event) = rx.try_recv() {
             match event.expect("valid stream event") {
                 StreamEvent::ReasoningContent(content) => reasoning.push(content),
+                StreamEvent::TextDelta(chunk) => text.push_str(&chunk.delta),
                 StreamEvent::ToolCall(call) => tool_calls.push(call),
                 _ => {}
             }
         }
         let assistant = serde_json::json!({
-            "content": null,
+            "content": text,
             "reasoning_content": reasoning.join("\n"),
             "tool_calls": tool_calls,
         })
@@ -2284,9 +2442,13 @@ data: {\"type\":\"message_stop\"}\n\n"
             .expect("assistant message should parse");
         let replayed = serde_json::to_value(blocks).unwrap();
         assert_eq!(replayed[0]["type"], "thinking");
-        assert_eq!(replayed[1]["id"], "tu_1");
-        assert_eq!(replayed[2]["type"], "redacted_thinking");
-        assert_eq!(replayed[3]["id"], "tu_2");
+        assert_eq!(replayed[1]["type"], "text");
+        assert_eq!(replayed[1]["text"], " I'll search. ");
+        assert_eq!(replayed[2]["id"], "tu_1");
+        assert_eq!(replayed[3]["type"], "redacted_thinking");
+        assert_eq!(replayed[4]["type"], "text");
+        assert_eq!(replayed[4]["text"], "第二个来源。");
+        assert_eq!(replayed[5]["id"], "tu_2");
     }
 
     #[tokio::test]
@@ -4003,6 +4165,85 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(replayed.as_array().unwrap().iter().all(|block| {
             block.get(ANTHROPIC_BLOCK_INDEX_KEY).is_none() && block.get("extra_content").is_none()
         }));
+    }
+
+    #[test]
+    fn interleaved_reasoning_with_text_keeps_complete_block_order_on_replay() {
+        let response_json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "first", "signature": "sig_1"},
+                {"type": "text", "text": "I'll search."},
+                {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "one"}},
+                {"type": "redacted_thinking", "data": "opaque_redacted_data"},
+                {"type": "text", "text": "第二个来源。"},
+                {"type": "tool_use", "id": "tu_2", "name": "search", "input": {"q": "two"}}
+            ]
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(response_json).unwrap();
+        let parsed = AnthropicModelProvider::parse_native_response(response);
+        let assistant = serde_json::json!({
+            "content": parsed.text,
+            "reasoning_content": parsed.reasoning_content,
+            "tool_calls": parsed.tool_calls,
+        })
+        .to_string();
+
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("assistant message should parse");
+        let replayed = serde_json::to_value(blocks).unwrap();
+
+        assert_eq!(replayed[0]["type"], "thinking");
+        assert_eq!(replayed[1]["text"], "I'll search.");
+        assert_eq!(replayed[2]["id"], "tu_1");
+        assert_eq!(replayed[3]["type"], "redacted_thinking");
+        assert_eq!(replayed[4]["text"], "第二个来源。");
+        assert_eq!(replayed[5]["id"], "tu_2");
+        assert!(replayed.as_array().unwrap().iter().all(|block| {
+            block.get(ANTHROPIC_BLOCK_INDEX_KEY).is_none() && block.get("extra_content").is_none()
+        }));
+    }
+
+    #[test]
+    fn invalid_text_span_falls_back_without_losing_assistant_blocks() {
+        let response_json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "first", "signature": "sig_1"},
+                {"type": "text", "text": "I'll search."},
+                {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "one"}}
+            ]
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(response_json).unwrap();
+        let parsed = AnthropicModelProvider::parse_native_response(response);
+        let reasoning = parsed.reasoning_content.expect("replay metadata");
+        let damaged_reasoning = reasoning
+            .lines()
+            .map(|line| {
+                let mut block: serde_json::Value = serde_json::from_str(line).unwrap();
+                if block["type"] == ANTHROPIC_TEXT_BLOCK_MARKER {
+                    block[ANTHROPIC_TEXT_END_KEY] = serde_json::json!(usize::MAX);
+                }
+                block.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let assistant = serde_json::json!({
+            "content": parsed.text,
+            "reasoning_content": damaged_reasoning,
+            "tool_calls": parsed.tool_calls,
+        })
+        .to_string();
+
+        let blocks = AnthropicModelProvider::parse_assistant_tool_call_message(&assistant)
+            .expect("invalid span should use the compatible fallback");
+        let replayed = serde_json::to_value(blocks).unwrap();
+
+        assert_eq!(replayed.as_array().unwrap().len(), 3);
+        assert_eq!(replayed[0]["type"], "thinking");
+        assert_eq!(replayed[0]["thinking"], "first");
+        assert_eq!(replayed[1]["type"], "text");
+        assert_eq!(replayed[1]["text"], "I'll search.");
+        assert_eq!(replayed[2]["type"], "tool_use");
+        assert_eq!(replayed[2]["id"], "tu_1");
     }
 
     #[test]
