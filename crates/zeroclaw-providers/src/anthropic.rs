@@ -1394,8 +1394,9 @@ impl AnthropicModelProvider {
 
     /// Resolve thinking parameters for an API request. Returns the effective
     /// temperature (forced to 1.0 when thinking is active), the thinking
-    /// config for the request body, and the effective max_tokens (raised to
-    /// meet budget_tokens minimum when the model uses the fixed-budget shape).
+    /// config for the request body, and the effective max_tokens. Manual mode
+    /// raises the limit above budget_tokens; Claude 4.6 adaptive mode preserves
+    /// the former budget as an output-capacity floor without serializing it.
     fn resolve_thinking(
         &self,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
@@ -1413,11 +1414,12 @@ impl AnthropicModelProvider {
                 // Adaptive thinking can omit display output by default. Request
                 // the only generally available visible form explicitly; Anthropic
                 // does not expose raw chain-of-thought through this API.
-                // Keep the former manual-thinking output capacity as a floor so
+                // Keep the former manual-thinking budget as a capacity floor so
                 // switching Claude 4.6 to adaptive cannot shrink high-effort
-                // requests to the provider's baseline max_tokens value.
+                // requests to the provider baseline. The strict `+ 1` applies
+                // only when budget_tokens is serialized in manual mode.
                 let max_tokens = if anthropic_model_is_claude_4_6(model) {
-                    self.max_tokens.max(params.budget_tokens.saturating_add(1))
+                    self.max_tokens.max(params.budget_tokens)
                 } else {
                     self.max_tokens
                 };
@@ -3261,8 +3263,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: 10_000,
         };
         for (model, expected_max_tokens) in [
-            ("claude-sonnet-4-6", 10_001),
-            ("claude-opus-4-6", 10_001),
+            ("claude-sonnet-4-6", 10_000),
+            ("claude-opus-4-6", 10_000),
             ("claude-opus-4-7", provider.max_tokens),
         ] {
             let (temp, config, max_tokens) =
@@ -3449,7 +3451,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn claude_4_6_adaptive_thinking_reaches_wire_via_chat() {
+    async fn claude_4_6_adaptive_max_budget_reaches_wire() {
         use axum::{Json, Router, routing::post};
         use parking_lot::Mutex;
         use std::sync::Arc;
@@ -3484,7 +3486,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             messages: &messages,
             tools: None,
             thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                budget_tokens: 10_000,
+                budget_tokens: zeroclaw_api::model_provider::MAX_BUDGET_TOKENS,
             }),
         };
 
@@ -3498,7 +3500,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(body["thinking"]["display"], "summarized");
         assert!(body["thinking"].get("budget_tokens").is_none());
         assert_eq!(body["temperature"], 1.0);
-        assert_eq!(body["max_tokens"], 10_001);
+        assert_eq!(
+            body["max_tokens"],
+            zeroclaw_api::model_provider::MAX_BUDGET_TOKENS
+        );
         server_handle.abort();
     }
 
