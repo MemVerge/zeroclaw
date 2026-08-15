@@ -293,17 +293,13 @@ impl StreamingReasoningBlock {
     }
 }
 
-/// Returns true for models that require `thinking: {type:"adaptive"}` and
-/// reject the fixed-budget `{type:"enabled", budget_tokens}` shape with HTTP
-/// 400. Unknown models default to `true` (forward-compatible: every Anthropic
-/// release from 4.7 onward is adaptive-only, so defaulting unknowns to adaptive
-/// keeps new models working without a list update).
+/// Returns true for models where ZeroClaw should send
+/// `thinking: {type:"adaptive"}`. Unknown models default to `true` so future
+/// Anthropic releases do not receive the legacy fixed-budget shape.
 ///
-/// Per Anthropic's extended-thinking docs, `enabled` is rejected starting at
-/// Claude 4.7; Claude 3.x and every Claude 4 minor below 7 (including the
-/// original bare Claude 4 and Claude 4.1) are manual-only and must use
-/// `enabled` with a `budget_tokens`.
-fn anthropic_model_requires_adaptive_thinking(model: &str) -> bool {
+/// Claude 4.6 accepts both modes, but Anthropic deprecates manual thinking on
+/// 4.6 and recommends adaptive. Claude 4.5 and earlier remain on manual mode.
+fn anthropic_model_uses_adaptive_thinking(model: &str) -> bool {
     let id = model
         .rsplit('/')
         .next()
@@ -312,14 +308,22 @@ fn anthropic_model_requires_adaptive_thinking(model: &str) -> bool {
     !is_legacy_thinking_model(&id)
 }
 
-/// True for models that predate adaptive thinking and must use the fixed-budget
-/// `{type:"enabled", budget_tokens}` shape: Claude 3.x, and the Claude 4
-/// generation whose minor version is below 7.
+fn anthropic_model_is_claude_4_6(model: &str) -> bool {
+    let id = model.rsplit('/').next().unwrap_or(model);
+    let mut tokens = id.split('-');
+    tokens.next() == Some("claude")
+        && tokens.next().is_some()
+        && tokens.next() == Some("4")
+        && tokens.next() == Some("6")
+}
+
+/// True for models that must use the fixed-budget
+/// `{type:"enabled", budget_tokens}` shape: Claude 3.x and Claude 4.5 or older.
 ///
 /// New-style Claude IDs are `claude-{family}-{major}[-{minor}][-{date}]`. The
 /// original bare Claude 4 has no minor (e.g. `claude-sonnet-4`,
 /// `claude-opus-4-20250514`) and is minor-less, so it is legacy; so are the
-/// `4-1` through `4-6` minors. Claude 4.7 and later stay adaptive. Older
+/// `4-1` through `4-5` minors. Claude 4.6 and later use adaptive. Older
 /// `claude-3-*` naming is matched by prefix and never places `4` in the major
 /// slot, so it cannot collide with the new-style branch.
 fn is_legacy_thinking_model(id: &str) -> bool {
@@ -341,8 +345,8 @@ fn is_legacy_thinking_model(id: &str) -> bool {
         None => true,
         // `claude-{family}-4-{YYYYMMDD}` with no minor
         Some(date) if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) => true,
-        // `claude-{family}-4-{minor}[-{date}]`: manual-only iff minor < 7
-        Some(minor) => minor.parse::<u32>().is_ok_and(|m| m < 7),
+        // `claude-{family}-4-{minor}[-{date}]`: manual-only iff minor < 6
+        Some(minor) => minor.parse::<u32>().is_ok_and(|m| m < 6),
     }
 }
 
@@ -1390,8 +1394,9 @@ impl AnthropicModelProvider {
 
     /// Resolve thinking parameters for an API request. Returns the effective
     /// temperature (forced to 1.0 when thinking is active), the thinking
-    /// config for the request body, and the effective max_tokens (raised to
-    /// meet budget_tokens minimum when the model uses the fixed-budget shape).
+    /// config for the request body, and the effective max_tokens. Manual mode
+    /// raises the limit above budget_tokens; Claude 4.6 adaptive mode preserves
+    /// the former budget as an output-capacity floor without serializing it.
     fn resolve_thinking(
         &self,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
@@ -1399,22 +1404,31 @@ impl AnthropicModelProvider {
         model: &str,
     ) -> (Option<f64>, Option<NativeThinkingConfig>, u32) {
         match thinking {
-            Some(_) if anthropic_model_requires_adaptive_thinking(model) => {
+            Some(params) if anthropic_model_uses_adaptive_thinking(model) => {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_attrs(::serde_json::json!({"model": model})),
                     "Adaptive thinking enabled; forcing temperature=1.0"
                 );
-                // Claude 4.7 defaults adaptive thinking display to `omitted`.
-                // Request the only generally available visible form explicitly;
-                // Anthropic does not expose raw chain-of-thought through this API.
+                // Adaptive thinking can omit display output by default. Request
+                // the only generally available visible form explicitly; Anthropic
+                // does not expose raw chain-of-thought through this API.
+                // Keep the former manual-thinking budget as a capacity floor so
+                // switching Claude 4.6 to adaptive cannot shrink high-effort
+                // requests to the provider baseline. The strict `+ 1` applies
+                // only when budget_tokens is serialized in manual mode.
+                let max_tokens = if anthropic_model_is_claude_4_6(model) {
+                    self.max_tokens.max(params.budget_tokens)
+                } else {
+                    self.max_tokens
+                };
                 (
                     Some(1.0),
                     Some(NativeThinkingConfig::Adaptive {
                         display: ThinkingDisplay::Summarized,
                     }),
-                    self.max_tokens,
+                    max_tokens,
                 )
             }
             Some(params) => {
@@ -3182,14 +3196,18 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn anthropic_thinking_mode_adaptive_for_opus_4_7() {
-        // Opus 4.7 only supports adaptive thinking; fixed-budget returns 400.
-        assert!(anthropic_model_requires_adaptive_thinking(
-            "claude-opus-4-7"
-        ));
-        assert!(anthropic_model_requires_adaptive_thinking(
-            "claude-opus-4-7-20260101"
-        ));
+    fn anthropic_thinking_mode_adaptive_from_claude_4_6() {
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-7-20260101",
+        ] {
+            assert!(
+                anthropic_model_uses_adaptive_thinking(model),
+                "{model} should use adaptive thinking"
+            );
+        }
     }
 
     #[test]
@@ -3198,15 +3216,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Claude 4.1 is listed by Anthropic among the earlier Claude 4 models
         // and is manual-only, so both its dated and undated IDs are legacy.
         for id in [
-            "claude-opus-4-6",
-            "claude-sonnet-4-6",
             "claude-haiku-4-5",
             "claude-opus-4-1",
             "claude-opus-4-1-20250805",
             "claude-3-opus",
         ] {
             assert!(
-                !anthropic_model_requires_adaptive_thinking(id),
+                !anthropic_model_uses_adaptive_thinking(id),
                 "{id} is a legacy (manual-thinking) model and must not be adaptive"
             );
         }
@@ -3224,45 +3240,49 @@ data: {\"type\":\"message_stop\"}\n\n";
             "claude-opus-4",
         ] {
             assert!(
-                !anthropic_model_requires_adaptive_thinking(id),
+                !anthropic_model_uses_adaptive_thinking(id),
                 "{id} is a bare Claude 4 model and must use enabled thinking"
             );
         }
-        // Boundary guard: Claude 4.7 is the first adaptive-only release, so a
-        // minor version is not by itself enough to stay adaptive.
-        for id in ["claude-opus-4-7", "claude-opus-4-7-20260101"] {
+        // Policy boundary: Claude 4.6 supports adaptive thinking and is where
+        // ZeroClaw stops sending the deprecated fixed-budget shape.
+        for id in ["claude-opus-4-6", "claude-opus-4-7-20260101"] {
             assert!(
-                anthropic_model_requires_adaptive_thinking(id),
-                "{id} is Claude 4.7+ and must be adaptive"
+                anthropic_model_uses_adaptive_thinking(id),
+                "{id} is Claude 4.6+ and should use adaptive thinking"
             );
         }
     }
 
     #[test]
-    fn resolve_thinking_emits_adaptive_for_opus_4_7() {
+    fn resolve_thinking_emits_adaptive_from_claude_4_6() {
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
             .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 10_000,
         };
-        let (temp, config, max_tokens) =
-            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
-        let config = config.expect("adaptive model should emit a thinking config");
-        let json = serde_json::to_string(&config).unwrap();
-        assert!(json.contains(r#""type":"adaptive""#), "got: {json}");
-        assert!(
-            json.contains(r#""display":"summarized""#),
-            "Claude 4.7 defaults display to omitted, got: {json}"
-        );
-        assert!(
-            !json.contains("budget_tokens"),
-            "adaptive must not carry budget_tokens, got: {json}"
-        );
-        // Forced to 1.0 per Anthropic thinking contract.
-        assert!((temp.unwrap() - 1.0_f64).abs() < f64::EPSILON);
-        // Adaptive has no budget, so max_tokens is not raised.
-        assert_eq!(max_tokens, provider.max_tokens);
+        for (model, expected_max_tokens) in [
+            ("claude-sonnet-4-6", 10_000),
+            ("claude-opus-4-6", 10_000),
+            ("claude-opus-4-7", provider.max_tokens),
+        ] {
+            let (temp, config, max_tokens) =
+                provider.resolve_thinking(Some(params), Some(0.7_f64), model);
+            let config = config.expect("adaptive model should emit a thinking config");
+            let json = serde_json::to_string(&config).unwrap();
+            assert!(json.contains(r#""type":"adaptive""#), "{model}: {json}");
+            assert!(
+                json.contains(r#""display":"summarized""#),
+                "{model}: adaptive thinking should request summaries: {json}"
+            );
+            assert!(
+                !json.contains("budget_tokens"),
+                "{model}: adaptive must not carry budget_tokens: {json}"
+            );
+            assert!((temp.unwrap() - 1.0_f64).abs() < f64::EPSILON);
+            assert_eq!(max_tokens, expected_max_tokens);
+        }
     }
 
     #[test]
@@ -3275,7 +3295,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         };
         // Every manual-thinking model emits `{type:"enabled", budget_tokens}`,
         // including Claude 4.1 (regression: it must not flip to adaptive).
-        for model in ["claude-sonnet-4-6", "claude-opus-4-1-20250805"] {
+        for model in ["claude-sonnet-4-5", "claude-opus-4-1-20250805"] {
             let (temp, config, _) = provider.resolve_thinking(Some(params), Some(0.7_f64), model);
             let config = config.expect("legacy model should emit a thinking config");
             let json = serde_json::to_string(&config).unwrap();
@@ -3364,7 +3384,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // adaptive-only models wrongly received `{type:"enabled"}` and 400'd.
         for id in ["claude-fable-5", "claude-opus-5", "claude-opus-4-8"] {
             assert!(
-                anthropic_model_requires_adaptive_thinking(id),
+                anthropic_model_uses_adaptive_thinking(id),
                 "{id} should require adaptive thinking"
             );
         }
@@ -3427,6 +3447,63 @@ data: {\"type\":\"message_stop\"}\n\n";
             body["output_config"]
         );
 
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_4_6_adaptive_max_budget_reaches_wire() {
+        use axum::{Json, Router, routing::post};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = captured_clone.clone();
+                async move {
+                    *captured.lock() = Some(body);
+                    Json(serde_json::json!({
+                        "content": [{"type": "text", "text": "ok"}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{address}"))
+            .build();
+        let messages = [ChatMessage::user("hi")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: zeroclaw_api::model_provider::MAX_BUDGET_TOKENS,
+            }),
+        };
+
+        provider
+            .chat(request, "claude-sonnet-4-6", Some(0.7))
+            .await
+            .expect("Claude 4.6 chat should succeed");
+
+        let body = captured.lock().take().expect("request should be captured");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert_eq!(body["temperature"], 1.0);
+        assert_eq!(
+            body["max_tokens"],
+            zeroclaw_api::model_provider::MAX_BUDGET_TOKENS
+        );
         server_handle.abort();
     }
 
