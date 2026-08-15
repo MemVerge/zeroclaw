@@ -308,6 +308,15 @@ fn anthropic_model_uses_adaptive_thinking(model: &str) -> bool {
     !is_legacy_thinking_model(&id)
 }
 
+fn anthropic_model_is_claude_4_6(model: &str) -> bool {
+    let id = model.rsplit('/').next().unwrap_or(model);
+    let mut tokens = id.split('-');
+    tokens.next() == Some("claude")
+        && tokens.next().is_some()
+        && tokens.next() == Some("4")
+        && tokens.next() == Some("6")
+}
+
 /// True for models that must use the fixed-budget
 /// `{type:"enabled", budget_tokens}` shape: Claude 3.x and Claude 4.5 or older.
 ///
@@ -1394,7 +1403,7 @@ impl AnthropicModelProvider {
         model: &str,
     ) -> (Option<f64>, Option<NativeThinkingConfig>, u32) {
         match thinking {
-            Some(_) if anthropic_model_uses_adaptive_thinking(model) => {
+            Some(params) if anthropic_model_uses_adaptive_thinking(model) => {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1404,12 +1413,20 @@ impl AnthropicModelProvider {
                 // Adaptive thinking can omit display output by default. Request
                 // the only generally available visible form explicitly; Anthropic
                 // does not expose raw chain-of-thought through this API.
+                // Keep the former manual-thinking output capacity as a floor so
+                // switching Claude 4.6 to adaptive cannot shrink high-effort
+                // requests to the provider's baseline max_tokens value.
+                let max_tokens = if anthropic_model_is_claude_4_6(model) {
+                    self.max_tokens.max(params.budget_tokens.saturating_add(1))
+                } else {
+                    self.max_tokens
+                };
                 (
                     Some(1.0),
                     Some(NativeThinkingConfig::Adaptive {
                         display: ThinkingDisplay::Summarized,
                     }),
-                    self.max_tokens,
+                    max_tokens,
                 )
             }
             Some(params) => {
@@ -3243,7 +3260,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 10_000,
         };
-        for model in ["claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"] {
+        for (model, expected_max_tokens) in [
+            ("claude-sonnet-4-6", 10_001),
+            ("claude-opus-4-6", 10_001),
+            ("claude-opus-4-7", provider.max_tokens),
+        ] {
             let (temp, config, max_tokens) =
                 provider.resolve_thinking(Some(params), Some(0.7_f64), model);
             let config = config.expect("adaptive model should emit a thinking config");
@@ -3258,7 +3279,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 "{model}: adaptive must not carry budget_tokens: {json}"
             );
             assert!((temp.unwrap() - 1.0_f64).abs() < f64::EPSILON);
-            assert_eq!(max_tokens, provider.max_tokens);
+            assert_eq!(max_tokens, expected_max_tokens);
         }
     }
 
@@ -3477,6 +3498,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(body["thinking"]["display"], "summarized");
         assert!(body["thinking"].get("budget_tokens").is_none());
         assert_eq!(body["temperature"], 1.0);
+        assert_eq!(body["max_tokens"], 10_001);
         server_handle.abort();
     }
 
