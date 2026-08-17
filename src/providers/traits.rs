@@ -5,8 +5,8 @@ mod tests {
     use super::*;
     use crate::tools::ToolSpec;
     use async_trait::async_trait;
-    use futures_util::StreamExt;
     use futures_util::stream::{self, BoxStream};
+    use futures_util::StreamExt;
 
     /// Representative non-zero temperature for default-path chat tests;
     /// mocks ignore it, so any plausible in-range value is fine — this
@@ -612,6 +612,6 @@ mod tests {
             StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "hello"),
             other => panic!("expected text delta event, got {other:?}"),
         }
-        assert!(matches!(second, StreamEvent::Final));
+        assert!(second.is_final());
     }
 }

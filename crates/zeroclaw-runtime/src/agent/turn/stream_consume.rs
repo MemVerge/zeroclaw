@@ -7,6 +7,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use zeroclaw_api::StopReason;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
@@ -24,6 +25,7 @@ pub(crate) struct StreamedChatOutcome {
     pub(crate) forwarded_visible_text: String,
     pub(crate) suppressed_protocol: bool,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    pub(crate) stop: StopReason,
 }
 
 pub(crate) async fn consume_provider_streaming_response(
@@ -145,7 +147,13 @@ pub(crate) async fn consume_provider_streaming_response(
             }
         };
         match event {
-            StreamEvent::Final => break,
+            StreamEvent::Final { stop } => {
+                outcome.stop = stop.clone();
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(TurnEvent::Stop { reason: stop }).await;
+                }
+                break;
+            }
             StreamEvent::Usage(usage) => {
                 outcome.usage = Some(usage);
             }
@@ -345,7 +353,7 @@ mod tests {
                 Ok(StreamEvent::TextDelta(StreamChunk::delta(
                     "check the count.",
                 ))),
-                Ok(StreamEvent::Final),
+                Ok(StreamEvent::unspecified_final()),
             ]))
         }
     }
@@ -406,5 +414,102 @@ mod tests {
             outcome.replay_reasoning_content,
             r#"{"thinking":"Checking","signature":"sig_1"}"#
         );
+    }
+
+    struct TruncatedTextProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for TruncatedTextProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "TruncatedTextProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for TruncatedTextProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: false,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("half json {"))),
+                Ok(StreamEvent::Final {
+                    stop: StopReason::OutputTruncated,
+                }),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_final_emits_stop_event_and_outcome() {
+        let provider = TruncatedTextProvider;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            None,
+            None,
+            None,
+            Some(&event_tx),
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(event_tx);
+
+        assert_eq!(outcome.stop, StopReason::OutputTruncated);
+        assert_eq!(outcome.response_text, "half json {");
+
+        let mut saw_stop = None;
+        while let Some(event) = event_rx.recv().await {
+            if let TurnEvent::Stop { reason } = event {
+                saw_stop = Some(reason);
+            }
+        }
+        assert_eq!(saw_stop, Some(StopReason::OutputTruncated));
     }
 }

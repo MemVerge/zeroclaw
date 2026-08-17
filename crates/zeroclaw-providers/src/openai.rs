@@ -2,7 +2,7 @@ use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
     build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
 };
-use crate::stream_guard::AbortOnDrop;
+use crate::stream_guard::{AbortOnDrop, SseFinish};
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
@@ -930,6 +930,8 @@ pub(crate) async fn run_responses_sse(
         }
     }
 
+    let stop = responses_finish_stop(&state);
+
     if !state.saw_text_delta
         && let Some(text) = state.fallback_text.filter(|t| !t.is_empty())
     {
@@ -941,12 +943,24 @@ pub(crate) async fn run_responses_sse(
         let _ = tx.send(Ok(StreamEvent::TextDelta(chunk))).await;
     }
 
-    crate::stream_guard::finish_sse_stream(
+    crate::stream_guard::finish_sse_stream(SseFinish {
         tx,
-        state.saw_completion,
-        "response.completed or [DONE]",
-    )
+        stop,
+        completion_signal: "response.completed or [DONE]",
+    })
     .await;
+}
+
+fn responses_finish_stop(state: &ResponsesStreamState) -> Option<zeroclaw_api::StopReason> {
+    if !state.saw_completion {
+        return None;
+    }
+    Some(
+        state
+            .stop
+            .clone()
+            .unwrap_or(zeroclaw_api::StopReason::Unspecified),
+    )
 }
 
 pub struct OpenAiResponsesModelProvider {
@@ -1302,7 +1316,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
-            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+            return stream::once(async { Ok(StreamEvent::unspecified_final()) }).boxed();
         }
 
         let credential = match self.credential.clone() {

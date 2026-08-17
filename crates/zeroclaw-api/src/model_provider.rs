@@ -287,17 +287,28 @@ pub enum StreamEvent {
     /// Token usage reported by the provider, typically just before [`StreamEvent::Final`].
     /// Providers that do not surface usage in streaming responses simply omit this event.
     Usage(TokenUsage),
-    /// Stream has completed.
-    Final,
+    /// Stream has completed. Truncation is `stop: OutputTruncated`, not an error.
+    Final { stop: crate::StopReason },
 }
 
 impl StreamEvent {
     pub fn from_chunk(chunk: StreamChunk) -> Self {
         if chunk.is_final {
-            Self::Final
+            Self::unspecified_final()
         } else {
             Self::TextDelta(chunk)
         }
+    }
+
+    /// Terminal event when the provider omitted a stop reason.
+    pub fn unspecified_final() -> Self {
+        Self::Final {
+            stop: crate::StopReason::Unspecified,
+        }
+    }
+
+    pub fn is_final(&self) -> bool {
+        matches!(self, Self::Final { .. })
     }
 }
 
@@ -878,7 +889,7 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 
 #[cfg(test)]
 mod turn_order_tests {
-    use super::ChatMessage;
+    use super::{ChatMessage, StreamChunk, StreamEvent};
 
     #[test]
     fn drops_leading_assistant_tool_call_before_first_user() {
@@ -934,5 +945,26 @@ mod turn_order_tests {
         let mut msgs: Vec<ChatMessage> = vec![];
         ChatMessage::sanitize_leading_turn_order(&mut msgs);
         assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn from_chunk_maps_final_flag_to_unspecified_stop() {
+        let event = StreamEvent::from_chunk(StreamChunk::final_chunk());
+        assert!(matches!(
+            event,
+            StreamEvent::Final {
+                stop: crate::StopReason::Unspecified
+            }
+        ));
+    }
+
+    #[test]
+    fn from_chunk_keeps_non_final_as_text_delta() {
+        let event = StreamEvent::from_chunk(StreamChunk::delta("hi"));
+        assert!(!event.is_final());
+        assert!(matches!(
+            event,
+            StreamEvent::TextDelta(chunk) if chunk.delta == "hi"
+        ));
     }
 }

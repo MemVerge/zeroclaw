@@ -4771,6 +4771,7 @@ fn notification_for_turn_event(
             session_id: session_id.to_string(),
             entries: entries.clone(),
         },
+        TurnEvent::Stop { .. } => return None,
     };
 
     let params = serde_json::to_value(update).ok()?;
@@ -6586,6 +6587,14 @@ mod tests {
         assert_eq!(v["params"]["dropped_messages"], 12);
         assert_eq!(v["params"]["kept_turns"], 1);
         assert_eq!(v["params"]["reason"], "context token budget exceeded");
+    }
+
+    #[test]
+    fn stop_event_does_not_emit_session_update() {
+        let event = TurnEvent::Stop {
+            reason: zeroclaw_api::StopReason::OutputTruncated,
+        };
+        assert!(notification_for_turn_event("s1", &event, None).is_none());
     }
 
     #[test]

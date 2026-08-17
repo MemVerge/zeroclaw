@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use zeroclaw_api::StopReason;
 use zeroclaw_api::tool::ToolSpec;
 
 const DEFAULT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -95,6 +96,7 @@ pub(crate) struct ResponsesStreamState {
     pub(crate) saw_text_delta: bool,
     pub(crate) reasoning_parts_with_deltas: HashSet<(String, u64)>,
     pub(crate) saw_completion: bool,
+    pub(crate) stop: Option<StopReason>,
     pub(crate) text_accumulator: String,
     pub(crate) fallback_text: Option<String>,
     pub(crate) tool_calls: HashMap<String, PendingToolCall>,
@@ -881,8 +883,9 @@ pub(crate) fn process_responses_stream_event(
                 }
             }
         }
-        Some(event_type @ ("response.completed" | "response.done")) => {
+        Some(event_type @ ("response.completed" | "response.done" | "response.incomplete")) => {
             state.saw_completion = true;
+            record_responses_stop(state, &event);
             let is_completed = event_type == "response.completed";
             if let Some(response) = event
                 .get("response")
@@ -910,6 +913,27 @@ pub(crate) fn process_responses_stream_event(
     Ok(emitted)
 }
 
+fn record_responses_stop(state: &mut ResponsesStreamState, event: &Value) {
+    let Some(response) = event.get("response") else {
+        return;
+    };
+    let status = response.get("status").and_then(Value::as_str).unwrap_or("");
+    if status.eq_ignore_ascii_case("incomplete") {
+        let reason = response
+            .get("incomplete_details")
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("incomplete");
+        state.stop = Some(StopReason::from_provider_token(reason));
+        return;
+    }
+    if status.is_empty() {
+        state.stop = Some(StopReason::Complete);
+        return;
+    }
+    state.stop = Some(StopReason::from_provider_token(status));
+}
+
 pub(crate) fn process_sse_chunk(
     chunk: &str,
     state: &mut ResponsesStreamState,
@@ -928,6 +952,9 @@ pub(crate) fn process_sse_chunk(
     if trimmed.is_empty() || trimmed == "[DONE]" {
         if trimmed == "[DONE]" {
             state.saw_completion = true;
+            if state.stop.is_none() {
+                state.stop = Some(StopReason::Unspecified);
+            }
         }
         return Ok(Vec::new());
     }
@@ -1587,7 +1614,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
-            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+            return stream::once(async { Ok(StreamEvent::unspecified_final()) }).boxed();
         }
 
         let provider = self.clone();
@@ -2274,13 +2301,27 @@ data: [DONE]
         )
         .unwrap();
         assert!(state.saw_completion);
+        assert_eq!(state.stop, Some(StopReason::Complete));
     }
 
     #[test]
-    fn process_sse_chunk_marks_completion_on_done_sentinel() {
+    fn process_sse_chunk_records_incomplete_max_output_tokens() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output_text\":\"cut\"}}",
+            &mut state,
+        )
+        .unwrap();
+        assert!(state.saw_completion);
+        assert_eq!(state.stop, Some(StopReason::OutputTruncated));
+    }
+
+    #[test]
+    fn process_sse_chunk_done_sentinel_fills_unspecified_stop() {
         let mut state = ResponsesStreamState::default();
         let _ = process_sse_chunk("data: [DONE]", &mut state).unwrap();
         assert!(state.saw_completion);
+        assert_eq!(state.stop, Some(StopReason::Unspecified));
     }
 
     #[test]

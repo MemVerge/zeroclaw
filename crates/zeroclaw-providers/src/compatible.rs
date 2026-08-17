@@ -4,7 +4,7 @@
 
 use crate::auth::AuthService;
 use crate::multimodal;
-use crate::stream_guard::AbortOnDrop;
+use crate::stream_guard::{AbortOnDrop, SseFinish};
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, StreamChunk, StreamError, StreamEvent, StreamOptions, StreamResult,
@@ -17,6 +17,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
+use zeroclaw_api::StopReason;
 
 /// Max wait for the next streaming body read before the connection is treated
 /// as stalled. Streaming clients omit reqwest's overall `.timeout()` (it kills
@@ -1773,6 +1774,19 @@ pub(crate) fn sse_bytes_to_events(
     sse_bytes_to_events_for_contract(response, count_tokens, false)
 }
 
+fn record_compatible_stop(stop: &mut Option<StopReason>, finish_reason: Option<&str>) {
+    let Some(token) = finish_reason else {
+        return;
+    };
+    *stop = Some(StopReason::from_provider_token(token));
+}
+
+fn mark_compatible_done(stop: &mut Option<StopReason>) {
+    if stop.is_none() {
+        *stop = Some(StopReason::Unspecified);
+    }
+}
+
 fn sse_bytes_to_events_for_contract(
     response: reqwest::Response,
     count_tokens: bool,
@@ -1785,7 +1799,7 @@ fn sse_bytes_to_events_for_contract(
         let mut tool_calls: Vec<StreamToolCallAccumulator> = Vec::new();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut emitted_tool_calls = false;
-        let mut saw_completion = false;
+        let mut stop = None;
 
         match response.error_for_status_ref() {
             Ok(_) => {}
@@ -1846,7 +1860,7 @@ fn sse_bytes_to_events_for_contract(
                                 if line.trim().strip_prefix("data:").map(str::trim)
                                     == Some("[DONE]")
                                 {
-                                    saw_completion = true;
+                                    mark_compatible_done(&mut stop);
                                 }
                                 continue;
                             }
@@ -1858,9 +1872,7 @@ fn sse_bytes_to_events_for_contract(
 
                         let mut should_emit_tool_calls = false;
                         for choice in &chunk.choices {
-                            if choice.finish_reason.is_some() {
-                                saw_completion = true;
-                            }
+                            record_compatible_stop(&mut stop, choice.finish_reason.as_deref());
                             if let Some(reasoning_delta) = extract_sse_reasoning_delta(choice) {
                                 let reasoning_chunk = StreamChunk::reasoning(reasoning_delta);
                                 if tx
@@ -1946,8 +1958,12 @@ fn sse_bytes_to_events_for_contract(
             }
         }
 
-        crate::stream_guard::finish_sse_stream(&tx, saw_completion, "[DONE] or finish_reason")
-            .await;
+        crate::stream_guard::finish_sse_stream(SseFinish {
+            tx: &tx,
+            stop,
+            completion_signal: "[DONE] or finish_reason",
+        })
+        .await;
     });
 
     let guard = AbortOnDrop::new(handle.abort_handle());
@@ -3068,7 +3084,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
-            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+            return stream::once(async { Ok(StreamEvent::unspecified_final()) }).boxed();
         }
 
         let provider = self.clone();
@@ -3764,7 +3780,12 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(events.last(), Some(Ok(StreamEvent::Final))),
+            matches!(
+                events.last(),
+                Some(Ok(StreamEvent::Final {
+                    stop: StopReason::Unspecified
+                }))
+            ),
             "got: {events:?}"
         );
     }
@@ -3776,7 +3797,29 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(events.last(), Some(Ok(StreamEvent::Final))),
+            matches!(
+                events.last(),
+                Some(Ok(StreamEvent::Final {
+                    stop: StopReason::Complete
+                }))
+            ),
+            "got: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_reason_length_emits_output_truncated() {
+        let events = collect_stream_events(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"length\"}]}\n\n",
+        )
+        .await;
+        assert!(
+            matches!(
+                events.last(),
+                Some(Ok(StreamEvent::Final {
+                    stop: StopReason::OutputTruncated
+                }))
+            ),
             "got: {events:?}"
         );
     }
@@ -3787,7 +3830,9 @@ mod tests {
             collect_stream_events("data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n")
                 .await;
         assert!(
-            !events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))),
+            !events
+                .iter()
+                .any(|e| matches!(e, Ok(StreamEvent::Final { .. }))),
             "truncated stream must not emit Final, got: {events:?}"
         );
         assert!(

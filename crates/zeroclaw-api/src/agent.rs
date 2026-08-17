@@ -116,6 +116,11 @@ pub enum TurnEvent {
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
     },
+    /// Provider-neutral stop for one LLM call. A turn may emit several; the
+    /// last one is the turn's terminal reason. Truncation is not an error.
+    Stop {
+        reason: crate::StopReason,
+    },
 }
 
 #[cfg(test)]

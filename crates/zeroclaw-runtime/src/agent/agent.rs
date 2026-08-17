@@ -3358,7 +3358,7 @@ mod tests {
                     Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
                         zeroclaw_providers::traits::StreamChunk::delta(text),
                     )),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::unspecified_final()),
                 ])
                 .boxed(),
                 RuntimeStreamPlan::Error => futures_util::stream::iter(vec![Err(
@@ -3781,7 +3781,10 @@ mod tests {
                         )),
                         1 => {
                             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                            Some((Ok(zeroclaw_providers::traits::StreamEvent::Final), 2))
+                            Some((
+                                Ok(zeroclaw_providers::traits::StreamEvent::unspecified_final()),
+                                2,
+                            ))
                         }
                         _ => None,
                     }
@@ -3891,11 +3894,14 @@ mod tests {
                 );
                 stream::iter(vec![
                     Ok(chunk),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::unspecified_final()),
                 ])
                 .boxed()
             } else {
-                stream::iter(vec![Ok(zeroclaw_providers::traits::StreamEvent::Final)]).boxed()
+                stream::iter(vec![Ok(
+                    zeroclaw_providers::traits::StreamEvent::unspecified_final(),
+                )])
+                .boxed()
             }
         }
 
@@ -5504,7 +5510,7 @@ mod tests {
                 );
                 stream::iter(vec![
                     Ok(tc),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::unspecified_final()),
                 ])
                 .boxed()
             } else {
@@ -5518,7 +5524,7 @@ mod tests {
                 );
                 stream::iter(vec![
                     Ok(chunk),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::unspecified_final()),
                 ])
                 .boxed()
             }
@@ -5891,7 +5897,7 @@ mod tests {
                             extra_content: None,
                         },
                     )),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::unspecified_final()),
                 ])
                 .boxed()
             } else {
@@ -5904,7 +5910,7 @@ mod tests {
                             token_count: 0,
                         },
                     )),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::unspecified_final()),
                 ])
                 .boxed()
             }
@@ -6057,7 +6063,7 @@ mod tests {
                         output: "b".into(),
                     },
                 ),
-                Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                Ok(zeroclaw_providers::traits::StreamEvent::unspecified_final()),
             ])
             .boxed()
         }
@@ -6925,7 +6931,7 @@ mod tests {
                             extra_content: None,
                         },
                     )),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::unspecified_final()),
                 ])
                 .boxed()
             } else {
@@ -6938,7 +6944,7 @@ mod tests {
                             token_count: 0,
                         },
                     )),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::unspecified_final()),
                 ])
                 .boxed()
             }
@@ -9291,7 +9297,7 @@ mod tests {
                 );
                 stream::iter(vec![
                     Ok(tc),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::unspecified_final()),
                 ])
                 .boxed()
             } else {
@@ -9307,7 +9313,7 @@ mod tests {
                 );
                 stream::iter(vec![
                     Ok(chunk),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::unspecified_final()),
                 ])
                 .boxed()
             }

@@ -836,7 +836,7 @@ impl ModelProvider for OpenRouterModelProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
-            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+            return stream::once(async { Ok(StreamEvent::unspecified_final()) }).boxed();
         }
 
         let credential = match self.credential.as_ref() {
@@ -1168,7 +1168,7 @@ mod tests {
             .next()
             .await
             .expect("stream should yield Final immediately");
-        assert!(matches!(first, Ok(StreamEvent::Final)));
+        assert!(matches!(first, Ok(StreamEvent::Final { .. })));
     }
 
     #[test]
