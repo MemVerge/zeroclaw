@@ -116,6 +116,14 @@ pub enum TurnEvent {
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
     },
+    /// Provider-neutral stop for **one LLM call**, not the user-visible turn.
+    /// A tool loop emits `Stop { ToolUse }` before tools run, then more calls.
+    /// The last `Stop` in the turn is the terminal reason. Truncation is not
+    /// an error. Gateway WS forwards only reasons where
+    /// [`crate::StopReason::ends_model_turn`] is true.
+    Stop {
+        reason: crate::StopReason,
+    },
 }
 
 #[cfg(test)]

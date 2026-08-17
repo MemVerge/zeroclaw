@@ -1091,7 +1091,7 @@ async fn forward_stream_attempt(
     while let Some(result) = provider_stream.next().await {
         match result {
             Ok(event) => {
-                let is_final = matches!(event, StreamEvent::Final);
+                let is_final = event.is_final();
                 emitted_event = true;
                 if tx.send(Ok(event)).await.is_err() {
                     return StreamAttemptOutcome::ConsumerDropped;
@@ -2164,7 +2164,7 @@ impl ModelProvider for ReliableModelProvider {
 
             let guard = AbortOnDrop::new(handle.abort_handle());
             return stream_with_success_recording(rx, guard, fallback_record, |event| {
-                matches!(event, StreamEvent::Final)
+                event.is_final()
             });
         }
 
@@ -4701,7 +4701,7 @@ mod tests {
                     arguments: r#"{"command":"date"}"#.to_string(),
                     extra_content: None,
                 })),
-                Ok(StreamEvent::Final),
+                Ok(StreamEvent::unspecified_final()),
             ])
             .boxed()
         }
@@ -4794,7 +4794,7 @@ mod tests {
             match self.mode {
                 StreamingRecordMode::Success => stream::iter(vec![
                     Ok(StreamEvent::TextDelta(StreamChunk::delta("streamed"))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ])
                 .boxed(),
                 StreamingRecordMode::Error => stream::iter(vec![Err(Self::stream_error())]).boxed(),
@@ -4934,7 +4934,7 @@ mod tests {
             StreamEvent::ToolCall(call) => assert_eq!(call.name, "shell"),
             other => panic!("expected tool-call event, got {other:?}"),
         }
-        assert!(matches!(second, StreamEvent::Final));
+        assert!(second.is_final());
         assert_eq!(primary.stream_calls.load(Ordering::SeqCst), 0);
         assert_eq!(fallback.stream_calls.load(Ordering::SeqCst), 1);
     }
@@ -4967,7 +4967,7 @@ mod tests {
             ));
             assert!(matches!(
                 stream.next().await.unwrap().unwrap(),
-                StreamEvent::Final
+                StreamEvent::Final { .. }
             ));
             take_last_provider_fallback()
         })
@@ -5171,7 +5171,7 @@ mod tests {
             }
             stream::iter(vec![
                 Ok(StreamEvent::TextDelta(StreamChunk::delta("recovered"))),
-                Ok(StreamEvent::Final),
+                Ok(StreamEvent::unspecified_final()),
             ])
             .boxed()
         }
@@ -5249,7 +5249,7 @@ mod tests {
         assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
         assert!(matches!(
             events.as_slice(),
-            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final)]
+            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
                 if chunk.delta == "recovered"
         ));
     }
@@ -5289,7 +5289,7 @@ mod tests {
         assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
         assert!(matches!(
             events.as_slice(),
-            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final)]
+            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
                 if chunk.delta == "recovered"
         ));
     }

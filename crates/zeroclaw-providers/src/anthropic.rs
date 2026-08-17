@@ -28,7 +28,8 @@ const ANTHROPIC_REPLAY_PROVIDER: &str = "anthropic";
 const ANTHROPIC_REPLAY_KIND: &str = "content_blocks";
 const ANTHROPIC_REPLAY_VERSION: u8 = 1;
 
-use crate::stream_guard::AbortOnDrop;
+use crate::stream_guard::{AbortOnDrop, SseFinish};
+use zeroclaw_api::StopReason;
 
 fn anthropic_tool_call_index(extra: Option<&serde_json::Value>) -> Option<u64> {
     extra?
@@ -1520,7 +1521,9 @@ impl AnthropicModelProvider {
         let mut cached_input_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
 
-        let mut saw_stop_reason = false;
+        // Reason from `message_delta`. Not a completion signal — only
+        // `message_stop` (or a clean Final emit) marks the stream complete.
+        let mut pending_stop = None;
 
         loop {
             let line = match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
@@ -1790,7 +1793,7 @@ impl AnthropicModelProvider {
                         .and_then(|s| s.as_str())
                         .unwrap_or("none");
                     if stop_reason != "none" {
-                        saw_stop_reason = true;
+                        pending_stop = Some(StopReason::from_provider_token(stop_reason));
                     }
                     // Anthropic's running-total: each `message_delta`
                     // supersedes the previous one, so we always overwrite.
@@ -1801,7 +1804,7 @@ impl AnthropicModelProvider {
                     if let Some(v) = observed_output {
                         output_tokens = Some(v);
                     }
-                    if stop_reason == "max_tokens" {
+                    if StopReason::from_provider_token(stop_reason) == StopReason::OutputTruncated {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -1843,7 +1846,11 @@ impl AnthropicModelProvider {
                             })))
                             .await;
                     }
-                    let _ = tx.send(Ok(StreamEvent::Final)).await;
+                    let _ = tx
+                        .send(Ok(StreamEvent::Final {
+                            stop: pending_stop.take().unwrap_or(StopReason::Unspecified),
+                        }))
+                        .await;
                     return;
                 }
                 "error" => {
@@ -1861,7 +1868,12 @@ impl AnthropicModelProvider {
             }
         }
 
-        crate::stream_guard::finish_sse_stream(tx, saw_stop_reason, "message_stop").await;
+        crate::stream_guard::finish_sse_stream(SseFinish {
+            tx,
+            stop: None,
+            completion_signal: "message_stop",
+        })
+        .await;
     }
 }
 
@@ -2163,7 +2175,7 @@ impl ModelProvider for AnthropicModelProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
-            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+            return stream::once(async { Ok(StreamEvent::unspecified_final()) }).boxed();
         }
 
         let credential = match self.credential.as_ref() {
@@ -2665,7 +2677,7 @@ data: {\"type\":\"message_stop\"}\n\n"
                 Ok(StreamEvent::PreExecutedToolCall { .. }) => "pre_tool_call",
                 Ok(StreamEvent::PreExecutedToolResult { .. }) => "pre_tool_result",
                 Ok(StreamEvent::Usage(_)) => "usage",
-                Ok(StreamEvent::Final) => "final",
+                Ok(StreamEvent::Final { .. }) => "final",
                 Err(_) => "err",
             })
             .collect();
@@ -2711,6 +2723,62 @@ data: {\"type\":\"message_stop\"}\n\n"
             Some(42),
             "cache_read_input_tokens from message_start"
         );
+    }
+
+    #[tokio::test]
+    async fn max_tokens_stop_reason_emits_output_truncated() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":8}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut last_final = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Ok(StreamEvent::Final { stop }) = ev {
+                last_final = Some(stop);
+            }
+        }
+        assert_eq!(last_final, Some(StopReason::OutputTruncated));
+    }
+
+    #[tokio::test]
+    async fn model_context_window_exceeded_emits_output_truncated() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"model_context_window_exceeded\"},\"usage\":{\"output_tokens\":8}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut last_final = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Ok(StreamEvent::Final { stop }) = ev {
+                last_final = Some(stop);
+            }
+        }
+        assert_eq!(last_final, Some(StopReason::OutputTruncated));
     }
 
     /// A reader that yields one buffer of bytes, then parks forever — models
@@ -2891,7 +2959,9 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
             "read error must propagate as StreamError::Http, got {events:?}"
         );
         assert!(
-            !events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))),
+            !events
+                .iter()
+                .any(|e| matches!(e, Ok(StreamEvent::Final { .. }))),
             "must never emit Final when the stream was cut short by a read error, got {events:?}"
         );
     }
@@ -2916,12 +2986,48 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
             tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
             match ev {
-                Ok(StreamEvent::Final) => saw_final = true,
+                Ok(StreamEvent::Final { .. }) => saw_final = true,
                 Err(e) => last_err = Some(e),
                 Ok(_) => {}
             }
         }
         assert!(!saw_final, "truncated stream must not emit Final");
+        let err = last_err.expect("truncated stream must emit a StreamError");
+        assert!(
+            matches!(err, StreamError::Http(ref m) if m.contains("truncated")),
+            "expected truncation error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_after_message_delta_without_message_stop_is_truncation() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut saw_final = false;
+        let mut last_err = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::Final { .. }) => saw_final = true,
+                Err(e) => last_err = Some(e),
+                Ok(_) => {}
+            }
+        }
+        assert!(
+            !saw_final,
+            "message_delta is not a completion signal; must not emit Final"
+        );
         let err = last_err.expect("truncated stream must emit a StreamError");
         assert!(
             matches!(err, StreamError::Http(ref m) if m.contains("truncated")),

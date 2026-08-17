@@ -419,7 +419,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                         token_count: 0,
                     })),
                     Ok(StreamEvent::ToolCall(tool_call("tc-1", "echo"))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ]
             } else {
                 vec![
@@ -429,7 +429,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                         is_final: false,
                         token_count: 0,
                     })),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ]
             };
             futures_util::stream::iter(events).boxed()

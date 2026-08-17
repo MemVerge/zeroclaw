@@ -889,6 +889,18 @@ fn history_trimmed_ws_frame(
     })
 }
 
+/// `TurnEvent::Stop` is per LLM call. Skip mid-turn `ToolUse` so WS clients
+/// do not treat a tool handoff as user-turn completion.
+fn ws_stop_frame(reason: &zeroclaw_api::StopReason) -> Option<serde_json::Value> {
+    if !reason.ends_model_turn() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "type": "stop",
+        "reason": reason,
+    }))
+}
+
 fn needs_onboarding_ws_error(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<serde_json::Value> {
@@ -1219,6 +1231,10 @@ async fn process_chat_message(
                             "type": "plan",
                             "entries": entries,
                         }),
+                        TurnEvent::Stop { reason } => match ws_stop_frame(&reason) {
+                            Some(frame) => frame,
+                            None => continue,
+                        },
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
                 }
@@ -1522,6 +1538,19 @@ mod tests {
             "WS ingress identity must stay `wss` — it is the name already used by \
              the turn span and SSE `channel` field; changing it splits attribution"
         );
+    }
+
+    #[test]
+    fn ws_stop_frame_skips_mid_turn_tool_use() {
+        assert!(super::ws_stop_frame(&zeroclaw_api::StopReason::ToolUse).is_none());
+    }
+
+    #[test]
+    fn ws_stop_frame_forwards_terminal_truncation() {
+        let frame =
+            super::ws_stop_frame(&zeroclaw_api::StopReason::OutputTruncated).expect("terminal");
+        assert_eq!(frame["type"], "stop");
+        assert_eq!(frame["reason"]["type"], "output_truncated");
     }
 
     #[tokio::test]

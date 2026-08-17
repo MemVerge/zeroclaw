@@ -4548,26 +4548,26 @@ mod tests {
                 NativeStreamTurn::ToolCall(tool_call) => {
                     Box::pin(futures_util::stream::iter(vec![
                         Ok(StreamEvent::ToolCall(tool_call)),
-                        Ok(StreamEvent::Final),
+                        Ok(StreamEvent::unspecified_final()),
                     ]))
                 }
                 NativeStreamTurn::Text(text) => Box::pin(futures_util::stream::iter(vec![
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ])),
                 NativeStreamTurn::TextChunks(chunks) => {
                     let mut events: Vec<_> = chunks
                         .into_iter()
                         .map(|text| Ok(StreamEvent::TextDelta(StreamChunk::delta(text))))
                         .collect();
-                    events.push(Ok(StreamEvent::Final));
+                    events.push(Ok(StreamEvent::unspecified_final()));
                     Box::pin(futures_util::stream::iter(events))
                 }
                 NativeStreamTurn::TextWithReasoning { text, reasoning } => {
                     Box::pin(futures_util::stream::iter(vec![
                         Ok(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning))),
                         Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
-                        Ok(StreamEvent::Final),
+                        Ok(StreamEvent::unspecified_final()),
                     ]))
                 }
                 NativeStreamTurn::NarrationThenToolCall {
@@ -4579,7 +4579,7 @@ mod tests {
                         .map(|text| Ok(StreamEvent::TextDelta(StreamChunk::delta(text))))
                         .collect();
                     events.push(Ok(StreamEvent::ToolCall(tool_call)));
-                    events.push(Ok(StreamEvent::Final));
+                    events.push(Ok(StreamEvent::unspecified_final()));
                     Box::pin(futures_util::stream::iter(events))
                 }
                 NativeStreamTurn::ToolCallThenNarration {
@@ -4592,7 +4592,7 @@ mod tests {
                             .into_iter()
                             .map(|text| Ok(StreamEvent::TextDelta(StreamChunk::delta(text)))),
                     );
-                    events.push(Ok(StreamEvent::Final));
+                    events.push(Ok(StreamEvent::unspecified_final()));
                     Box::pin(futures_util::stream::iter(events))
                 }
             }
@@ -9447,7 +9447,7 @@ This is an example, not an invocation."#;
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(
                         "\nThis is an example, not an invocation.",
                     ))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ]))
             }
         }
@@ -10173,7 +10173,7 @@ This is an example, not an invocation."#;
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(
                         r#"calls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
                     ))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ]))
             }
         }
@@ -10259,7 +10259,7 @@ This is an example, not an invocation."#;
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(
                         r#"[{"name":"count_tool","arguments":{"value":"X"}}]"#,
                     ))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ]))
             }
         }
@@ -10464,7 +10464,7 @@ This is an example, not an invocation."#;
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(
                         r#"calls":[{"call_id":"call_1","arguments":{"value":"X"}}]}"#,
                     ))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ]))
             }
         }
@@ -10546,7 +10546,7 @@ This is an example, not an invocation."#;
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(
                         r#"{"tool_call_id":"call_1","content":"raw"#,
                     ))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ]))
             }
         }
@@ -10631,7 +10631,7 @@ This is an example, not an invocation."#;
                         r#"{"tool_calls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
                     ))),
                     Ok(StreamEvent::TextDelta(StreamChunk::delta("\n```"))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ]))
             }
         }
@@ -10715,7 +10715,7 @@ This is an example, not an invocation."#;
                         r#"{"name":"count_tool","arguments":{"value":"X"}}"#,
                     ))),
                     Ok(StreamEvent::TextDelta(StreamChunk::delta("\n```"))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ]))
             }
         }
@@ -10802,7 +10802,7 @@ This is an example, not an invocation."#;
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(
                         r#"Visible prefix {"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
                     ))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ]))
             }
         }
@@ -10888,7 +10888,7 @@ This is an example, not an invocation."#;
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(
                         r#"calls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
                     ))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ]))
             }
         }
@@ -13173,7 +13173,7 @@ Let me check the result."#;
                         "consider options.",
                     ))),
                     Ok(StreamEvent::TextDelta(StreamChunk::delta("there."))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::unspecified_final()),
                 ]))
             }
         }

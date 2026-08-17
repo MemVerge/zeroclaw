@@ -2410,6 +2410,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
             }),
         },
         TurnEvent::ApprovalRequest { .. } => return None,
+        TurnEvent::Stop { .. } => return None,
         TurnEvent::HistoryTrimmed {
             dropped_messages,
             kept_turns,

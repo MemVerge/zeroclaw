@@ -19,8 +19,11 @@ pub mod runtime_status;
 pub mod runtime_traits;
 pub mod schema;
 pub mod session_keys;
+pub mod stop_reason;
 pub mod tool;
 pub mod vad;
+
+pub use stop_reason::StopReason;
 
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.

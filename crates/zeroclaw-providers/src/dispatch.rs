@@ -512,7 +512,7 @@ mod tests {
                         );
                         Some((Ok(StreamEvent::TextDelta(StreamChunk::delta("hi"))), 1u8))
                     }
-                    1 => Some((Ok(StreamEvent::Final), 2u8)),
+                    1 => Some((Ok(StreamEvent::unspecified_final()), 2u8)),
                     _ => None,
                 }
             })
