@@ -1804,7 +1804,7 @@ impl AnthropicModelProvider {
                     if let Some(v) = observed_output {
                         output_tokens = Some(v);
                     }
-                    if stop_reason == "max_tokens" {
+                    if StopReason::from_provider_token(stop_reason) == StopReason::OutputTruncated {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -2737,6 +2737,33 @@ event: content_block_delta\n\
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":8}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut last_final = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Ok(StreamEvent::Final { stop }) = ev {
+                last_final = Some(stop);
+            }
+        }
+        assert_eq!(last_final, Some(StopReason::OutputTruncated));
+    }
+
+    #[tokio::test]
+    async fn model_context_window_exceeded_emits_output_truncated() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"model_context_window_exceeded\"},\"usage\":{\"output_tokens\":8}}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));

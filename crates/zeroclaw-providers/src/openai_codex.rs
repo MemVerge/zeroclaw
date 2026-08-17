@@ -886,7 +886,6 @@ pub(crate) fn process_responses_stream_event(
         Some(event_type @ ("response.completed" | "response.done" | "response.incomplete")) => {
             state.saw_completion = true;
             record_responses_stop(state, &event);
-            let is_completed = event_type == "response.completed";
             if let Some(response) = event
                 .get("response")
                 .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
@@ -900,7 +899,10 @@ pub(crate) fn process_responses_stream_event(
                         emitted.push(StreamEvent::ToolCall(tool_call));
                     }
                 }
-                if is_completed && let Some(usage) = parse_responses_usage(response.usage.as_ref())
+                // `response.done` is a Codex alias that can follow `completed`;
+                // do not emit usage twice. Incomplete is a first-class terminal.
+                if matches!(event_type, "response.completed" | "response.incomplete")
+                    && let Some(usage) = parse_responses_usage(response.usage.as_ref())
                 {
                     state.usage = Some(usage.clone());
                     emitted.push(StreamEvent::Usage(usage));
@@ -919,12 +921,18 @@ fn record_responses_stop(state: &mut ResponsesStreamState, event: &Value) {
     };
     let status = response.get("status").and_then(Value::as_str).unwrap_or("");
     if status.eq_ignore_ascii_case("incomplete") {
+        // The event/status already means the model did not finish. A missing
+        // `incomplete_details.reason` is still truncation, not Unknown.
         let reason = response
             .get("incomplete_details")
             .and_then(|details| details.get("reason"))
             .and_then(Value::as_str)
-            .unwrap_or("incomplete");
-        state.stop = Some(StopReason::from_provider_token(reason));
+            .unwrap_or("");
+        state.stop = Some(if reason.trim().is_empty() {
+            StopReason::OutputTruncated
+        } else {
+            StopReason::from_provider_token(reason)
+        });
         return;
     }
     if status.is_empty() {
@@ -1881,6 +1889,30 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_stream_event_emits_usage_when_present() {
+        let mut state = ResponsesStreamState::default();
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output_text\":\"cut\",\"usage\":{\"input_tokens\":80,\"output_tokens\":12}}}",
+            &mut state,
+        )
+        .expect("incomplete event should parse");
+
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Usage(TokenUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(12),
+                ..
+            })]
+        ));
+        assert_eq!(state.stop, Some(StopReason::OutputTruncated));
+        assert_eq!(
+            state.usage.as_ref().and_then(|usage| usage.output_tokens),
+            Some(12)
+        );
+    }
+
+    #[test]
     fn completed_stream_event_omits_usage_when_provider_does_not_report_it() {
         let mut state = ResponsesStreamState::default();
         let events = process_sse_chunk(
@@ -2309,6 +2341,18 @@ data: [DONE]
         let mut state = ResponsesStreamState::default();
         let _ = process_sse_chunk(
             "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output_text\":\"cut\"}}",
+            &mut state,
+        )
+        .unwrap();
+        assert!(state.saw_completion);
+        assert_eq!(state.stop, Some(StopReason::OutputTruncated));
+    }
+
+    #[test]
+    fn process_sse_chunk_incomplete_without_reason_is_output_truncated() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"output_text\":\"cut\"}}",
             &mut state,
         )
         .unwrap();

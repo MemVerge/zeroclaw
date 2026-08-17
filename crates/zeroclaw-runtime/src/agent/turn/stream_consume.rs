@@ -148,10 +148,10 @@ pub(crate) async fn consume_provider_streaming_response(
         };
         match event {
             StreamEvent::Final { stop } => {
-                outcome.stop = stop.clone();
-                if let Some(tx) = event_tx {
-                    let _ = tx.send(TurnEvent::Stop { reason: stop }).await;
-                }
+                // Keep the reason, but emit Stop only after the trailing
+                // think/protocol flush below. Those guards can still yield a
+                // Chunk after this event.
+                outcome.stop = stop;
                 break;
             }
             StreamEvent::Usage(usage) => {
@@ -262,6 +262,13 @@ pub(crate) async fn consume_provider_streaming_response(
     // Final forward may null delta_sender on send failure; mark it read.
     let _ = delta_sender;
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
+    if let Some(tx) = event_tx {
+        let _ = tx
+            .send(TurnEvent::Stop {
+                reason: outcome.stop.clone(),
+            })
+            .await;
+    }
 
     Ok(outcome)
 }
@@ -511,5 +518,123 @@ mod tests {
             }
         }
         assert_eq!(saw_stop, Some(StopReason::OutputTruncated));
+    }
+
+    struct HeldThinkPrefixProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for HeldThinkPrefixProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "HeldThinkPrefixProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for HeldThinkPrefixProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: false,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("ok<"))),
+                Ok(StreamEvent::Final {
+                    stop: StopReason::OutputTruncated,
+                }),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_event_arrives_after_think_stripper_flush() {
+        let provider = HeldThinkPrefixProvider;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            None,
+            None,
+            None,
+            Some(&event_tx),
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(event_tx);
+
+        assert_eq!(outcome.response_text, "ok<");
+
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+        let stop_at = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    TurnEvent::Stop {
+                        reason: StopReason::OutputTruncated
+                    }
+                )
+            })
+            .expect("Stop must be emitted");
+        assert!(
+            events[stop_at + 1..]
+                .iter()
+                .all(|event| !matches!(event, TurnEvent::Chunk { .. })),
+            "no Chunk may follow Stop, got {events:?}"
+        );
+        let visible: String = events[..stop_at]
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::Chunk { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(visible, "ok<");
     }
 }
