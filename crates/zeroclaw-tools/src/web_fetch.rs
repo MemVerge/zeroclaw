@@ -1,6 +1,8 @@
+mod charset;
+
 use crate::helpers::domain_guard;
 use async_trait::async_trait;
-use encoding_rs::{Encoding, UTF_8};
+use charset::{DecodedResponseBody, ResponseCompleteness, decode_response_body};
 use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
@@ -12,7 +14,6 @@ use zeroclaw_config::schema::FirecrawlConfig;
 /// Minimum body length to consider a standard fetch successful.
 /// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
 const FIRECRAWL_MIN_BODY_LEN: usize = 100;
-const HTML_META_CHARSET_SCAN_LIMIT: usize = 1024;
 
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
@@ -65,26 +66,27 @@ impl WebFetchTool {
     }
 
     fn truncate_response(&self, text: &str) -> String {
+        self.format_limited_response(text, ResponseCompleteness::Complete)
+    }
+
+    fn format_limited_response(&self, text: &str, completeness: ResponseCompleteness) -> String {
         if self.max_response_size == 0 {
             return text.to_string();
         }
-        if text.len() > self.max_response_size {
-            let mut truncated = text
-                .chars()
-                .take(self.max_response_size)
-                .collect::<String>();
-            truncated.push_str("\n\n... [Response truncated due to size limit] ...");
-            truncated
-        } else {
-            text.to_string()
+        let end = utf8_prefix_length(text, self.max_response_size);
+        if end == text.len() && completeness.is_complete() {
+            return text.to_string();
         }
+        let mut truncated = text[..end].to_string();
+        truncated.push_str("\n\n... [Response truncated due to size limit] ...");
+        truncated
     }
 
     async fn read_response_text_limited(
         &self,
         response: reqwest::Response,
         content_type: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<DecodedResponseBody> {
         let mut bytes_stream = response.bytes_stream();
         let hard_cap = if self.max_response_size == 0 {
             usize::MAX
@@ -100,7 +102,15 @@ impl WebFetchTool {
             }
         }
 
-        Ok(decode_response_body(&bytes, content_type))
+        let completeness = if self.max_response_size != 0 && bytes.len() > self.max_response_size {
+            ResponseCompleteness::Truncated
+        } else {
+            ResponseCompleteness::Complete
+        };
+        if !completeness.is_complete() {
+            bytes.truncate(self.max_response_size);
+        }
+        decode_response_body(&bytes, content_type, completeness)
     }
 
     /// Whether the standard fetch result should trigger a Firecrawl fallback.
@@ -296,13 +306,17 @@ impl WebFetchTool {
             }
         };
 
+        if body.had_decode_errors {
+            log_decode_errors(&content_type, body.completeness);
+        }
+
         let text = if body_mode == "html" {
-            nanohtml2text::html2text(&body)
+            nanohtml2text::html2text(&body.text)
         } else {
-            body
+            body.text
         };
 
-        let output = self.truncate_response(&text);
+        let output = self.format_limited_response(&text, body.completeness);
 
         ToolResult {
             success: true,
@@ -586,131 +600,25 @@ fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) ->
     buffer.len() >= hard_cap
 }
 
-fn decode_response_body(bytes: &[u8], content_type: &str) -> String {
-    let (bom_encoding, bom_length) = Encoding::for_bom(bytes)
-        .map(|(encoding, length)| (Some(encoding), length))
-        .unwrap_or((None, 0));
-    let declared_encoding = encoding_from_content_type(content_type).or_else(|| {
-        if is_html_content_type(content_type) {
-            encoding_from_html_meta(bytes)
-        } else {
-            None
-        }
-    });
-    let encoding = bom_encoding.or(declared_encoding).unwrap_or(UTF_8);
-    let (decoded, _) = encoding.decode_without_bom_handling(&bytes[bom_length..]);
-    decoded.into_owned()
-}
-
-fn encoding_from_content_type(content_type: &str) -> Option<&'static Encoding> {
-    content_type.split(';').skip(1).find_map(|parameter| {
-        let (name, value) = parameter.split_once('=')?;
-        if !name.trim().eq_ignore_ascii_case("charset") {
-            return None;
-        }
-        let label = value
-            .trim()
-            .trim_matches(|character| character == '"' || character == '\'');
-        Encoding::for_label(label.as_bytes())
-    })
-}
-
-fn is_html_content_type(content_type: &str) -> bool {
-    content_type.is_empty()
-        || find_ascii_case_insensitive(content_type.as_bytes(), b"text/html").is_some()
-}
-
-fn encoding_from_html_meta(bytes: &[u8]) -> Option<&'static Encoding> {
-    let sample = &bytes[..bytes.len().min(HTML_META_CHARSET_SCAN_LIMIT)];
-    let mut search_start = 0;
-    while let Some(relative_start) = find_ascii_case_insensitive(&sample[search_start..], b"<meta")
-    {
-        let tag_start = search_start + relative_start;
-        let tag_tail = &sample[tag_start..];
-        let tag_length = tag_tail
-            .iter()
-            .position(|byte| *byte == b'>')
-            .unwrap_or(tag_tail.len());
-        if let Some(encoding) = encoding_after_charset(&tag_tail[..tag_length]) {
-            return Some(encoding);
-        }
-        search_start = tag_start + tag_length;
-        if search_start >= sample.len() {
-            break;
-        }
+fn utf8_prefix_length(text: &str, max_bytes: usize) -> usize {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
     }
-    None
+    end
 }
 
-fn encoding_after_charset(tag: &[u8]) -> Option<&'static Encoding> {
-    let mut search_start = 0;
-    while let Some(relative_start) = find_ascii_case_insensitive(&tag[search_start..], b"charset") {
-        let label_start = search_start + relative_start;
-        search_start = label_start + b"charset".len();
-        if !is_charset_declaration(tag, label_start) {
-            continue;
-        }
-        if let Some(encoding) = charset_label(&tag[search_start..]).and_then(Encoding::for_label) {
-            return Some(encoding);
-        }
-    }
-    None
-}
-
-fn charset_label(bytes: &[u8]) -> Option<&[u8]> {
-    let bytes = bytes.trim_ascii_start();
-    if bytes.first() != Some(&b'=') {
-        return None;
-    }
-    let bytes = bytes[1..].trim_ascii_start();
-    let bytes = match bytes.first() {
-        Some(b'"' | b'\'') => &bytes[1..],
-        Some(_) => bytes,
-        None => return None,
-    };
-    let label_length = bytes
-        .iter()
-        .position(|byte| {
-            byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\'' | b';' | b'>' | b'/')
-        })
-        .unwrap_or(bytes.len());
-    (label_length > 0).then_some(&bytes[..label_length])
-}
-
-fn is_charset_declaration(tag: &[u8], charset_start: usize) -> bool {
-    is_direct_charset_attribute(tag, charset_start) || is_legacy_content_type_meta(tag)
-}
-
-fn is_direct_charset_attribute(tag: &[u8], charset_start: usize) -> bool {
-    let has_attribute_separator =
-        charset_start == 0 || tag[charset_start - 1].is_ascii_whitespace();
-    has_attribute_separator && !is_inside_quoted_value(tag, charset_start)
-}
-
-fn is_inside_quoted_value(tag: &[u8], position: usize) -> bool {
-    let mut quote = None;
-    for byte in &tag[..position] {
-        match (quote, byte) {
-            (None, b'"' | b'\'') => quote = Some(*byte),
-            (Some(opening), closing) if opening == *closing => quote = None,
-            _ => {}
-        }
-    }
-    quote.is_some()
-}
-
-fn is_legacy_content_type_meta(tag: &[u8]) -> bool {
-    find_ascii_case_insensitive(tag, b"http-equiv").is_some()
-        && find_ascii_case_insensitive(tag, b"content-type").is_some()
-}
-
-fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|candidate| {
-        candidate
-            .iter()
-            .zip(needle)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
-    })
+fn log_decode_errors(content_type: &str, completeness: ResponseCompleteness) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "content_type": content_type,
+                "was_truncated": !completeness.is_complete(),
+            })),
+        "web_fetch: response body contained malformed byte sequences"
+    );
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
@@ -858,6 +766,19 @@ mod tests {
         test_tool_with_blocklist(allowed_domains, vec![])
     }
 
+    fn test_tool_with_limit(max_response_size: usize) -> WebFetchTool {
+        WebFetchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            vec![],
+            max_response_size,
+            30,
+            FirecrawlConfig::default(),
+            vec![],
+        )
+        .unwrap()
+    }
+
     fn test_tool_with_blocklist(
         allowed_domains: Vec<&str>,
         blocked_domains: Vec<&str>,
@@ -949,60 +870,6 @@ mod tests {
         assert!(!text.contains("<p>"));
     }
 
-    #[test]
-    fn response_body_uses_declared_gbk_charset() {
-        let original = "8月20日收盘：上证指数报3903.72点";
-        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
-        assert!(!had_errors);
-
-        let decoded = decode_response_body(&encoded, "text/html; charset=gb2312");
-
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn response_body_uses_html_meta_charset() {
-        let original = "<meta charset=\"gbk\"><p>医药领涨，医药股涨停潮</p>";
-        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
-        assert!(!had_errors);
-
-        let decoded = decode_response_body(&encoded, "text/html");
-
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn response_body_uses_legacy_html_meta_charset() {
-        let original =
-            "<meta http-equiv=\"content-type\" content=\"text/html; charset=gbk\"><p>医药领涨</p>";
-        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
-        assert!(!had_errors);
-
-        let decoded = decode_response_body(&encoded, "text/html");
-
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn response_body_ignores_charset_text_in_unrelated_meta() {
-        let original = "<meta name=\"description\" content=\"charset=gbk\"><p>创业板指</p>";
-
-        let decoded = decode_response_body(original.as_bytes(), "text/html");
-
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn response_body_bom_overrides_declared_charset() {
-        let original = "创业板指涨0.64%";
-        let mut encoded = b"\xEF\xBB\xBF".to_vec();
-        encoded.extend_from_slice(original.as_bytes());
-
-        let decoded = decode_response_body(&encoded, "text/plain; charset=gbk");
-
-        assert_eq!(decoded, original);
-    }
-
     #[tokio::test]
     async fn standard_fetch_decodes_gbk_html() {
         use wiremock::matchers::method;
@@ -1030,6 +897,58 @@ mod tests {
         assert!(result.success, "unexpected fetch error: {:?}", result.error);
         assert!(result.output.contains(original));
         assert!(!result.output.contains('\u{FFFD}'));
+    }
+
+    #[tokio::test]
+    async fn standard_fetch_drops_incomplete_gbk_tail_at_byte_limit() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode("中文");
+        assert!(!had_errors);
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(encoded.into_owned())
+                    .insert_header("content-type", "text/plain; charset=gbk"),
+            )
+            .mount(&server)
+            .await;
+
+        let result = test_tool_with_limit(3)
+            .standard_fetch(&reqwest::Client::new(), &server.uri())
+            .await;
+
+        assert!(result.success, "unexpected fetch error: {:?}", result.error);
+        assert!(result.output.starts_with("中"));
+        assert!(!result.output.contains('\u{FFFD}'));
+        assert!(result.output.contains("[Response truncated"));
+    }
+
+    #[tokio::test]
+    async fn standard_fetch_does_not_mark_complete_gbk_response_as_truncated() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode("中");
+        assert!(!had_errors);
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(encoded.into_owned())
+                    .insert_header("content-type", "text/plain; charset=gbk"),
+            )
+            .mount(&server)
+            .await;
+
+        let result = test_tool_with_limit(3)
+            .standard_fetch(&reqwest::Client::new(), &server.uri())
+            .await;
+
+        assert_eq!(result.output, "中");
+        assert!(!result.output.contains("[Response truncated"));
     }
 
     // ── URL validation ───────────────────────────────────────────
@@ -1220,6 +1139,23 @@ mod tests {
         let tool = test_tool(vec!["example.com"]);
         let text = "hello world";
         assert_eq!(tool.truncate_response(text), "hello world");
+    }
+
+    #[test]
+    fn truncate_response_stops_at_utf8_byte_boundary() {
+        let truncated = test_tool_with_limit(4).truncate_response("中文");
+
+        assert!(truncated.starts_with("中\n\n"));
+        assert!(!truncated.starts_with("中文"));
+    }
+
+    #[test]
+    fn format_response_marks_truncated_source_even_when_cleaned_text_is_short() {
+        let output = test_tool_with_limit(10)
+            .format_limited_response("short", ResponseCompleteness::Truncated);
+
+        assert!(output.starts_with("short\n\n"));
+        assert!(output.contains("[Response truncated"));
     }
 
     #[test]
