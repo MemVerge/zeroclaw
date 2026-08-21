@@ -13755,6 +13755,7 @@ dependencies = [
  "cap-std 4.0.2",
  "chrono",
  "directories",
+ "encoding_rs",
  "fantoccini",
  "fluent",
  "futures-util",
