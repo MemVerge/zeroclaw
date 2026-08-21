@@ -1,5 +1,6 @@
 use crate::helpers::domain_guard;
 use async_trait::async_trait;
+use encoding_rs::{Encoding, UTF_8};
 use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use zeroclaw_config::schema::FirecrawlConfig;
 /// Minimum body length to consider a standard fetch successful.
 /// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
 const FIRECRAWL_MIN_BODY_LEN: usize = 100;
+const HTML_META_CHARSET_SCAN_LIMIT: usize = 1024;
 
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
@@ -81,6 +83,7 @@ impl WebFetchTool {
     async fn read_response_text_limited(
         &self,
         response: reqwest::Response,
+        content_type: &str,
     ) -> anyhow::Result<String> {
         let mut bytes_stream = response.bytes_stream();
         let hard_cap = if self.max_response_size == 0 {
@@ -97,7 +100,7 @@ impl WebFetchTool {
             }
         }
 
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(decode_response_body(&bytes, content_type))
     }
 
     /// Whether the standard fetch result should trigger a Firecrawl fallback.
@@ -279,7 +282,10 @@ impl WebFetchTool {
             };
         };
 
-        let body = match self.read_response_text_limited(response).await {
+        let body = match self
+            .read_response_text_limited(response, &content_type)
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
                 return ToolResult {
@@ -580,6 +586,133 @@ fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) ->
     buffer.len() >= hard_cap
 }
 
+fn decode_response_body(bytes: &[u8], content_type: &str) -> String {
+    let (bom_encoding, bom_length) = Encoding::for_bom(bytes)
+        .map(|(encoding, length)| (Some(encoding), length))
+        .unwrap_or((None, 0));
+    let declared_encoding = encoding_from_content_type(content_type).or_else(|| {
+        if is_html_content_type(content_type) {
+            encoding_from_html_meta(bytes)
+        } else {
+            None
+        }
+    });
+    let encoding = bom_encoding.or(declared_encoding).unwrap_or(UTF_8);
+    let (decoded, _) = encoding.decode_without_bom_handling(&bytes[bom_length..]);
+    decoded.into_owned()
+}
+
+fn encoding_from_content_type(content_type: &str) -> Option<&'static Encoding> {
+    content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        let label = value
+            .trim()
+            .trim_matches(|character| character == '"' || character == '\'');
+        Encoding::for_label(label.as_bytes())
+    })
+}
+
+fn is_html_content_type(content_type: &str) -> bool {
+    content_type.is_empty()
+        || find_ascii_case_insensitive(content_type.as_bytes(), b"text/html").is_some()
+}
+
+fn encoding_from_html_meta(bytes: &[u8]) -> Option<&'static Encoding> {
+    let sample = &bytes[..bytes.len().min(HTML_META_CHARSET_SCAN_LIMIT)];
+    let mut search_start = 0;
+    while let Some(relative_start) = find_ascii_case_insensitive(&sample[search_start..], b"<meta")
+    {
+        let tag_start = search_start + relative_start;
+        let tag_tail = &sample[tag_start..];
+        let tag_length = tag_tail
+            .iter()
+            .position(|byte| *byte == b'>')
+            .unwrap_or(tag_tail.len());
+        if let Some(encoding) = encoding_after_charset(&tag_tail[..tag_length]) {
+            return Some(encoding);
+        }
+        search_start = tag_start + tag_length;
+        if search_start >= sample.len() {
+            break;
+        }
+    }
+    None
+}
+
+fn encoding_after_charset(tag: &[u8]) -> Option<&'static Encoding> {
+    let mut search_start = 0;
+    while let Some(relative_start) = find_ascii_case_insensitive(&tag[search_start..], b"charset") {
+        let label_start = search_start + relative_start;
+        search_start = label_start + b"charset".len();
+        if !is_charset_declaration(tag, label_start) {
+            continue;
+        }
+        if let Some(encoding) = charset_label(&tag[search_start..]).and_then(Encoding::for_label) {
+            return Some(encoding);
+        }
+    }
+    None
+}
+
+fn charset_label(bytes: &[u8]) -> Option<&[u8]> {
+    let bytes = bytes.trim_ascii_start();
+    if bytes.first() != Some(&b'=') {
+        return None;
+    }
+    let bytes = bytes[1..].trim_ascii_start();
+    let bytes = match bytes.first() {
+        Some(b'"' | b'\'') => &bytes[1..],
+        Some(_) => bytes,
+        None => return None,
+    };
+    let label_length = bytes
+        .iter()
+        .position(|byte| {
+            byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\'' | b';' | b'>' | b'/')
+        })
+        .unwrap_or(bytes.len());
+    (label_length > 0).then_some(&bytes[..label_length])
+}
+
+fn is_charset_declaration(tag: &[u8], charset_start: usize) -> bool {
+    is_direct_charset_attribute(tag, charset_start) || is_legacy_content_type_meta(tag)
+}
+
+fn is_direct_charset_attribute(tag: &[u8], charset_start: usize) -> bool {
+    let has_attribute_separator =
+        charset_start == 0 || tag[charset_start - 1].is_ascii_whitespace();
+    has_attribute_separator && !is_inside_quoted_value(tag, charset_start)
+}
+
+fn is_inside_quoted_value(tag: &[u8], position: usize) -> bool {
+    let mut quote = None;
+    for byte in &tag[..position] {
+        match (quote, byte) {
+            (None, b'"' | b'\'') => quote = Some(*byte),
+            (Some(opening), closing) if opening == *closing => quote = None,
+            _ => {}
+        }
+    }
+    quote.is_some()
+}
+
+fn is_legacy_content_type_meta(tag: &[u8]) -> bool {
+    find_ascii_case_insensitive(tag, b"http-equiv").is_some()
+        && find_ascii_case_insensitive(tag, b"content-type").is_some()
+}
+
+fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|candidate| {
+        candidate
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    })
+}
+
 fn extract_host(url: &str) -> anyhow::Result<String> {
     let rest = url
         .strip_prefix("http://")
@@ -814,6 +947,89 @@ mod tests {
         assert!(text.contains("world"));
         assert!(!text.contains("<h1>"));
         assert!(!text.contains("<p>"));
+    }
+
+    #[test]
+    fn response_body_uses_declared_gbk_charset() {
+        let original = "8月20日收盘：上证指数报3903.72点";
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
+        assert!(!had_errors);
+
+        let decoded = decode_response_body(&encoded, "text/html; charset=gb2312");
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn response_body_uses_html_meta_charset() {
+        let original = "<meta charset=\"gbk\"><p>医药领涨，医药股涨停潮</p>";
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
+        assert!(!had_errors);
+
+        let decoded = decode_response_body(&encoded, "text/html");
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn response_body_uses_legacy_html_meta_charset() {
+        let original =
+            "<meta http-equiv=\"content-type\" content=\"text/html; charset=gbk\"><p>医药领涨</p>";
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
+        assert!(!had_errors);
+
+        let decoded = decode_response_body(&encoded, "text/html");
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn response_body_ignores_charset_text_in_unrelated_meta() {
+        let original = "<meta name=\"description\" content=\"charset=gbk\"><p>创业板指</p>";
+
+        let decoded = decode_response_body(original.as_bytes(), "text/html");
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn response_body_bom_overrides_declared_charset() {
+        let original = "创业板指涨0.64%";
+        let mut encoded = b"\xEF\xBB\xBF".to_vec();
+        encoded.extend_from_slice(original.as_bytes());
+
+        let decoded = decode_response_body(&encoded, "text/plain; charset=gbk");
+
+        assert_eq!(decoded, original);
+    }
+
+    #[tokio::test]
+    async fn standard_fetch_decodes_gbk_html() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let original = "8月20日收盘：上证指数报3903.72点，涨0.24%";
+        let html = format!("<html><body><p>{original}</p></body></html>");
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(&html);
+        assert!(!had_errors);
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(encoded.into_owned())
+                    .insert_header("content-type", "text/html; charset=gbk"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let result = test_tool(vec!["*"])
+            .standard_fetch(&client, &server.uri())
+            .await;
+
+        assert!(result.success, "unexpected fetch error: {:?}", result.error);
+        assert!(result.output.contains(original));
+        assert!(!result.output.contains('\u{FFFD}'));
     }
 
     // ── URL validation ───────────────────────────────────────────
