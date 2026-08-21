@@ -2,7 +2,9 @@ mod charset;
 
 use crate::helpers::domain_guard;
 use async_trait::async_trait;
-use charset::{DecodedResponseBody, ResponseCompleteness, decode_response_body};
+use charset::{
+    DecodedResponseBody, ResponseCompleteness, ResponseContentType, decode_response_body,
+};
 use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
@@ -129,31 +131,30 @@ impl WebFetchTool {
         text: &str,
         completeness: ResponseCompleteness,
     ) -> LimitedResponse {
-        let end = if self.max_response_size == 0 {
-            text.len()
-        } else {
-            utf8_prefix_length(text, self.max_response_size)
-        };
-        let content_byte_len = text[..end].trim().len();
-        if end == text.len() && completeness.is_complete() {
-            return LimitedResponse {
-                output: text.to_string(),
-                content_byte_len,
-            };
+        let (mut output, output_was_truncated) = self.legacy_limited_output(text);
+        let content_byte_len = output.trim().len();
+        if output_was_truncated || !completeness.is_complete() {
+            output.push_str("\n\n");
+            output.push_str(RESPONSE_TRUNCATION_MARKER);
         }
-        let mut truncated = text[..end].to_string();
-        truncated.push_str("\n\n");
-        truncated.push_str(RESPONSE_TRUNCATION_MARKER);
         LimitedResponse {
-            output: truncated,
+            output,
             content_byte_len,
         }
+    }
+
+    fn legacy_limited_output(&self, text: &str) -> (String, bool) {
+        let should_truncate = self.max_response_size != 0 && text.len() > self.max_response_size;
+        if !should_truncate {
+            return (text.to_string(), false);
+        }
+        (text.chars().take(self.max_response_size).collect(), true)
     }
 
     async fn read_response_text_limited(
         &self,
         response: reqwest::Response,
-        content_type: &str,
+        content_type: ResponseContentType,
     ) -> anyhow::Result<DecodedResponseBody> {
         let mut bytes_stream = response.bytes_stream();
         let hard_cap = if self.max_response_size == 0 {
@@ -344,27 +345,23 @@ impl WebFetchTool {
             .unwrap_or("")
             .to_lowercase();
 
-        let body_mode = if content_type.contains("text/html") || content_type.is_empty() {
-            "html"
-        } else if content_type.contains("text/plain")
-            || content_type.contains("text/markdown")
-            || content_type.contains("application/json")
-        {
-            "plain"
-        } else {
-            return ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Unsupported content type: {content_type}. \
+        let parsed_content_type = match ResponseContentType::parse(&content_type) {
+            Some(parsed) => parsed,
+            None => {
+                return ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Unsupported content type: {content_type}. \
                      web_fetch supports text/html, text/plain, text/markdown, and application/json."
-                )),
+                    )),
+                }
+                .into();
             }
-            .into();
         };
 
         let body = match self
-            .read_response_text_limited(response, &content_type)
+            .read_response_text_limited(response, parsed_content_type)
             .await
         {
             Ok(t) => t,
@@ -382,7 +379,7 @@ impl WebFetchTool {
             log_decode_errors(&content_type, body.completeness);
         }
 
-        let text = if body_mode == "html" {
+        let text = if parsed_content_type.is_html() {
             nanohtml2text::html2text(&body.text)
         } else {
             body.text
@@ -665,14 +662,6 @@ fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) ->
 
     buffer.extend_from_slice(chunk);
     buffer.len() >= hard_cap
-}
-
-fn utf8_prefix_length(text: &str, max_bytes: usize) -> usize {
-    let mut end = text.len().min(max_bytes);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
 }
 
 fn log_decode_errors(content_type: &str, completeness: ResponseCompleteness) {
@@ -1210,11 +1199,11 @@ mod tests {
     }
 
     #[test]
-    fn truncate_response_stops_at_utf8_byte_boundary() {
+    fn truncate_response_preserves_legacy_character_limit() {
         let truncated = test_tool_with_limit(4).truncate_response("中文");
 
-        assert!(truncated.starts_with("中\n\n"));
-        assert!(!truncated.starts_with("中文"));
+        assert!(truncated.starts_with("中文\n\n"));
+        assert!(truncated.contains("[Response truncated"));
     }
 
     #[test]

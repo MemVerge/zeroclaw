@@ -21,9 +21,34 @@ impl ResponseCompleteness {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ResponseContentType {
+    kind: ResponseBodyKind,
+    declared_encoding: Option<&'static Encoding>,
+}
+
+impl ResponseContentType {
+    pub(super) fn parse(content_type: &str) -> Option<Self> {
+        Some(Self {
+            kind: response_body_kind(content_type)?,
+            declared_encoding: encoding_from_content_type(content_type),
+        })
+    }
+
+    pub(super) fn is_html(self) -> bool {
+        self.kind == ResponseBodyKind::Html
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponseBodyKind {
+    Html,
+    Plain,
+}
+
 pub(super) fn decode_response_body(
     bytes: &[u8],
-    content_type: &str,
+    content_type: ResponseContentType,
     completeness: ResponseCompleteness,
 ) -> anyhow::Result<DecodedResponseBody> {
     let (encoding, bom_length) = select_encoding(bytes, content_type);
@@ -35,13 +60,15 @@ pub(super) fn decode_response_body(
     })
 }
 
-fn select_encoding(bytes: &[u8], content_type: &str) -> (&'static Encoding, usize) {
+fn select_encoding(bytes: &[u8], content_type: ResponseContentType) -> (&'static Encoding, usize) {
     if let Some((encoding, length)) = Encoding::for_bom(bytes) {
         return (encoding, length);
     }
-    let encoding = encoding_from_content_type(content_type)
+    let encoding = content_type
+        .declared_encoding
         .or_else(|| {
-            is_html_content_type(content_type)
+            content_type
+                .is_html()
                 .then(|| encoding_from_html_meta(bytes))
                 .flatten()
         })
@@ -104,11 +131,17 @@ fn split_content_type(content_type: &str) -> Vec<&str> {
     parts
 }
 
-fn is_html_content_type(content_type: &str) -> bool {
-    content_type.is_empty()
-        || split_content_type(content_type)
-            .first()
-            .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/html"))
+fn response_body_kind(content_type: &str) -> Option<ResponseBodyKind> {
+    if content_type.contains("text/html") || content_type.is_empty() {
+        Some(ResponseBodyKind::Html)
+    } else if content_type.contains("text/plain")
+        || content_type.contains("text/markdown")
+        || content_type.contains("application/json")
+    {
+        Some(ResponseBodyKind::Plain)
+    } else {
+        None
+    }
 }
 
 fn encoding_from_html_meta(bytes: &[u8]) -> Option<&'static Encoding> {
@@ -140,7 +173,8 @@ fn encoding_from_html_prescan(sample: &[u8]) -> Option<&'static Encoding> {
             }
             position = end + 1;
         } else if is_ascii_start_tag(sample, position) {
-            position = position_after_start_tag(sample, position + 1)? + 1;
+            let attributes_start = position_after_tag_name(sample, position + 1);
+            position = position_after_start_tag(sample, attributes_start)? + 1;
         } else if is_simple_markup_start(sample, position) {
             position = position_after_first_gt(sample, position + 2)? + 1;
         } else {
@@ -183,6 +217,13 @@ fn is_simple_markup_start(bytes: &[u8], position: usize) -> bool {
             .is_some_and(|byte| matches!(byte, b'!' | b'/' | b'?'))
 }
 
+fn position_after_tag_name(bytes: &[u8], mut position: usize) -> usize {
+    if bytes.get(position) == Some(&b'/') {
+        position += 1;
+    }
+    position_after_attribute_name(bytes, position)
+}
+
 fn position_after_start_tag(bytes: &[u8], mut position: usize) -> Option<usize> {
     while let Some(byte) = bytes.get(position) {
         if *byte == b'>' {
@@ -192,10 +233,14 @@ fn position_after_start_tag(bytes: &[u8], mut position: usize) -> Option<usize> 
             position += 1;
             continue;
         }
+        let name_start = position;
         position = position_after_attribute_name(bytes, position);
+        let has_name = position > name_start;
         position = skip_html_space(bytes, position);
-        if bytes.get(position) == Some(&b'=') {
+        if has_name && bytes.get(position) == Some(&b'=') {
             position = position_after_tag_attribute_value(bytes, position + 1)?;
+        } else if !has_name {
+            position += 1;
         }
     }
     None
@@ -481,6 +526,8 @@ mod tests {
     use super::*;
 
     fn decode(bytes: &[u8], content_type: &str) -> DecodedResponseBody {
+        let content_type = ResponseContentType::parse(content_type)
+            .expect("test content type should be supported");
         decode_response_body(bytes, content_type, ResponseCompleteness::Complete)
             .expect("response should decode")
     }
@@ -526,6 +573,17 @@ mod tests {
 
         assert_eq!(decoded.text, original);
         assert!(!decoded.had_decode_errors);
+    }
+
+    #[test]
+    fn supported_html_like_content_type_uses_meta_charset_scan() {
+        let original = "<meta charset=gbk><p>上证指数</p>";
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
+        assert!(!had_errors);
+
+        let decoded = decode(&encoded, "application/x-text/html");
+
+        assert_eq!(decoded.text, original);
     }
 
     #[test]
@@ -606,6 +664,17 @@ mod tests {
     #[test]
     fn apostrophe_in_unquoted_attribute_does_not_hide_meta() {
         let original = "<img alt=It's fine><meta charset=gbk><p>医药领涨</p>";
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
+        assert!(!had_errors);
+
+        let decoded = decode(&encoded, "text/html");
+
+        assert_eq!(decoded.text, original);
+    }
+
+    #[test]
+    fn empty_attribute_name_does_not_open_quoted_value() {
+        let original = "<a =\"unterminated><meta charset=gbk><p>医药领涨</p>";
         let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
         assert!(!had_errors);
 
@@ -761,13 +830,12 @@ mod tests {
     fn truncated_multibyte_tail_is_not_replaced() {
         let (encoded, _, had_errors) = encoding_rs::GBK.encode("中文");
         assert!(!had_errors);
+        let content_type = ResponseContentType::parse("text/plain; charset=gbk")
+            .expect("test content type should be supported");
 
-        let decoded = decode_response_body(
-            &encoded[..3],
-            "text/plain; charset=gbk",
-            ResponseCompleteness::Truncated,
-        )
-        .expect("truncated response should decode");
+        let decoded =
+            decode_response_body(&encoded[..3], content_type, ResponseCompleteness::Truncated)
+                .expect("truncated response should decode");
 
         assert_eq!(decoded.text, "中");
         assert!(!decoded.text.contains('\u{FFFD}'));
