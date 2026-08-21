@@ -14,6 +14,60 @@ use zeroclaw_config::schema::FirecrawlConfig;
 /// Minimum body length to consider a standard fetch successful.
 /// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
 const FIRECRAWL_MIN_BODY_LEN: usize = 100;
+const RESPONSE_TRUNCATION_MARKER: &str = "... [Response truncated due to size limit] ...";
+
+struct LimitedResponse {
+    output: String,
+    content_byte_len: usize,
+}
+
+impl std::ops::Deref for LimitedResponse {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.output
+    }
+}
+
+struct StandardFetchOutcome {
+    result: ToolResult,
+    content_byte_len: usize,
+}
+
+impl StandardFetchOutcome {
+    fn success(response: LimitedResponse) -> Self {
+        Self {
+            result: ToolResult {
+                success: true,
+                output: response.output.into(),
+                error: None,
+            },
+            content_byte_len: response.content_byte_len,
+        }
+    }
+
+    fn into_result(self) -> ToolResult {
+        self.result
+    }
+}
+
+impl From<ToolResult> for StandardFetchOutcome {
+    fn from(result: ToolResult) -> Self {
+        let content_byte_len = result.output.trim().len();
+        Self {
+            result,
+            content_byte_len,
+        }
+    }
+}
+
+impl std::ops::Deref for StandardFetchOutcome {
+    type Target = ToolResult;
+
+    fn deref(&self) -> &Self::Target {
+        &self.result
+    }
+}
 
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
@@ -67,19 +121,33 @@ impl WebFetchTool {
 
     fn truncate_response(&self, text: &str) -> String {
         self.format_limited_response(text, ResponseCompleteness::Complete)
+            .output
     }
 
-    fn format_limited_response(&self, text: &str, completeness: ResponseCompleteness) -> String {
-        if self.max_response_size == 0 {
-            return text.to_string();
-        }
-        let end = utf8_prefix_length(text, self.max_response_size);
+    fn format_limited_response(
+        &self,
+        text: &str,
+        completeness: ResponseCompleteness,
+    ) -> LimitedResponse {
+        let end = if self.max_response_size == 0 {
+            text.len()
+        } else {
+            utf8_prefix_length(text, self.max_response_size)
+        };
+        let content_byte_len = text[..end].trim().len();
         if end == text.len() && completeness.is_complete() {
-            return text.to_string();
+            return LimitedResponse {
+                output: text.to_string(),
+                content_byte_len,
+            };
         }
         let mut truncated = text[..end].to_string();
-        truncated.push_str("\n\n... [Response truncated due to size limit] ...");
-        truncated
+        truncated.push_str("\n\n");
+        truncated.push_str(RESPONSE_TRUNCATION_MARKER);
+        LimitedResponse {
+            output: truncated,
+            content_byte_len,
+        }
     }
 
     async fn read_response_text_limited(
@@ -114,7 +182,7 @@ impl WebFetchTool {
     }
 
     /// Whether the standard fetch result should trigger a Firecrawl fallback.
-    fn should_fallback_to_firecrawl(&self, result: &ToolResult) -> bool {
+    fn should_fallback_to_firecrawl(&self, result: &StandardFetchOutcome) -> bool {
         if !self.firecrawl.enabled {
             return false;
         }
@@ -123,7 +191,7 @@ impl WebFetchTool {
             return true;
         }
         // Fallback on empty or very short body (JS-only pages)
-        if result.output.trim().len() < FIRECRAWL_MIN_BODY_LEN {
+        if result.content_byte_len < FIRECRAWL_MIN_BODY_LEN {
             return true;
         }
         false
@@ -241,7 +309,7 @@ impl WebFetchTool {
     }
 
     /// Perform the standard HTTP GET fetch and convert to text.
-    async fn standard_fetch(&self, client: &reqwest::Client, url: &str) -> ToolResult {
+    async fn standard_fetch(&self, client: &reqwest::Client, url: &str) -> StandardFetchOutcome {
         let response = match client.get(url).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -249,7 +317,8 @@ impl WebFetchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("HTTP request failed: {e}")),
-                };
+                }
+                .into();
             }
         };
 
@@ -263,7 +332,8 @@ impl WebFetchTool {
                     status.as_u16(),
                     status.canonical_reason().unwrap_or("Unknown")
                 )),
-            };
+            }
+            .into();
         }
 
         // Determine content type for processing strategy
@@ -289,7 +359,8 @@ impl WebFetchTool {
                     "Unsupported content type: {content_type}. \
                      web_fetch supports text/html, text/plain, text/markdown, and application/json."
                 )),
-            };
+            }
+            .into();
         };
 
         let body = match self
@@ -302,7 +373,8 @@ impl WebFetchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Failed to read response body: {e}")),
-                };
+                }
+                .into();
             }
         };
 
@@ -316,13 +388,8 @@ impl WebFetchTool {
             body.text
         };
 
-        let output = self.format_limited_response(&text, body.completeness);
-
-        ToolResult {
-            success: true,
-            output: output.into(),
-            error: None,
-        }
+        let response = self.format_limited_response(&text, body.completeness);
+        StandardFetchOutcome::success(response)
     }
 }
 
@@ -452,7 +519,7 @@ impl Tool for WebFetchTool {
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"url": url})),
-                "web_fetch: standard fetch insufficient for , attempting Firecrawl fallback"
+                "web_fetch: standard fetch insufficient, attempting Firecrawl fallback"
             );
             match Box::pin(self.fetch_via_firecrawl(&url)).await {
                 Ok(firecrawl_result) if firecrawl_result.success => {
@@ -482,7 +549,7 @@ impl Tool for WebFetchTool {
             }
         }
 
-        Ok(standard_result)
+        Ok(standard_result.into_result())
     }
 }
 
@@ -614,6 +681,7 @@ fn log_decode_errors(content_type: &str, completeness: ResponseCompleteness) {
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
             .with_attrs(::serde_json::json!({
+                "error_key": "web_fetch.response_decode_errors",
                 "content_type": content_type,
                 "was_truncated": !completeness.is_complete(),
             })),
@@ -1396,11 +1464,11 @@ mod tests {
     #[test]
     fn fallback_disabled_when_firecrawl_not_enabled() {
         let tool = test_tool_with_firecrawl(FirecrawlConfig::default());
-        let result = ToolResult {
+        let result = StandardFetchOutcome::from(ToolResult {
             success: false,
             output: ToolOutput::default(),
             error: Some("HTTP 403 Forbidden".into()),
-        };
+        });
         assert!(!tool.should_fallback_to_firecrawl(&result));
     }
 
@@ -1410,11 +1478,11 @@ mod tests {
             enabled: true,
             ..FirecrawlConfig::default()
         });
-        let result = ToolResult {
+        let result = StandardFetchOutcome::from(ToolResult {
             success: false,
             output: ToolOutput::default(),
             error: Some("HTTP 403 Forbidden".into()),
-        };
+        });
         assert!(tool.should_fallback_to_firecrawl(&result));
     }
 
@@ -1424,11 +1492,11 @@ mod tests {
             enabled: true,
             ..FirecrawlConfig::default()
         });
-        let result = ToolResult {
+        let result = StandardFetchOutcome::from(ToolResult {
             success: true,
             output: ToolOutput::default(),
             error: None,
-        };
+        });
         assert!(tool.should_fallback_to_firecrawl(&result));
     }
 
@@ -1438,11 +1506,11 @@ mod tests {
             enabled: true,
             ..FirecrawlConfig::default()
         });
-        let result = ToolResult {
+        let result = StandardFetchOutcome::from(ToolResult {
             success: true,
             output: "Loading...".into(), // < 100 chars, JS-only page
             error: None,
-        };
+        });
         assert!(tool.should_fallback_to_firecrawl(&result));
     }
 
@@ -1452,11 +1520,11 @@ mod tests {
             enabled: true,
             ..FirecrawlConfig::default()
         });
-        let result = ToolResult {
+        let result = StandardFetchOutcome::from(ToolResult {
             success: true,
             output: "A".repeat(200).into(), // well above 100 chars
             error: None,
-        };
+        });
         assert!(!tool.should_fallback_to_firecrawl(&result));
     }
 
@@ -1518,11 +1586,11 @@ mod tests {
             enabled: true,
             ..FirecrawlConfig::default()
         });
-        let result = ToolResult {
+        let result = StandardFetchOutcome::from(ToolResult {
             success: true,
             output: "A".repeat(99).into(),
             error: None,
-        };
+        });
         assert!(
             tool.should_fallback_to_firecrawl(&result),
             "99-char body (below threshold) should trigger fallback"
@@ -1535,15 +1603,28 @@ mod tests {
             enabled: true,
             ..FirecrawlConfig::default()
         });
-        let result = ToolResult {
+        let result = StandardFetchOutcome::from(ToolResult {
             success: true,
             output: "A".repeat(100).into(),
             error: None,
-        };
+        });
         assert!(
             !tool.should_fallback_to_firecrawl(&result),
             "100-char body (at threshold) should NOT trigger fallback"
         );
+    }
+
+    #[test]
+    fn fallback_ignores_truncation_marker_when_content_is_short() {
+        let tool = test_tool_with_firecrawl(FirecrawlConfig {
+            enabled: true,
+            ..FirecrawlConfig::default()
+        });
+        let response =
+            tool.format_limited_response(&"A".repeat(52), ResponseCompleteness::Truncated);
+        let result = StandardFetchOutcome::success(response);
+
+        assert!(tool.should_fallback_to_firecrawl(&result));
     }
 
     // ── Item 1: missing API key env var falls back gracefully ─────────

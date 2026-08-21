@@ -68,37 +68,81 @@ fn decode_bytes(
 }
 
 fn encoding_from_content_type(content_type: &str) -> Option<&'static Encoding> {
-    content_type.split(';').skip(1).find_map(|parameter| {
-        let (name, value) = parameter.split_once('=')?;
-        if !name.trim().eq_ignore_ascii_case("charset") {
-            return None;
+    split_content_type(content_type)
+        .into_iter()
+        .skip(1)
+        .find_map(|parameter| {
+            let (name, value) = parameter.split_once('=')?;
+            if !name.trim().eq_ignore_ascii_case("charset") {
+                return None;
+            }
+            let label = value
+                .trim()
+                .trim_matches(|character| character == '"' || character == '\'');
+            Encoding::for_label(label.as_bytes())
+        })
+}
+
+fn split_content_type(content_type: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (position, byte) in content_type.bytes().enumerate() {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' if in_quotes => escaped = true,
+            b'"' => in_quotes = !in_quotes,
+            b';' if !in_quotes => {
+                parts.push(&content_type[start..position]);
+                start = position + 1;
+            }
+            _ => {}
         }
-        let label = value
-            .trim()
-            .trim_matches(|character| character == '"' || character == '\'');
-        Encoding::for_label(label.as_bytes())
-    })
+    }
+    parts.push(&content_type[start..]);
+    parts
 }
 
 fn is_html_content_type(content_type: &str) -> bool {
     content_type.is_empty()
-        || find_ascii_case_insensitive(content_type.as_bytes(), b"text/html").is_some()
+        || split_content_type(content_type)
+            .first()
+            .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/html"))
 }
 
 fn encoding_from_html_meta(bytes: &[u8]) -> Option<&'static Encoding> {
     let sample = &bytes[..bytes.len().min(HTML_META_CHARSET_SCAN_LIMIT)];
+    encoding_from_utf16_xml_prefix(sample)
+        .or_else(|| encoding_from_html_prescan(sample))
+        .or_else(|| encoding_from_xml_declaration(sample))
+}
+
+fn encoding_from_utf16_xml_prefix(bytes: &[u8]) -> Option<&'static Encoding> {
+    if bytes.starts_with(&[0x3C, 0x00, 0x3F, 0x00, 0x78, 0x00]) {
+        Some(UTF_16LE)
+    } else if bytes.starts_with(&[0x00, 0x3C, 0x00, 0x3F, 0x00, 0x78]) {
+        Some(UTF_16BE)
+    } else {
+        None
+    }
+}
+
+fn encoding_from_html_prescan(sample: &[u8]) -> Option<&'static Encoding> {
     let mut position = 0;
     while position < sample.len() {
         if sample[position..].starts_with(b"<!--") {
-            position = position_after_comment(sample, position + 4);
+            position = position_after_comment(sample, position)?;
         } else if is_meta_tag_start(sample, position) {
-            let end = position_after_tag(sample, position + 5);
+            let end = position_after_start_tag(sample, position + 5)?;
             if let Some(encoding) = encoding_from_meta_attributes(&sample[position + 5..end]) {
                 return Some(encoding);
             }
-            position = end.saturating_add(1);
-        } else if is_tag_start(sample, position) {
-            position = position_after_tag(sample, position + 1).saturating_add(1);
+            position = end + 1;
+        } else if is_ascii_start_tag(sample, position) {
+            position = position_after_start_tag(sample, position + 1)? + 1;
+        } else if is_simple_markup_start(sample, position) {
+            position = position_after_first_gt(sample, position + 2)? + 1;
         } else {
             position += 1;
         }
@@ -106,10 +150,9 @@ fn encoding_from_html_meta(bytes: &[u8]) -> Option<&'static Encoding> {
     None
 }
 
-fn position_after_comment(bytes: &[u8], start: usize) -> usize {
-    find_bytes(&bytes[start..], b"-->")
-        .map(|relative| start + relative + 3)
-        .unwrap_or(bytes.len())
+fn position_after_comment(bytes: &[u8], comment_start: usize) -> Option<usize> {
+    let search_start = comment_start + 2;
+    find_bytes(&bytes[search_start..], b"-->").map(|relative| search_start + relative + 3)
 }
 
 fn is_meta_tag_start(bytes: &[u8], position: usize) -> bool {
@@ -122,24 +165,120 @@ fn is_meta_tag_start(bytes: &[u8], position: usize) -> bool {
             .is_some_and(|byte| is_html_space(*byte) || *byte == b'/')
 }
 
-fn is_tag_start(bytes: &[u8], position: usize) -> bool {
+fn is_ascii_start_tag(bytes: &[u8], position: usize) -> bool {
+    if bytes.get(position) != Some(&b'<') {
+        return false;
+    }
+    let mut name_start = position + 1;
+    if bytes.get(name_start) == Some(&b'/') {
+        name_start += 1;
+    }
+    bytes.get(name_start).is_some_and(u8::is_ascii_alphabetic)
+}
+
+fn is_simple_markup_start(bytes: &[u8], position: usize) -> bool {
     bytes.get(position) == Some(&b'<')
         && bytes
             .get(position + 1)
-            .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'!' | b'/' | b'?'))
+            .is_some_and(|byte| matches!(byte, b'!' | b'/' | b'?'))
 }
 
-fn position_after_tag(bytes: &[u8], start: usize) -> usize {
-    let mut quote = None;
-    for (offset, byte) in bytes[start..].iter().enumerate() {
-        match (quote, byte) {
-            (None, b'"' | b'\'') => quote = Some(*byte),
-            (Some(opening), closing) if opening == *closing => quote = None,
-            (None, b'>') => return start + offset,
-            _ => {}
+fn position_after_start_tag(bytes: &[u8], mut position: usize) -> Option<usize> {
+    while let Some(byte) = bytes.get(position) {
+        if *byte == b'>' {
+            return Some(position);
+        }
+        if is_html_space(*byte) || *byte == b'/' {
+            position += 1;
+            continue;
+        }
+        position = position_after_attribute_name(bytes, position);
+        position = skip_html_space(bytes, position);
+        if bytes.get(position) == Some(&b'=') {
+            position = position_after_tag_attribute_value(bytes, position + 1)?;
         }
     }
-    bytes.len()
+    None
+}
+
+fn position_after_attribute_name(bytes: &[u8], mut position: usize) -> usize {
+    while bytes
+        .get(position)
+        .is_some_and(|byte| !is_html_space(*byte) && !matches!(byte, b'/' | b'=' | b'>'))
+    {
+        position += 1;
+    }
+    position
+}
+
+fn position_after_tag_attribute_value(bytes: &[u8], position: usize) -> Option<usize> {
+    let start = skip_html_space(bytes, position);
+    match bytes.get(start) {
+        Some(quote @ (b'"' | b'\'')) => bytes[start + 1..]
+            .iter()
+            .position(|byte| byte == quote)
+            .map(|relative| start + relative + 2),
+        Some(_) => Some(position_after_unquoted_value(bytes, start)),
+        None => None,
+    }
+}
+
+fn position_after_unquoted_value(bytes: &[u8], mut position: usize) -> usize {
+    while bytes
+        .get(position)
+        .is_some_and(|byte| !is_html_space(*byte) && *byte != b'>')
+    {
+        position += 1;
+    }
+    position
+}
+
+fn position_after_first_gt(bytes: &[u8], start: usize) -> Option<usize> {
+    bytes[start..]
+        .iter()
+        .position(|byte| *byte == b'>')
+        .map(|relative| start + relative)
+}
+
+fn encoding_from_xml_declaration(bytes: &[u8]) -> Option<&'static Encoding> {
+    if !bytes.starts_with(b"<?xml") {
+        return None;
+    }
+    let declaration_end = bytes.iter().position(|byte| *byte == b'>')?;
+    let declaration = &bytes[..declaration_end];
+    let mut position = find_bytes(declaration, b"encoding")? + b"encoding".len();
+    position = skip_ascii_control_or_space(declaration, position);
+    if declaration.get(position) != Some(&b'=') {
+        return None;
+    }
+    position = skip_ascii_control_or_space(declaration, position + 1);
+    let quote = *declaration.get(position)?;
+    if !matches!(quote, b'"' | b'\'') {
+        return None;
+    }
+    let value = xml_encoding_value(declaration, position + 1, quote)?;
+    Encoding::for_label(value).map(normalize_xml_encoding)
+}
+
+fn skip_ascii_control_or_space(bytes: &[u8], mut position: usize) -> usize {
+    while bytes.get(position).is_some_and(|byte| *byte <= 0x20) {
+        position += 1;
+    }
+    position
+}
+
+fn xml_encoding_value(bytes: &[u8], start: usize, quote: u8) -> Option<&[u8]> {
+    let length = bytes[start..].iter().position(|byte| *byte == quote)?;
+    let value = &bytes[start..start + length];
+    value.iter().all(|byte| *byte > 0x20).then_some(value)
+}
+
+fn normalize_xml_encoding(encoding: &'static Encoding) -> &'static Encoding {
+    if std::ptr::eq(encoding, UTF_16BE) || std::ptr::eq(encoding, UTF_16LE) {
+        UTF_8
+    } else {
+        encoding
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -379,6 +518,17 @@ mod tests {
     }
 
     #[test]
+    fn quoted_content_type_parameter_does_not_hide_real_charset() {
+        let original = "<p>上证指数</p>";
+        let content_type = "text/html; note=\"x;charset=gbk\"; charset=utf-8";
+
+        let decoded = decode(original.as_bytes(), content_type);
+
+        assert_eq!(decoded.text, original);
+        assert!(!decoded.had_decode_errors);
+    }
+
+    #[test]
     fn non_html_content_does_not_scan_meta_charset() {
         let original = "<meta charset=gbk>上证指数";
 
@@ -429,6 +579,104 @@ mod tests {
         let decoded = decode(original.as_bytes(), "text/html");
 
         assert_eq!(decoded.text, original);
+    }
+
+    #[test]
+    fn empty_comment_does_not_hide_following_meta() {
+        let original = "<!--><meta charset=gbk><p>上证指数</p>";
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
+        assert!(!had_errors);
+
+        let decoded = decode(&encoded, "text/html");
+
+        assert_eq!(decoded.text, original);
+    }
+
+    #[test]
+    fn empty_comment_with_extra_dash_does_not_hide_following_meta() {
+        let original = "<!---><meta charset=gbk><p>深证成指</p>";
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
+        assert!(!had_errors);
+
+        let decoded = decode(&encoded, "text/html");
+
+        assert_eq!(decoded.text, original);
+    }
+
+    #[test]
+    fn apostrophe_in_unquoted_attribute_does_not_hide_meta() {
+        let original = "<img alt=It's fine><meta charset=gbk><p>医药领涨</p>";
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
+        assert!(!had_errors);
+
+        let decoded = decode(&encoded, "text/html");
+
+        assert_eq!(decoded.text, original);
+    }
+
+    #[test]
+    fn doctype_prefix_does_not_hide_meta() {
+        let original = "<!DOCTYPE html><meta charset=gbk><p>科创50指</p>";
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
+        assert!(!had_errors);
+
+        let decoded = decode(&encoded, "text/html");
+
+        assert_eq!(decoded.text, original);
+    }
+
+    #[test]
+    fn xml_declaration_supplies_fallback_encoding() {
+        let original = "<?xml version=\"1.0\" encoding=\"gbk\"?><p>创业板指</p>";
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
+        assert!(!had_errors);
+
+        let decoded = decode(&encoded, "text/html");
+
+        assert_eq!(decoded.text, original);
+    }
+
+    #[test]
+    fn utf16_xml_prefix_selects_little_endian_encoding() {
+        let original = "<?xml version=\"1.0\"?><p>深证成指</p>";
+        let encoded: Vec<u8> = original.encode_utf16().flat_map(u16::to_le_bytes).collect();
+
+        let decoded = decode(&encoded, "text/html");
+
+        assert_eq!(decoded.text, original);
+    }
+
+    #[test]
+    fn xml_utf16_label_is_normalized_to_utf8() {
+        let original = "<?xml version=\"1.0\" encoding=\"utf-16\"?><p>科创50指</p>";
+
+        let decoded = decode(original.as_bytes(), "text/html");
+
+        assert_eq!(decoded.text, original);
+        assert!(!decoded.had_decode_errors);
+    }
+
+    #[test]
+    fn first_duplicate_charset_attribute_wins() {
+        let original = "<meta charset=gbk charset=utf-8><p>上证指数</p>";
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(original);
+        assert!(!had_errors);
+
+        let decoded = decode(&encoded, "text/html");
+
+        assert_eq!(decoded.text, original);
+    }
+
+    #[test]
+    fn meta_straddling_scan_limit_is_not_accepted() {
+        let meta = "<meta charset=gbk";
+        let padding = "a".repeat(HTML_META_CHARSET_SCAN_LIMIT - meta.len());
+        let original = format!("{padding}{meta}><p>上证指数</p>");
+
+        let decoded = decode(original.as_bytes(), "text/html");
+
+        assert_eq!(decoded.text, original);
+        assert!(!decoded.had_decode_errors);
     }
 
     #[test]
