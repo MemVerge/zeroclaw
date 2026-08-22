@@ -29,6 +29,17 @@ pub struct ProviderFallbackInfo {
     pub actual_model: String,
 }
 
+/// Controls which failures may restart a structured [`ModelProvider::stream_chat`]
+/// request before it emits an event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StructuredStreamRetryPolicy {
+    /// Preserve ZeroClaw's default retry behavior for transient provider failures.
+    #[default]
+    BroadTransient,
+    /// Retry connection failures and HTTP 429/502/503/504/529, but not timeouts.
+    ConnectionErrorsAndRetryableStatuses,
+}
+
 tokio::task_local! {
     static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackInfo>>;
 }
@@ -819,6 +830,7 @@ pub struct ReliableModelProvider {
     model_providers: Vec<ReliableModelProviderEntry>,
     max_retries: u32,
     base_backoff_ms: u64,
+    structured_stream_retry_policy: StructuredStreamRetryPolicy,
     /// Extra API keys for rotation (index tracks round-robin position).
     api_keys: Vec<String>,
     key_index: AtomicUsize,
@@ -858,6 +870,7 @@ impl ReliableModelProvider {
             model_providers,
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
+            structured_stream_retry_policy: StructuredStreamRetryPolicy::default(),
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
@@ -867,6 +880,15 @@ impl ReliableModelProvider {
     /// Set additional API keys for round-robin rotation on rate-limit errors.
     pub fn with_api_keys(mut self, keys: Vec<String>) -> Self {
         self.api_keys = keys;
+        self
+    }
+
+    /// Restrict which pre-output structured stream failures may consume the retry budget.
+    pub fn with_structured_stream_retry_policy(
+        mut self,
+        policy: StructuredStreamRetryPolicy,
+    ) -> Self {
+        self.structured_stream_retry_policy = policy;
         self
     }
 
@@ -1028,6 +1050,7 @@ struct StructuredStreamRequest {
     options: StreamOptions,
     max_retries: u32,
     base_backoff_ms: u64,
+    retry_policy: StructuredStreamRetryPolicy,
 }
 
 impl StructuredStreamRequest {
@@ -1052,7 +1075,20 @@ enum StreamAttemptOutcome {
     ConsumerDropped,
 }
 
-fn is_retryable_stream_error(error: &StreamError) -> bool {
+fn is_retryable_stream_error(error: &StreamError, policy: StructuredStreamRetryPolicy) -> bool {
+    if is_context_window_stream_error(error) {
+        return true;
+    }
+
+    match policy {
+        StructuredStreamRetryPolicy::BroadTransient => is_broadly_retryable_stream_error(error),
+        StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses => {
+            is_connection_retryable_stream_error(error)
+        }
+    }
+}
+
+fn is_broadly_retryable_stream_error(error: &StreamError) -> bool {
     match error {
         StreamError::Io(_) => true,
         StreamError::Http(message) | StreamError::ModelProvider(message) => {
@@ -1060,6 +1096,97 @@ fn is_retryable_stream_error(error: &StreamError) -> bool {
         }
         StreamError::Json(_) | StreamError::InvalidSse(_) => false,
     }
+}
+
+fn is_connection_retryable_stream_error(error: &StreamError) -> bool {
+    match error {
+        StreamError::Io(error) => is_retryable_io_error(error),
+        StreamError::Http(message) | StreamError::ModelProvider(message) => {
+            is_retryable_transport_message(message)
+        }
+        StreamError::Json(_) | StreamError::InvalidSse(_) => false,
+    }
+}
+
+fn is_retryable_io_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+
+    matches!(
+        error.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+    ) || is_retryable_transport_message(&error.to_string())
+}
+
+fn is_retryable_transport_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    if let Some(status) = explicit_http_status(&message) {
+        return is_retryable_http_status(status);
+    }
+    if message.contains("timed out") || message.contains("timeout") {
+        return false;
+    }
+
+    const CONNECTION_MARKERS: [&str; 14] = [
+        "broken pipe",
+        "connection aborted",
+        "connection closed",
+        "connection refused",
+        "connection reset",
+        "connection was closed",
+        "dns error",
+        "failed to lookup address",
+        "forcibly closed",
+        "network is unreachable",
+        "not connected",
+        "os error 10054",
+        "tcp connect error",
+        "unexpected eof",
+    ];
+    CONNECTION_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+fn explicit_http_status(message: &str) -> Option<u16> {
+    const PREFIXES: [&str; 5] = [
+        "http status client error",
+        "http status server error",
+        "api error",
+        "status code",
+        "http ",
+    ];
+    let leading = parse_status_code(message).map(|status| (0, status));
+    PREFIXES
+        .iter()
+        .flat_map(|prefix| message.match_indices(prefix))
+        .filter_map(|(position, prefix)| {
+            parse_status_code(&message[position + prefix.len()..]).map(|status| (position, status))
+        })
+        .chain(leading)
+        .min_by_key(|(position, _)| *position)
+        .map(|(_, status)| status)
+}
+
+fn parse_status_code(message: &str) -> Option<u16> {
+    let candidate = message.trim_start_matches(|character: char| {
+        character.is_ascii_whitespace() || matches!(character, '(' | ':' | '=')
+    });
+    let digits: String = candidate
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .take(4)
+        .collect();
+    let status = (digits.len() == 3).then(|| digits.parse::<u16>().ok())??;
+    (100..=599).contains(&status).then_some(status)
+}
+
+fn is_retryable_http_status(status: u16) -> bool {
+    matches!(status, 429 | 502 | 503 | 504 | 529)
 }
 
 fn is_context_window_stream_error(error: &StreamError) -> bool {
@@ -1100,7 +1227,9 @@ async fn forward_stream_attempt(
                     return StreamAttemptOutcome::Complete;
                 }
             }
-            Err(error) if !emitted_event && is_retryable_stream_error(&error) => {
+            Err(error)
+                if !emitted_event && is_retryable_stream_error(&error, request.retry_policy) =>
+            {
                 return StreamAttemptOutcome::Retry(error);
             }
             Err(error) => return StreamAttemptOutcome::Terminal(error),
@@ -2159,6 +2288,7 @@ impl ModelProvider for ReliableModelProvider {
                 options,
                 max_retries: self.max_retries,
                 base_backoff_ms: self.base_backoff_ms,
+                retry_policy: self.structured_stream_retry_policy,
             };
             let handle = ::zeroclaw_spawn::spawn!(forward_structured_stream(retry_request, tx));
 
@@ -5092,6 +5222,8 @@ mod tests {
         BeforeOutputOnce,
         BeforeOutputAlways,
         BeforeOutputNonRetryable,
+        BeforeOutputTimeout,
+        BeforeOutputWindowsResetOnce,
         ContextWindowUntilTruncated,
         ContextWindowAlways,
         AfterOutput,
@@ -5152,6 +5284,26 @@ mod tests {
                 return stream::once(async {
                     Err(StreamError::ModelProvider(
                         "400 Bad Request: invalid tool schema".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+            if matches!(self.failure_mode, StreamFailureMode::BeforeOutputTimeout) {
+                return stream::once(async {
+                    Err(StreamError::Http(
+                        "provider request timed out after 300 seconds".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+            if matches!(
+                self.failure_mode,
+                StreamFailureMode::BeforeOutputWindowsResetOnce
+            ) && attempt == 0
+            {
+                return stream::once(async {
+                    Err(StreamError::Http(
+                        "error sending request for url: client error (SendRequest): connection was forcibly closed by a peer. (os error 10054)".to_string(),
                     ))
                 })
                 .boxed();
@@ -5254,11 +5406,115 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn connection_policy_retries_windows_reset_before_output() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::BeforeOutputWindowsResetOnce,
+            1,
+        )
+        .with_structured_stream_retry_policy(
+            StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+        );
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
+                if chunk.delta == "recovered"
+        ));
+    }
+
+    #[tokio::test]
+    async fn connection_policy_does_not_retry_timeout_before_output() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::BeforeOutputTimeout,
+            2,
+        )
+        .with_structured_stream_retry_policy(
+            StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+        );
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::Http(error))]
+                if error == "provider request timed out after 300 seconds"
+        ));
+    }
+
+    #[test]
+    fn connection_policy_retries_documented_http_statuses() {
+        let errors = [
+            "API error (429 Too Many Requests)",
+            "HTTP status server error (502 Bad Gateway)",
+            "HTTP 503 Service Unavailable",
+            "status code: 504 Gateway Timeout",
+            "529 Site Overloaded",
+        ];
+        for message in errors {
+            let error = StreamError::Http(message.to_string());
+
+            assert!(is_retryable_stream_error(
+                &error,
+                StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+            ));
+        }
+    }
+
+    #[test]
+    fn connection_policy_rejects_terminal_status_before_body_markers() {
+        let errors = [
+            "API error (400 Bad Request): connection reset by caller input",
+            "HTTP status client error (408 Request Timeout): connection closed",
+            "HTTP status server error (500 Internal Server Error): connection aborted",
+        ];
+        for message in errors {
+            let error = StreamError::Http(message.to_string());
+
+            assert!(!is_retryable_stream_error(
+                &error,
+                StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+            ));
+        }
+    }
+
+    #[test]
+    fn connection_policy_ignores_status_tokens_in_urls() {
+        let error = StreamError::Http(
+            "error sending request for url (https://example.test/503): request timed out"
+                .to_string(),
+        );
+
+        assert!(!is_retryable_stream_error(
+            &error,
+            StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+        ));
+    }
+
+    #[test]
+    fn broad_policy_preserves_timeout_retry_behavior() {
+        let error = StreamError::Http("provider request timed out".to_string());
+
+        assert!(is_retryable_stream_error(
+            &error,
+            StructuredStreamRetryPolicy::BroadTransient,
+        ));
+    }
+
     #[tokio::test]
     async fn stream_chat_does_not_retry_interruption_after_output() {
         let stream_calls = Arc::new(AtomicUsize::new(0));
         let model_provider =
-            interrupting_provider(Arc::clone(&stream_calls), StreamFailureMode::AfterOutput, 2);
+            interrupting_provider(Arc::clone(&stream_calls), StreamFailureMode::AfterOutput, 2)
+                .with_structured_stream_retry_policy(
+                    StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+                );
         let events = collect_interrupting_stream(&model_provider).await;
 
         assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
@@ -5276,6 +5532,9 @@ mod tests {
             Arc::clone(&stream_calls),
             StreamFailureMode::ContextWindowUntilTruncated,
             2,
+        )
+        .with_structured_stream_retry_policy(
+            StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
         );
         let messages = vec![
             ChatMessage::system("system"),
