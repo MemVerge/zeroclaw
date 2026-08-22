@@ -1226,7 +1226,18 @@ fn parse_status_code(message: &str) -> Option<u16> {
         .take_while(char::is_ascii_digit)
         .take(4)
         .collect();
-    let status = (digits.len() == 3).then(|| digits.parse::<u16>().ok())??;
+    if digits.len() != 3 {
+        return None;
+    }
+    let suffix = candidate.strip_prefix(&digits)?;
+    if suffix
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let status = digits.parse::<u16>().ok()?;
     (100..=599).contains(&status).then_some(status)
 }
 
@@ -5570,6 +5581,23 @@ mod tests {
             let error = StreamError::Http(message.to_string());
 
             assert!(is_retryable_stream_error(
+                &error,
+                StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+            ));
+        }
+    }
+
+    #[test]
+    fn connection_policy_rejects_statuses_with_alphanumeric_suffixes() {
+        let errors = [
+            "API error (429foo)",
+            "HTTP 503x invalid status",
+            "status code=504retry",
+        ];
+        for message in errors {
+            let error = StreamError::Http(message.to_string());
+
+            assert!(!is_retryable_stream_error(
                 &error,
                 StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
             ));
