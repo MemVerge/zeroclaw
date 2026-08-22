@@ -1,0 +1,44 @@
+name: MemoryBox Provider Gate
+
+on:
+  pull_request:
+    branches: [memorybox]
+    paths:
+      - "crates/zeroclaw-providers/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/memorybox-provider.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  providers:
+    name: Provider Format, Lint, and Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.96.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+      - name: Install system dependencies
+        run: bash scripts/ci/apt_install.sh libudev-dev
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint provider package
+        run: cargo clippy -p zeroclaw-providers --all-targets --locked -- -D warnings
+      - name: Test provider package
+        run: cargo test -p zeroclaw-providers --locked
