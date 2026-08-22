@@ -40,6 +40,44 @@ pub enum StructuredStreamRetryPolicy {
     ConnectionErrorsAndRetryableStatuses,
 }
 
+/// Classifies failures that may restart a structured stream before it emits an event.
+///
+/// [`ReliableModelProvider`] always treats failures after the first emitted event as
+/// terminal, regardless of this classifier's decision.
+pub trait StructuredStreamRetryClassifier: Send + Sync {
+    fn should_retry(&self, error: &StreamError) -> bool;
+}
+
+impl<F> StructuredStreamRetryClassifier for F
+where
+    F: Fn(&StreamError) -> bool + Send + Sync,
+{
+    fn should_retry(&self, error: &StreamError) -> bool {
+        self(error)
+    }
+}
+
+#[derive(Clone)]
+enum StructuredStreamRetryStrategy {
+    BuiltIn(StructuredStreamRetryPolicy),
+    Custom(Arc<dyn StructuredStreamRetryClassifier>),
+}
+
+impl Default for StructuredStreamRetryStrategy {
+    fn default() -> Self {
+        Self::BuiltIn(StructuredStreamRetryPolicy::default())
+    }
+}
+
+impl StructuredStreamRetryStrategy {
+    fn should_retry(&self, error: &StreamError) -> bool {
+        match self {
+            Self::BuiltIn(policy) => is_retryable_stream_error(error, *policy),
+            Self::Custom(classifier) => classifier.should_retry(error),
+        }
+    }
+}
+
 tokio::task_local! {
     static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackInfo>>;
 }
@@ -830,7 +868,7 @@ pub struct ReliableModelProvider {
     model_providers: Vec<ReliableModelProviderEntry>,
     max_retries: u32,
     base_backoff_ms: u64,
-    structured_stream_retry_policy: StructuredStreamRetryPolicy,
+    structured_stream_retry_strategy: StructuredStreamRetryStrategy,
     /// Extra API keys for rotation (index tracks round-robin position).
     api_keys: Vec<String>,
     key_index: AtomicUsize,
@@ -870,7 +908,7 @@ impl ReliableModelProvider {
             model_providers,
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
-            structured_stream_retry_policy: StructuredStreamRetryPolicy::default(),
+            structured_stream_retry_strategy: StructuredStreamRetryStrategy::default(),
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
@@ -888,7 +926,20 @@ impl ReliableModelProvider {
         mut self,
         policy: StructuredStreamRetryPolicy,
     ) -> Self {
-        self.structured_stream_retry_policy = policy;
+        self.structured_stream_retry_strategy = StructuredStreamRetryStrategy::BuiltIn(policy);
+        self
+    }
+
+    /// Use a caller-defined classifier for pre-output structured stream failures.
+    ///
+    /// The classifier replaces the built-in policy, but cannot permit retries after
+    /// the provider has emitted a stream event.
+    pub fn with_structured_stream_retry_classifier<C>(mut self, classifier: C) -> Self
+    where
+        C: StructuredStreamRetryClassifier + 'static,
+    {
+        self.structured_stream_retry_strategy =
+            StructuredStreamRetryStrategy::Custom(Arc::new(classifier));
         self
     }
 
@@ -1050,7 +1101,7 @@ struct StructuredStreamRequest {
     options: StreamOptions,
     max_retries: u32,
     base_backoff_ms: u64,
-    retry_policy: StructuredStreamRetryPolicy,
+    retry_strategy: StructuredStreamRetryStrategy,
 }
 
 impl StructuredStreamRequest {
@@ -1227,9 +1278,7 @@ async fn forward_stream_attempt(
                     return StreamAttemptOutcome::Complete;
                 }
             }
-            Err(error)
-                if !emitted_event && is_retryable_stream_error(&error, request.retry_policy) =>
-            {
+            Err(error) if !emitted_event && request.retry_strategy.should_retry(&error) => {
                 return StreamAttemptOutcome::Retry(error);
             }
             Err(error) => return StreamAttemptOutcome::Terminal(error),
@@ -2288,7 +2337,7 @@ impl ModelProvider for ReliableModelProvider {
                 options,
                 max_retries: self.max_retries,
                 base_backoff_ms: self.base_backoff_ms,
-                retry_policy: self.structured_stream_retry_policy,
+                retry_strategy: self.structured_stream_retry_strategy.clone(),
             };
             let handle = ::zeroclaw_spawn::spawn!(forward_structured_stream(retry_request, tx));
 
@@ -5224,6 +5273,7 @@ mod tests {
         BeforeOutputNonRetryable,
         BeforeOutputTimeout,
         BeforeOutputWindowsResetOnce,
+        BeforeOutputCustomOnce,
         ContextWindowUntilTruncated,
         ContextWindowAlways,
         AfterOutput,
@@ -5304,6 +5354,16 @@ mod tests {
                 return stream::once(async {
                     Err(StreamError::Http(
                         "error sending request for url: client error (SendRequest): connection was forcibly closed by a peer. (os error 10054)".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+            if matches!(self.failure_mode, StreamFailureMode::BeforeOutputCustomOnce)
+                && attempt == 0
+            {
+                return stream::once(async {
+                    Err(StreamError::ModelProvider(
+                        "caller-defined transient failure".to_string(),
                     ))
                 })
                 .boxed();
@@ -5424,6 +5484,61 @@ mod tests {
             events.as_slice(),
             [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
                 if chunk.delta == "recovered"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn custom_classifier_retries_caller_defined_failure_before_output() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::BeforeOutputCustomOnce,
+            1,
+        )
+        .with_structured_stream_retry_classifier(|error: &StreamError| {
+            matches!(error, StreamError::ModelProvider(message) if message == "caller-defined transient failure")
+        });
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
+                if chunk.delta == "recovered"
+        ));
+    }
+
+    #[tokio::test]
+    async fn custom_classifier_cannot_retry_failure_after_output() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider =
+            interrupting_provider(Arc::clone(&stream_calls), StreamFailureMode::AfterOutput, 2)
+                .with_structured_stream_retry_classifier(|_error: &StreamError| true);
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(chunk)), Err(StreamError::Http(error))]
+                if chunk.delta == "partial" && error == "connection reset"
+        ));
+    }
+
+    #[tokio::test]
+    async fn custom_classifier_replaces_builtin_policy() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::BeforeOutputAlways,
+            2,
+        )
+        .with_structured_stream_retry_classifier(|_error: &StreamError| false);
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::Http(error))] if error == "connection reset"
         ));
     }
 
