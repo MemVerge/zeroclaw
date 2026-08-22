@@ -57,24 +57,19 @@ where
     }
 }
 
-#[derive(Clone)]
-enum StructuredStreamRetryStrategy {
-    BuiltIn(StructuredStreamRetryPolicy),
-    Custom(Arc<dyn StructuredStreamRetryClassifier>),
-}
-
-impl Default for StructuredStreamRetryStrategy {
-    fn default() -> Self {
-        Self::BuiltIn(StructuredStreamRetryPolicy::default())
-    }
+#[derive(Clone, Default)]
+struct StructuredStreamRetryStrategy {
+    policy: StructuredStreamRetryPolicy,
+    extension: Option<Arc<dyn StructuredStreamRetryClassifier>>,
 }
 
 impl StructuredStreamRetryStrategy {
     fn should_retry(&self, error: &StreamError) -> bool {
-        match self {
-            Self::BuiltIn(policy) => is_retryable_stream_error(error, *policy),
-            Self::Custom(classifier) => classifier.should_retry(error),
-        }
+        is_retryable_stream_error(error, self.policy)
+            || self
+                .extension
+                .as_ref()
+                .is_some_and(|classifier| classifier.should_retry(error))
     }
 }
 
@@ -926,20 +921,19 @@ impl ReliableModelProvider {
         mut self,
         policy: StructuredStreamRetryPolicy,
     ) -> Self {
-        self.structured_stream_retry_strategy = StructuredStreamRetryStrategy::BuiltIn(policy);
+        self.structured_stream_retry_strategy.policy = policy;
         self
     }
 
-    /// Use a caller-defined classifier for pre-output structured stream failures.
+    /// Extend the built-in policy with caller-defined pre-output stream failures.
     ///
-    /// The classifier replaces the built-in policy, but cannot permit retries after
-    /// the provider has emitted a stream event.
+    /// The classifier cannot narrow the built-in policy or permit retries after the
+    /// provider has emitted a stream event.
     pub fn with_structured_stream_retry_classifier<C>(mut self, classifier: C) -> Self
     where
         C: StructuredStreamRetryClassifier + 'static,
     {
-        self.structured_stream_retry_strategy =
-            StructuredStreamRetryStrategy::Custom(Arc::new(classifier));
+        self.structured_stream_retry_strategy.extension = Some(Arc::new(classifier));
         self
     }
 
@@ -5525,7 +5519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_classifier_replaces_builtin_policy() {
+    async fn custom_classifier_preserves_builtin_policy() {
         let stream_calls = Arc::new(AtomicUsize::new(0));
         let model_provider = interrupting_provider(
             Arc::clone(&stream_calls),
@@ -5535,7 +5529,7 @@ mod tests {
         .with_structured_stream_retry_classifier(|_error: &StreamError| false);
         let events = collect_interrupting_stream(&model_provider).await;
 
-        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 3);
         assert!(matches!(
             events.as_slice(),
             [Err(StreamError::Http(error))] if error == "connection reset"
