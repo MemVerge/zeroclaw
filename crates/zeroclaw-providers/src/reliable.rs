@@ -29,8 +29,11 @@ pub struct ProviderFallbackInfo {
     pub actual_model: String,
 }
 
-/// Controls which failures may restart a structured [`ModelProvider::stream_chat`]
-/// request before it emits an event.
+/// Controls which transient failures may restart a structured
+/// [`ModelProvider::stream_chat`] request before it emits an event.
+///
+/// Context-window recovery remains enabled independently so the wrapper can
+/// truncate history once before surfacing the error.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StructuredStreamRetryPolicy {
     /// Preserve ZeroClaw's default retry behavior for transient provider failures.
@@ -916,7 +919,9 @@ impl ReliableModelProvider {
         self
     }
 
-    /// Restrict which pre-output structured stream failures may consume the retry budget.
+    /// Restrict which transient pre-output stream failures may consume the retry budget.
+    ///
+    /// Context-window recovery remains enabled independently of this policy.
     pub fn with_structured_stream_retry_policy(
         mut self,
         policy: StructuredStreamRetryPolicy,
@@ -1291,10 +1296,10 @@ async fn forward_stream_attempt(
     }
 
     let error = StreamError::ModelProvider("stream ended before final event".to_string());
-    if emitted_event {
-        StreamAttemptOutcome::Terminal(error)
-    } else {
+    if !emitted_event && request.retry_strategy.should_retry(&error) {
         StreamAttemptOutcome::Retry(error)
+    } else {
+        StreamAttemptOutcome::Terminal(error)
     }
 }
 
@@ -5279,6 +5284,7 @@ mod tests {
         BeforeOutputTimeout,
         BeforeOutputWindowsResetOnce,
         BeforeOutputCustomOnce,
+        EmptyBeforeOutputOnce,
         ContextWindowUntilTruncated,
         ContextWindowAlways,
         AfterOutput,
@@ -5372,6 +5378,10 @@ mod tests {
                     ))
                 })
                 .boxed();
+            }
+            if matches!(self.failure_mode, StreamFailureMode::EmptyBeforeOutputOnce) && attempt == 0
+            {
+                return stream::empty().boxed();
             }
             if matches!(self.failure_mode, StreamFailureMode::AfterOutput) {
                 return stream::iter(vec![
@@ -5495,17 +5505,24 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn custom_classifier_retries_caller_defined_failure_before_output() {
         let stream_calls = Arc::new(AtomicUsize::new(0));
+        let classifier_calls = Arc::new(AtomicUsize::new(0));
+        let classifier_calls_for_request = Arc::clone(&classifier_calls);
         let model_provider = interrupting_provider(
             Arc::clone(&stream_calls),
             StreamFailureMode::BeforeOutputCustomOnce,
             1,
         )
-        .with_structured_stream_retry_classifier(|error: &StreamError| {
+        .with_structured_stream_retry_policy(
+            StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+        )
+        .with_structured_stream_retry_classifier(move |error: &StreamError| {
+            classifier_calls_for_request.fetch_add(1, Ordering::SeqCst);
             matches!(error, StreamError::ModelProvider(message) if message == "caller-defined transient failure")
         });
         let events = collect_interrupting_stream(&model_provider).await;
 
         assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(classifier_calls.load(Ordering::SeqCst), 1);
         assert!(matches!(
             events.as_slice(),
             [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
@@ -5565,6 +5582,45 @@ mod tests {
             events.as_slice(),
             [Err(StreamError::Http(error))]
                 if error == "provider request timed out after 300 seconds"
+        ));
+    }
+
+    #[tokio::test]
+    async fn connection_policy_does_not_retry_empty_stream_before_output() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::EmptyBeforeOutputOnce,
+            2,
+        )
+        .with_structured_stream_retry_policy(
+            StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+        );
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::ModelProvider(error))]
+                if error == "stream ended before final event"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn broad_policy_preserves_empty_stream_retry_behavior() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::EmptyBeforeOutputOnce,
+            1,
+        );
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
+                if chunk.delta == "recovered"
         ));
     }
 

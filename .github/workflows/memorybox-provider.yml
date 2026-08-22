@@ -34,6 +34,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/memorybox' }}
       - name: Install system dependencies
         run: bash scripts/ci/apt_install.sh libudev-dev
       - name: Check formatting
