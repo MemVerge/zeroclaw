@@ -64,9 +64,14 @@ where
 struct StructuredStreamRetryStrategy {
     policy: StructuredStreamRetryPolicy,
     extension: Option<Arc<dyn StructuredStreamRetryClassifier>>,
+    max_retries: Option<u32>,
 }
 
 impl StructuredStreamRetryStrategy {
+    fn max_retries(&self, fallback: u32) -> u32 {
+        self.max_retries.unwrap_or(fallback)
+    }
+
     fn should_retry(&self, error: &StreamError) -> bool {
         is_retryable_stream_error(error, self.policy)
             || self
@@ -939,6 +944,16 @@ impl ReliableModelProvider {
         C: StructuredStreamRetryClassifier + 'static,
     {
         self.structured_stream_retry_strategy.extension = Some(Arc::new(classifier));
+        self
+    }
+
+    /// Override the retry budget used only by [`ModelProvider::stream_chat`].
+    ///
+    /// The value counts retries after the initial attempt. Without this override,
+    /// structured streaming uses the general `max_retries` value passed to [`Self::new`].
+    /// Non-streaming provider methods continue to use only that general budget.
+    pub fn with_structured_stream_max_retries(mut self, max_retries: u32) -> Self {
+        self.structured_stream_retry_strategy.max_retries = Some(max_retries);
         self
     }
 
@@ -2345,7 +2360,9 @@ impl ModelProvider for ReliableModelProvider {
                 model: current_model,
                 temperature,
                 options,
-                max_retries: self.max_retries,
+                max_retries: self
+                    .structured_stream_retry_strategy
+                    .max_retries(self.max_retries),
                 base_backoff_ms: self.base_backoff_ms,
                 retry_strategy: self.structured_stream_retry_strategy.clone(),
             };
@@ -2688,6 +2705,31 @@ mod tests {
             .unwrap();
         assert_eq!(result, "recovered");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn structured_stream_budget_does_not_enable_non_streaming_retries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "temporary",
+                }),
+            )],
+            0,
+            1,
+        )
+        .with_structured_stream_max_retries(2);
+
+        let result = model_provider.simple_chat("hello", "test", Some(0.0)).await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -5478,6 +5520,25 @@ mod tests {
             events.as_slice(),
             [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
                 if chunk.delta == "recovered"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn structured_stream_budget_overrides_zero_general_retry_budget() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::BeforeOutputAlways,
+            0,
+        )
+        .with_structured_stream_max_retries(2);
+
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 3);
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::Http(error))] if error == "connection reset"
         ));
     }
 
