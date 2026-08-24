@@ -46,7 +46,8 @@ pub enum StructuredStreamRetryPolicy {
 /// Classifies failures that may restart a structured stream before it emits an event.
 ///
 /// [`ReliableModelProvider`] always treats failures after the first emitted event as
-/// terminal, regardless of this classifier's decision.
+/// terminal, regardless of this classifier's decision. Classifier panics are contained
+/// and treated as a terminal decision for the original stream error.
 pub trait StructuredStreamRetryClassifier: Send + Sync {
     fn should_retry(&self, error: &StreamError) -> bool;
 }
@@ -73,12 +74,32 @@ impl StructuredStreamRetryStrategy {
     }
 
     fn should_retry(&self, error: &StreamError) -> bool {
-        is_retryable_stream_error(error, self.policy)
-            || self
-                .extension
-                .as_ref()
-                .is_some_and(|classifier| classifier.should_retry(error))
+        is_retryable_stream_error(error, self.policy) || self.extension_should_retry(error)
     }
+
+    fn extension_should_retry(&self, error: &StreamError) -> bool {
+        let Some(classifier) = &self.extension else {
+            return false;
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            classifier.should_retry(error)
+        })) {
+            Ok(should_retry) => should_retry,
+            Err(_) => {
+                log_retry_classifier_panic();
+                false
+            }
+        }
+    }
+}
+
+fn log_retry_classifier_panic() {
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+        "Structured stream retry classifier panicked; treating provider error as terminal"
+    );
 }
 
 tokio::task_local! {
@@ -1196,12 +1217,15 @@ fn is_retryable_transport_message(message: &str) -> bool {
         return false;
     }
 
-    const CONNECTION_MARKERS: [&str; 14] = [
+    const CONNECTION_MARKERS: [&str; 17] = [
         "broken pipe",
+        "channel closed",
         "connection aborted",
         "connection closed",
+        "connection error received",
         "connection refused",
         "connection reset",
+        "connection shutdown",
         "connection was closed",
         "dns error",
         "failed to lookup address",
@@ -1218,10 +1242,11 @@ fn is_retryable_transport_message(message: &str) -> bool {
 }
 
 fn explicit_http_status(message: &str) -> Option<u16> {
-    const PREFIXES: [&str; 5] = [
+    const PREFIXES: [&str; 6] = [
         "http status client error",
         "http status server error",
         "api error",
+        "error code",
         "status code",
         "http ",
     ];
@@ -5626,6 +5651,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn panicking_custom_classifier_surfaces_original_error() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::BeforeOutputCustomOnce,
+            2,
+        )
+        .with_structured_stream_retry_policy(
+            StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+        )
+        .with_structured_stream_retry_classifier(|_error: &StreamError| {
+            panic!("classifier failure")
+        });
+
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::ModelProvider(error))]
+                if error == "caller-defined transient failure"
+        ));
+    }
+
+    #[tokio::test]
     async fn connection_policy_does_not_retry_timeout_before_output() {
         let stream_calls = Arc::new(AtomicUsize::new(0));
         let model_provider = interrupting_provider(
@@ -5689,6 +5739,7 @@ mod tests {
     fn connection_policy_retries_documented_http_statuses() {
         let errors = [
             "API error (429 Too Many Requests)",
+            "Error code: 429 - Too Many Requests",
             "HTTP status server error (502 Bad Gateway)",
             "HTTP 503 Service Unavailable",
             "status code: 504 Gateway Timeout",
@@ -5701,6 +5752,48 @@ mod tests {
                 &error,
                 StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
             ));
+        }
+    }
+
+    #[test]
+    fn connection_policy_retries_http2_connection_failures() {
+        let messages = [
+            "http2 error: connection error received: GOAWAY",
+            "client connection shutdown",
+            "request failed because channel closed",
+        ];
+
+        for message in messages {
+            assert!(is_retryable_transport_message(message));
+        }
+    }
+
+    #[test]
+    fn connection_policy_retries_transient_io_error_kinds() {
+        let kinds = [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::UnexpectedEof,
+        ];
+
+        for kind in kinds {
+            assert!(is_retryable_io_error(&std::io::Error::from(kind)));
+        }
+    }
+
+    #[test]
+    fn connection_policy_rejects_terminal_io_error_kinds() {
+        let kinds = [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+        ];
+
+        for kind in kinds {
+            assert!(!is_retryable_io_error(&std::io::Error::from(kind)));
         }
     }
 
