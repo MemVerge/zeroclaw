@@ -32,22 +32,24 @@ pub struct ProviderFallbackInfo {
 /// Controls which transient failures may restart a structured
 /// [`ModelProvider::stream_chat`] request before it emits an event.
 ///
-/// Context-window recovery remains enabled independently so the wrapper can
-/// truncate history once before surfacing the error.
+/// Context-window failures bypass this classification policy, but truncation
+/// recovery consumes the same structured-stream retry budget.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StructuredStreamRetryPolicy {
     /// Preserve ZeroClaw's default retry behavior for transient provider failures.
     #[default]
     BroadTransient,
-    /// Retry connection failures and HTTP 429/502/503/504/529, but not timeouts.
+    /// Retry connection failures and HTTP 429/502/503/504/529, but not timeouts
+    /// or streams that close before emitting any event.
     ConnectionErrorsAndRetryableStatuses,
 }
 
 /// Classifies failures that may restart a structured stream before it emits an event.
 ///
 /// [`ReliableModelProvider`] always treats failures after the first emitted event as
-/// terminal, regardless of this classifier's decision. Classifier panics are contained
-/// and treated as a terminal decision for the original stream error.
+/// terminal, regardless of this classifier's decision. With an unwind panic strategy,
+/// classifier panics are contained and treated as terminal for the original stream
+/// error. Builds configured with `panic = "abort"` terminate before containment runs.
 pub trait StructuredStreamRetryClassifier: Send + Sync {
     fn should_retry(&self, error: &StreamError) -> bool;
 }
@@ -947,7 +949,8 @@ impl ReliableModelProvider {
 
     /// Restrict which transient pre-output stream failures may consume the retry budget.
     ///
-    /// Context-window recovery remains enabled independently of this policy.
+    /// Context-window recovery bypasses this classification policy, but consumes
+    /// the same structured-stream retry budget.
     pub fn with_structured_stream_retry_policy(
         mut self,
         policy: StructuredStreamRetryPolicy,
@@ -972,7 +975,9 @@ impl ReliableModelProvider {
     ///
     /// The value counts retries after the initial attempt. Without this override,
     /// structured streaming uses the general `max_retries` value passed to [`Self::new`].
-    /// Non-streaming provider methods continue to use only that general budget.
+    /// The budget covers both classified transient failures and context-window
+    /// truncation recovery. Non-streaming methods continue to use only the general
+    /// budget.
     pub fn with_structured_stream_max_retries(mut self, max_retries: u32) -> Self {
         self.structured_stream_retry_strategy.max_retries = Some(max_retries);
         self
@@ -5353,6 +5358,7 @@ mod tests {
         BeforeOutputCustomOnce,
         EmptyBeforeOutputOnce,
         ContextWindowUntilTruncated,
+        ConnectionThenContextWindowUntilTruncated,
         ContextWindowAlways,
         AfterOutput,
     }
@@ -5397,6 +5403,11 @@ mod tests {
                     self.failure_mode,
                     StreamFailureMode::ContextWindowUntilTruncated
                 ) && history_too_long)
+                || (matches!(
+                    self.failure_mode,
+                    StreamFailureMode::ConnectionThenContextWindowUntilTruncated
+                ) && attempt > 0
+                    && history_too_long)
             {
                 return stream::once(async {
                     Err(StreamError::ModelProvider(
@@ -5528,6 +5539,16 @@ mod tests {
             )
             .collect()
             .await
+    }
+
+    fn oversized_test_history() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("old question"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("current question"),
+            ChatMessage::assistant("current answer"),
+        ]
     }
 
     #[tokio::test(start_paused = true)]
@@ -5832,11 +5853,19 @@ mod tests {
     }
 
     #[test]
-    fn connection_policy_ignores_status_tokens_in_urls() {
-        let error = StreamError::Http(
-            "error sending request for url (https://example.test/503): request timed out"
-                .to_string(),
-        );
+    fn explicit_http_status_ignores_status_tokens_in_urls() {
+        let url_only = "error sending request for url (https://example.test/503)";
+        let status_after_url =
+            "error sending request for url (https://example.test/503): http 429 too many requests";
+
+        assert_eq!(explicit_http_status(url_only), None);
+        assert_eq!(explicit_http_status(status_after_url), Some(429));
+    }
+
+    #[test]
+    fn connection_policy_keeps_tcp_connect_timeouts_terminal() {
+        let error =
+            StreamError::Http("tcp connect error: connection timed out (os error 110)".to_string());
 
         assert!(!is_retryable_stream_error(
             &error,
@@ -5855,13 +5884,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_chat_does_not_retry_interruption_after_output() {
+    async fn connection_policy_does_not_retry_interruption_after_output() {
         let stream_calls = Arc::new(AtomicUsize::new(0));
         let model_provider =
             interrupting_provider(Arc::clone(&stream_calls), StreamFailureMode::AfterOutput, 2)
                 .with_structured_stream_retry_policy(
                     StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
                 );
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(chunk)), Err(StreamError::Http(error))]
+                if chunk.delta == "partial" && error == "connection reset"
+        ));
+    }
+
+    #[tokio::test]
+    async fn broad_policy_does_not_retry_interruption_after_output() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider =
+            interrupting_provider(Arc::clone(&stream_calls), StreamFailureMode::AfterOutput, 2);
         let events = collect_interrupting_stream(&model_provider).await;
 
         assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
@@ -5883,13 +5927,7 @@ mod tests {
         .with_structured_stream_retry_policy(
             StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
         );
-        let messages = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("old question"),
-            ChatMessage::assistant("old answer"),
-            ChatMessage::user("current question"),
-            ChatMessage::assistant("current answer"),
-        ];
+        let messages = oversized_test_history();
         let events = collect_interrupting_stream_with_messages(&model_provider, &messages).await;
 
         assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
@@ -5897,6 +5935,66 @@ mod tests {
             events.as_slice(),
             [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
                 if chunk.delta == "recovered"
+        ));
+    }
+
+    #[tokio::test]
+    async fn zero_structured_stream_budget_disables_context_recovery() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::ContextWindowUntilTruncated,
+            2,
+        )
+        .with_structured_stream_max_retries(0);
+        let messages = oversized_test_history();
+        let events = collect_interrupting_stream_with_messages(&model_provider, &messages).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::ModelProvider(error))]
+                if error == "maximum context length exceeded"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn structured_stream_budget_covers_transport_and_context_recovery() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::ConnectionThenContextWindowUntilTruncated,
+            0,
+        )
+        .with_structured_stream_max_retries(2);
+        let messages = oversized_test_history();
+        let events = collect_interrupting_stream_with_messages(&model_provider, &messages).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 3);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
+                if chunk.delta == "recovered"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_transport_budget_prevents_context_recovery() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::ConnectionThenContextWindowUntilTruncated,
+            0,
+        )
+        .with_structured_stream_max_retries(1);
+        let messages = oversized_test_history();
+        let events = collect_interrupting_stream_with_messages(&model_provider, &messages).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            events.as_slice(),
+            [Err(StreamError::ModelProvider(error))]
+                if error == "maximum context length exceeded"
         ));
     }
 
