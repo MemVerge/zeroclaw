@@ -23,6 +23,10 @@ pub mod stop_reason;
 pub mod tool;
 pub mod vad;
 
+pub use model_provider::{
+    has_membox_prompt_cache_boundary, strip_membox_prompt_cache_boundary,
+    MEMBOX_PROMPT_CACHE_BOUNDARY_PREFIX,
+};
 pub use stop_reason::StopReason;
 
 tokio::task_local! {

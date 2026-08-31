@@ -700,6 +700,33 @@ impl AnthropicModelProvider {
         }
     }
 
+    fn native_messages_have_stable_cache_boundary(messages: &[NativeMessage]) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    NativeContentOut::Text {
+                        cache_control: Some(_),
+                        ..
+                    }
+                )
+            })
+        })
+    }
+
+    fn apply_conversation_cache_control(
+        source_messages: &[ChatMessage],
+        native_messages: &mut [NativeMessage],
+    ) {
+        if !Self::should_cache_conversation(source_messages) {
+            return;
+        }
+        if Self::native_messages_have_stable_cache_boundary(native_messages) {
+            return;
+        }
+        Self::apply_cache_to_last_message(native_messages);
+    }
+
     fn parse_reasoning_content_block(block: &serde_json::Value) -> Option<IndexedNativeContent> {
         let index = block
             .get(ANTHROPIC_BLOCK_INDEX_KEY)
@@ -981,6 +1008,10 @@ impl AnthropicModelProvider {
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
         let mut system_text = None;
         let mut native_messages = Vec::new();
+        let last_boundary_index = messages.iter().enumerate().rev().find_map(|(index, msg)| {
+            (msg.role == "user" && zeroclaw_api::has_membox_prompt_cache_boundary(&msg.content))
+                .then_some(index)
+        });
 
         for (index, msg) in messages.iter().enumerate() {
             if ChatMessage::should_skip_internal_pruning_marker(messages, index) {
@@ -1040,7 +1071,11 @@ impl AnthropicModelProvider {
                 }
                 _ => {
                     // Parse image markers from user message content
-                    let (text, image_refs) = crate::multimodal::parse_image_markers(&msg.content);
+                    let (content_body, had_boundary) =
+                        zeroclaw_api::strip_membox_prompt_cache_boundary(&msg.content);
+                    let (text, image_refs) = crate::multimodal::parse_image_markers(&content_body);
+                    let cache_at_boundary =
+                        had_boundary && last_boundary_index == Some(index);
                     let mut content_blocks: Vec<NativeContentOut> = Vec::new();
 
                     // Add image content blocks for each image reference
@@ -1094,12 +1129,20 @@ impl AnthropicModelProvider {
                     if text.is_empty() && !image_refs.is_empty() {
                         content_blocks.push(NativeContentOut::Text {
                             text: "[image]".to_string(),
-                            cache_control: None,
+                            cache_control: if cache_at_boundary {
+                                Some(CacheControl::ephemeral())
+                            } else {
+                                None
+                            },
                         });
                     } else if !text.trim().is_empty() {
                         content_blocks.push(NativeContentOut::Text {
                             text,
-                            cache_control: None,
+                            cache_control: if cache_at_boundary {
+                                Some(CacheControl::ephemeral())
+                            } else {
+                                None
+                            },
                         });
                     }
 
@@ -1991,10 +2034,9 @@ impl ModelProvider for AnthropicModelProvider {
 
         let (system_prompt, mut messages) = Self::convert_messages(request.messages);
 
-        // Auto-cache last message if conversation is long
-        if Self::should_cache_conversation(request.messages) {
-            Self::apply_cache_to_last_message(&mut messages);
-        }
+        // Auto-cache last message if conversation is long, unless MemBox placed
+        // a stable breakpoint on the current user request.
+        Self::apply_conversation_cache_control(request.messages, &mut messages);
 
         // Check for tool_choice override from the agent loop (e.g. "any"
         // to force tool use for hardware requests).
@@ -2191,9 +2233,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         let (system_prompt, mut messages) = Self::convert_messages(request.messages);
-        if Self::should_cache_conversation(request.messages) {
-            Self::apply_cache_to_last_message(&mut messages);
-        }
+        Self::apply_conversation_cache_control(request.messages, &mut messages);
 
         let tool_choice_override = zeroclaw_api::TOOL_CHOICE_OVERRIDE
             .try_with(Clone::clone)
@@ -3839,6 +3879,50 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
         ];
         assert!(AnthropicModelProvider::should_cache_conversation(&messages));
+    }
+
+    #[test]
+    fn convert_messages_applies_cache_breakpoint_on_membox_boundary() {
+        let messages = vec![
+            ChatMessage::user(format!(
+                "{}{}",
+                zeroclaw_api::MEMBOX_PROMPT_CACHE_BOUNDARY_PREFIX,
+                "<current_user_request>\nfirst\n</current_user_request>"
+            )),
+            ChatMessage::assistant("answer"),
+            ChatMessage::user(format!(
+                "{}{}",
+                zeroclaw_api::MEMBOX_PROMPT_CACHE_BOUNDARY_PREFIX,
+                "<current_user_request>\nsecond\n</current_user_request>"
+            )),
+            ChatMessage::user("<memorybox_context>\nvolatile\n</memorybox_context>"),
+        ];
+        let (_, native) = AnthropicModelProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 3, "adjacent user turns merge for Anthropic");
+        let merged_tail = native.last().expect("merged tail");
+        assert_eq!(merged_tail.content.len(), 2);
+        match &merged_tail.content[0] {
+            NativeContentOut::Text { cache_control, text, .. } => {
+                assert!(cache_control.is_some(), "latest boundary should be cached");
+                assert!(text.contains("second"));
+            }
+            other => panic!("expected cached boundary block, got {other:?}"),
+        }
+        match &merged_tail.content[1] {
+            NativeContentOut::Text { cache_control, text, .. } => {
+                assert!(cache_control.is_none(), "volatile tail must stay uncached");
+                assert!(text.contains("volatile"));
+            }
+            other => panic!("expected volatile block, got {other:?}"),
+        }
+        let (_, mut native_for_apply) = AnthropicModelProvider::convert_messages(&messages);
+        AnthropicModelProvider::apply_conversation_cache_control(&messages, &mut native_for_apply);
+        match native_for_apply.last().unwrap().content.last() {
+            Some(NativeContentOut::Text { cache_control, .. }) => {
+                assert!(cache_control.is_none());
+            }
+            other => panic!("expected volatile tail after apply, got {other:?}"),
+        }
     }
 
     #[test]
