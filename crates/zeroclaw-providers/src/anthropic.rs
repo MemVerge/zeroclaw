@@ -654,26 +654,49 @@ impl AnthropicModelProvider {
 
     /// For OAuth tokens, Anthropic requires the system prompt to start with the
     /// Claude Code identity prefix. This prepends it to any existing system prompt.
+    ///
+    /// Anthropic allows at most four explicit `cache_control` breakpoints. When a
+    /// full system block follows the identity prefix, caching the identity alone is
+    /// redundant (the later system breakpoint already covers that prefix). Keep the
+    /// identity block uncached in that case so a slot remains for MemBox's stable
+    /// request boundary plus an incremental tool-loop tail.
     fn apply_oauth_system_prompt(system: Option<SystemPrompt>) -> Option<SystemPrompt> {
-        let prefix = SystemBlock {
-            block_type: "text".to_string(),
-            text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
-            cache_control: Some(CacheControl::ephemeral()),
-        };
+        let identity_text = "You are Claude Code, Anthropic's official CLI for Claude.".to_string();
         match system {
             Some(SystemPrompt::Blocks(mut blocks)) => {
-                blocks.insert(0, prefix);
+                blocks.insert(
+                    0,
+                    SystemBlock {
+                        block_type: "text".to_string(),
+                        text: identity_text,
+                        cache_control: None,
+                    },
+                );
+                if !blocks.iter().any(|block| block.cache_control.is_some())
+                    && let Some(last) = blocks.last_mut()
+                {
+                    last.cache_control = Some(CacheControl::ephemeral());
+                }
                 Some(SystemPrompt::Blocks(blocks))
             }
             Some(SystemPrompt::String(s)) => Some(SystemPrompt::Blocks(vec![
-                prefix,
+                SystemBlock {
+                    block_type: "text".to_string(),
+                    text: identity_text,
+                    cache_control: None,
+                },
                 SystemBlock {
                     block_type: "text".to_string(),
                     text: s,
                     cache_control: Some(CacheControl::ephemeral()),
                 },
             ])),
-            None => Some(SystemPrompt::Blocks(vec![prefix])),
+            None => Some(SystemPrompt::Blocks(vec![SystemBlock {
+                block_type: "text".to_string(),
+                text: identity_text,
+                // Identity is the only system block, so it owns the system breakpoint.
+                cache_control: Some(CacheControl::ephemeral()),
+            }])),
         }
     }
 
@@ -714,6 +737,75 @@ impl AnthropicModelProvider {
         })
     }
 
+    /// Anthropic accepts at most four explicit breakpoints per request.
+    const MAX_EXPLICIT_CACHE_BREAKPOINTS: usize = 4;
+
+    fn content_block_has_cache(block: &NativeContentOut) -> bool {
+        matches!(
+            block,
+            NativeContentOut::Text {
+                cache_control: Some(_),
+                ..
+            } | NativeContentOut::ToolResult {
+                cache_control: Some(_),
+                ..
+            } | NativeContentOut::ToolUse {
+                cache_control: Some(_),
+                ..
+            }
+        )
+    }
+
+    fn count_explicit_cache_breakpoints(
+        system: Option<&SystemPrompt>,
+        tools: Option<&[NativeToolSpec]>,
+        messages: &[NativeMessage],
+    ) -> usize {
+        let system_count = match system {
+            Some(SystemPrompt::Blocks(blocks)) => blocks
+                .iter()
+                .filter(|block| block.cache_control.is_some())
+                .count(),
+            Some(SystemPrompt::String(_)) | None => 0,
+        };
+        let tool_count = tools
+            .map(|specs| {
+                specs
+                    .iter()
+                    .filter(|tool| tool.cache_control.is_some())
+                    .count()
+            })
+            .unwrap_or(0);
+        let message_count = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|block| Self::content_block_has_cache(block))
+            .count();
+        system_count + tool_count + message_count
+    }
+
+    /// When MemBox already marked a stable request boundary, still cache the
+    /// growing tool-loop tail — but never the volatile MemoryBox context that
+    /// shares the same user message as that boundary.
+    fn apply_incremental_tail_cache_after_stable_boundary(messages: &mut [NativeMessage]) {
+        let Some(last_msg) = messages.last() else {
+            return;
+        };
+        let same_message_has_boundary = last_msg.content.iter().any(|block| {
+            matches!(
+                block,
+                NativeContentOut::Text {
+                    cache_control: Some(_),
+                    ..
+                }
+            )
+        });
+        if same_message_has_boundary {
+            return;
+        }
+        Self::apply_cache_to_last_message(messages);
+    }
+
     fn apply_conversation_cache_control(
         source_messages: &[ChatMessage],
         native_messages: &mut [NativeMessage],
@@ -722,9 +814,86 @@ impl AnthropicModelProvider {
             return;
         }
         if Self::native_messages_have_stable_cache_boundary(native_messages) {
+            Self::apply_incremental_tail_cache_after_stable_boundary(native_messages);
             return;
         }
         Self::apply_cache_to_last_message(native_messages);
+    }
+
+    /// Drop lowest-priority conversation tail breakpoints first when a request
+    /// would otherwise exceed Anthropic's four-breakpoint cap. Stable MemBox
+    /// boundaries, system, and tool breakpoints are preserved.
+    fn enforce_max_explicit_cache_breakpoints(
+        system: Option<&SystemPrompt>,
+        tools: Option<&[NativeToolSpec]>,
+        messages: &mut [NativeMessage],
+    ) {
+        while Self::count_explicit_cache_breakpoints(system, tools, messages)
+            > Self::MAX_EXPLICIT_CACHE_BREAKPOINTS
+        {
+            let Some((message_index, content_index)) =
+                Self::lowest_priority_tail_breakpoint(messages)
+            else {
+                break;
+            };
+            match &mut messages[message_index].content[content_index] {
+                NativeContentOut::Text { cache_control, .. }
+                | NativeContentOut::ToolResult { cache_control, .. } => {
+                    *cache_control = None;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    fn lowest_priority_tail_breakpoint(messages: &[NativeMessage]) -> Option<(usize, usize)> {
+        // Prefer stripping incremental tool_result tails first.
+        for (message_index, message) in messages.iter().enumerate().rev() {
+            for (content_index, block) in message.content.iter().enumerate().rev() {
+                if matches!(
+                    block,
+                    NativeContentOut::ToolResult {
+                        cache_control: Some(_),
+                        ..
+                    }
+                ) {
+                    return Some((message_index, content_index));
+                }
+            }
+        }
+        // Then strip trailing text caches that are not a MemBox boundary placed
+        // immediately before volatile uncached sibling content.
+        for (message_index, message) in messages.iter().enumerate().rev() {
+            for (content_index, block) in message.content.iter().enumerate().rev() {
+                if !matches!(
+                    block,
+                    NativeContentOut::Text {
+                        cache_control: Some(_),
+                        ..
+                    }
+                ) {
+                    continue;
+                }
+                let has_later_uncached_sibling =
+                    message.content[content_index + 1..].iter().any(|sibling| {
+                        matches!(
+                            sibling,
+                            NativeContentOut::Text {
+                                cache_control: None,
+                                ..
+                            } | NativeContentOut::ToolResult {
+                                cache_control: None,
+                                ..
+                            }
+                        )
+                    });
+                if has_later_uncached_sibling {
+                    continue;
+                }
+                return Some((message_index, content_index));
+            }
+        }
+        None
     }
 
     fn parse_reasoning_content_block(block: &serde_json::Value) -> Option<IndexedNativeContent> {
@@ -1074,8 +1243,7 @@ impl AnthropicModelProvider {
                     let (content_body, had_boundary) =
                         zeroclaw_api::strip_membox_prompt_cache_boundary(&msg.content);
                     let (text, image_refs) = crate::multimodal::parse_image_markers(&content_body);
-                    let cache_at_boundary =
-                        had_boundary && last_boundary_index == Some(index);
+                    let cache_at_boundary = had_boundary && last_boundary_index == Some(index);
                     let mut content_blocks: Vec<NativeContentOut> = Vec::new();
 
                     // Add image content blocks for each image reference
@@ -2034,8 +2202,9 @@ impl ModelProvider for AnthropicModelProvider {
 
         let (system_prompt, mut messages) = Self::convert_messages(request.messages);
 
-        // Auto-cache last message if conversation is long, unless MemBox placed
-        // a stable breakpoint on the current user request.
+        // Cache the latest conversation tail when useful. MemBox stable
+        // boundaries keep the request prefix cached; tool-loop tails can still
+        // receive an incremental breakpoint when they are separate messages.
         Self::apply_conversation_cache_control(request.messages, &mut messages);
 
         // Check for tool_choice override from the agent loop (e.g. "any"
@@ -2058,6 +2227,11 @@ impl ModelProvider for AnthropicModelProvider {
         } else {
             system_prompt
         };
+        Self::enforce_max_explicit_cache_breakpoints(
+            system_prompt.as_ref(),
+            native_tools.as_deref(),
+            &mut messages,
+        );
 
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
@@ -2252,6 +2426,11 @@ impl ModelProvider for AnthropicModelProvider {
         } else {
             system_prompt
         };
+        Self::enforce_max_explicit_cache_breakpoints(
+            system_prompt.as_ref(),
+            native_tools.as_deref(),
+            &mut messages,
+        );
 
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
@@ -3902,14 +4081,22 @@ data: {\"type\":\"message_stop\"}\n\n";
         let merged_tail = native.last().expect("merged tail");
         assert_eq!(merged_tail.content.len(), 2);
         match &merged_tail.content[0] {
-            NativeContentOut::Text { cache_control, text, .. } => {
+            NativeContentOut::Text {
+                cache_control,
+                text,
+                ..
+            } => {
                 assert!(cache_control.is_some(), "latest boundary should be cached");
                 assert!(text.contains("second"));
             }
             other => panic!("expected cached boundary block, got {other:?}"),
         }
         match &merged_tail.content[1] {
-            NativeContentOut::Text { cache_control, text, .. } => {
+            NativeContentOut::Text {
+                cache_control,
+                text,
+                ..
+            } => {
                 assert!(cache_control.is_none(), "volatile tail must stay uncached");
                 assert!(text.contains("volatile"));
             }
@@ -3919,10 +4106,121 @@ data: {\"type\":\"message_stop\"}\n\n";
         AnthropicModelProvider::apply_conversation_cache_control(&messages, &mut native_for_apply);
         match native_for_apply.last().unwrap().content.last() {
             Some(NativeContentOut::Text { cache_control, .. }) => {
-                assert!(cache_control.is_none());
+                assert!(
+                    cache_control.is_none(),
+                    "volatile MemoryBox context sibling must stay uncached"
+                );
             }
             other => panic!("expected volatile tail after apply, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn no_membox_marker_retains_last_message_cache() {
+        let messages = vec![
+            ChatMessage::user("first"),
+            ChatMessage::assistant("answer"),
+            ChatMessage::user("second"),
+        ];
+        let (_, mut native) = AnthropicModelProvider::convert_messages(&messages);
+        AnthropicModelProvider::apply_conversation_cache_control(&messages, &mut native);
+        match native.last().unwrap().content.last() {
+            Some(NativeContentOut::Text { cache_control, .. }) => {
+                assert!(
+                    cache_control.is_some(),
+                    "unmarked conversations should keep last-message cache"
+                );
+            }
+            other => panic!("expected cached last user text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn membox_boundary_still_allows_tool_loop_tail_cache() {
+        let messages = vec![
+            ChatMessage::user(format!(
+                "{}{}",
+                zeroclaw_api::MEMBOX_PROMPT_CACHE_BOUNDARY_PREFIX,
+                "<current_user_request>\nask\n</current_user_request>"
+            )),
+            ChatMessage::user("<memorybox_context>\nvolatile\n</memorybox_context>"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"call_1","name":"search","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"result"}"#),
+        ];
+        let (_, mut native) = AnthropicModelProvider::convert_messages(&messages);
+        AnthropicModelProvider::apply_conversation_cache_control(&messages, &mut native);
+        let last = native.last().expect("tool result message");
+        match last.content.last() {
+            Some(NativeContentOut::ToolResult { cache_control, .. }) => {
+                assert!(
+                    cache_control.is_some(),
+                    "tool-loop tail should keep an incremental breakpoint"
+                );
+            }
+            other => panic!("expected cached tool_result tail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_identity_does_not_consume_extra_breakpoint_when_system_follows() {
+        let system = Some(SystemPrompt::String("MemBox system".to_string()));
+        let with_oauth =
+            AnthropicModelProvider::apply_oauth_system_prompt(system).expect("oauth system");
+        match with_oauth {
+            SystemPrompt::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(blocks[0].cache_control.is_none());
+                assert!(blocks[1].cache_control.is_some());
+            }
+            other => panic!("expected blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn membox_oauth_tool_request_keeps_at_most_four_breakpoints() {
+        let messages = vec![
+            ChatMessage::system("MemBox system"),
+            ChatMessage::user(format!(
+                "{}{}",
+                zeroclaw_api::MEMBOX_PROMPT_CACHE_BOUNDARY_PREFIX,
+                "<current_user_request>\nask\n</current_user_request>"
+            )),
+            ChatMessage::user("<memorybox_context>\nvolatile\n</memorybox_context>"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"call_1","name":"search","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"result"}"#),
+        ];
+        let (system, mut native) = AnthropicModelProvider::convert_messages(&messages);
+        AnthropicModelProvider::apply_conversation_cache_control(&messages, &mut native);
+        let tools = AnthropicModelProvider::convert_tools(Some(&[ToolSpec::new(
+            "search",
+            "Search",
+            serde_json::json!({"type": "object"}),
+        )]));
+        let system = AnthropicModelProvider::apply_oauth_system_prompt(system);
+        AnthropicModelProvider::enforce_max_explicit_cache_breakpoints(
+            system.as_ref(),
+            tools.as_deref(),
+            &mut native,
+        );
+        let count = AnthropicModelProvider::count_explicit_cache_breakpoints(
+            system.as_ref(),
+            tools.as_deref(),
+            &native,
+        );
+        assert!(
+            count <= AnthropicModelProvider::MAX_EXPLICIT_CACHE_BREAKPOINTS,
+            "expected <=4 breakpoints, got {count}"
+        );
+        // Intended layout: tools + full system + MemBox boundary + tool_result tail.
+        assert_eq!(count, 4, "expected full four-slot allocation, got {count}");
+        assert!(
+            AnthropicModelProvider::native_messages_have_stable_cache_boundary(&native),
+            "MemBox boundary must remain"
+        );
     }
 
     #[test]

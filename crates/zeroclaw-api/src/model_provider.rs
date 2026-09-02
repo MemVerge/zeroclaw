@@ -29,7 +29,8 @@ pub const PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX: &str = "results collapsed]";
 pub const PRUNED_CONTEXT_SEPARATOR: &str = "[context continues]";
 /// MemBox injects this prefix on host `current_user_request` messages so Anthropic
 /// can place a stable prompt-cache breakpoint before volatile tail blocks.
-pub const MEMBOX_PROMPT_CACHE_BOUNDARY_PREFIX: &str = "\u{001E}membox:prompt_cache_boundary\u{001E}\n";
+pub const MEMBOX_PROMPT_CACHE_BOUNDARY_PREFIX: &str =
+    "\u{001E}membox:prompt_cache_boundary\u{001E}\n";
 
 pub fn has_membox_prompt_cache_boundary(content: &str) -> bool {
     content.starts_with(MEMBOX_PROMPT_CACHE_BOUNDARY_PREFIX)
