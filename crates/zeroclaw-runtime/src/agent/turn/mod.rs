@@ -35,7 +35,8 @@ pub use execution::{
 };
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior, StreamFailureBehavior};
-pub(crate) use max_iter::finish_after_max_iterations;
+use max_iter::GracefulFinishInput;
+pub(crate) use max_iter::{finish_after_max_iterations, requested_graceful_stop};
 pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
@@ -74,6 +75,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::GracefulStopReason;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
@@ -459,8 +461,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // steps drain across several iterations.
     let mut sop_exec_cache: std::collections::HashMap<String, OwnedAgentExecution> =
         std::collections::HashMap::new();
+    let mut graceful_reason = None;
 
     for iteration in 0..max_iterations {
+        if cancellation_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(ToolLoopCancelled.into());
+        }
+        if let Some(reason) = requested_graceful_stop() {
+            graceful_reason = Some(reason);
+            break;
+        }
         for steering_message in drain_steering_messages(&mut steering) {
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
                 // DEFAULT — append the injection to history exactly as today.
@@ -1205,20 +1218,31 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
     }
 
-    finish_after_max_iterations(
+    if cancellation_token
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return Err(ToolLoopCancelled.into());
+    }
+    let reason = graceful_reason
+        .or_else(requested_graceful_stop)
+        .unwrap_or(GracefulStopReason::MaxIterations);
+    finish_after_max_iterations(GracefulFinishInput {
         model_provider,
-        turn_state.history,
+        history: turn_state.history,
         provider_name,
         model,
         temperature,
         pacing,
-        cancellation_token.as_ref(),
+        cancellation_token: cancellation_token.as_ref(),
         max_iterations,
         accumulated_display_text,
         turn_id,
         knobs,
-        turn_state.canonical.as_deref_mut(),
-    )
+        new_messages_out: turn_state.canonical.as_deref_mut(),
+        reason,
+        event_tx: event_tx.as_ref(),
+    })
     .await
 }
 

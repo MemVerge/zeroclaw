@@ -4,6 +4,7 @@ pub mod agent;
 pub mod attribution;
 pub mod channel;
 pub mod elicitation;
+pub mod graceful_stop;
 pub mod hook;
 pub mod ingress;
 pub mod jsonrpc;
@@ -23,6 +24,7 @@ pub mod stop_reason;
 pub mod tool;
 pub mod vad;
 
+pub use graceful_stop::{GracefulStopReason, GracefulStopSignal};
 pub use model_provider::{
     MEMBOX_PROMPT_CACHE_BOUNDARY_PREFIX, has_membox_prompt_cache_boundary,
     strip_membox_prompt_cache_boundary,
@@ -45,4 +47,9 @@ tokio::task_local! {
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
     pub static NATIVE_THINKING_OVERRIDE: Option<crate::model_provider::NativeThinkingParams>;
+
+    /// Host-requested graceful wrap-up. Distinct from the loop cancellation
+    /// token: when set, the runtime finishes the current tool wave and then
+    /// issues one `tools=None` completion.
+    pub static GRACEFUL_STOP: Option<std::sync::Arc<crate::graceful_stop::GracefulStopSignal>>;
 }
