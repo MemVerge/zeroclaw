@@ -27,6 +27,21 @@ pub struct ChatMessage {
 pub const PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX: &str = "[Tool exchange:";
 pub const PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX: &str = "results collapsed]";
 pub const PRUNED_CONTEXT_SEPARATOR: &str = "[context continues]";
+/// MemBox injects this prefix on host `current_user_request` messages so Anthropic
+/// can place a stable prompt-cache breakpoint before volatile tail blocks.
+pub const MEMBOX_PROMPT_CACHE_BOUNDARY_PREFIX: &str =
+    "\u{001E}membox:prompt_cache_boundary\u{001E}\n";
+
+pub fn has_membox_prompt_cache_boundary(content: &str) -> bool {
+    content.starts_with(MEMBOX_PROMPT_CACHE_BOUNDARY_PREFIX)
+}
+
+pub fn strip_membox_prompt_cache_boundary(content: &str) -> (String, bool) {
+    content
+        .strip_prefix(MEMBOX_PROMPT_CACHE_BOUNDARY_PREFIX)
+        .map(|rest| (rest.to_string(), true))
+        .unwrap_or_else(|| (content.to_string(), false))
+}
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
