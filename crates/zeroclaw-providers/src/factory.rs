@@ -973,6 +973,9 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         // The Anthropic provider maps it to `output_config.effort` for supported
         // models and ignores it otherwise.
         b = b.reasoning_effort(opts.reasoning_effort.clone());
+        if !opts.extra_headers.is_empty() {
+            b = b.extra_headers(opts.extra_headers.clone());
+        }
         Ok(Box::new(b.build()))
     }
 }
@@ -1032,6 +1035,9 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         }
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(Some(mt));
+        }
+        if !opts.extra_headers.is_empty() {
+            b = b.extra_headers(opts.extra_headers.clone());
         }
         Ok(Box::new(b.build()))
     }

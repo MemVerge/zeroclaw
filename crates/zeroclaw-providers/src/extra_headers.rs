@@ -12,12 +12,16 @@
 use reqwest::header::{HeaderName, HeaderValue};
 use std::collections::HashMap;
 
-/// Header names the provider itself owns on every request. A caller-supplied copy
-/// is dropped so the built-in credential and framing stay authoritative — the same
-/// rule the Responses provider applies to `Authorization`.
+/// Single-valued header names the provider itself sets on every request. A
+/// caller-supplied copy is dropped so the built-in credential, framing and API
+/// version stay authoritative — the Responses provider's `Authorization` rule,
+/// widened to the other names a second value would make ambiguous. Comma-list
+/// headers such as `anthropic-beta` are deliberately not here: appending a beta
+/// flag is a legitimate caller use.
 const RESERVED: &[&str] = &[
     "authorization",
     "x-api-key",
+    "anthropic-version",
     "content-type",
     "content-length",
     "host",
