@@ -266,9 +266,10 @@ impl OpenAiBuilder {
     }
 
     /// Extra HTTP headers to send on every request, e.g. a host's per-turn
-    /// correlation tags. Same contract as the compatible provider's
-    /// `extra_headers`: reserved names (`Authorization`, framing) and invalid
-    /// entries are dropped with a warning.
+    /// correlation tags. Invalid entries are skipped with a warning, as on the
+    /// compatible provider; names this provider sets itself (`Authorization`,
+    /// framing) are dropped with a warning, as the Responses provider does for
+    /// `Authorization`. See `extra_headers`.
     pub fn extra_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
         self.extra_headers = headers;
         self
@@ -1553,29 +1554,61 @@ mod tests {
         );
     }
 
-    #[test]
-    fn openai_builder_extra_headers_ride_every_request_but_never_replace_the_credential() {
+    #[tokio::test]
+    async fn openai_builder_extra_headers_ride_every_request_but_never_replace_the_credential() {
+        use axum::{Json, Router, routing::post};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<axum::http::HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |headers: axum::http::HeaderMap| {
+                let captured = captured_clone.clone();
+                async move {
+                    *captured.lock() = Some(headers);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
         let mut headers = std::collections::HashMap::new();
         headers.insert("x-membox-turn-id".to_string(), "membox-round-1".to_string());
         headers.insert("x-membox-call-kind".to_string(), "main".to_string());
         headers.insert("Authorization".to_string(), "Bearer stolen".to_string());
         let p = OpenAiModelProvider::builder("test")
             .credential(Some("sk-real"))
+            .base_url(&format!("http://{addr}"))
             .extra_headers(headers)
             .build();
-        let request = crate::extra_headers::apply_extra_headers(
-            p.http_client()
-                .post(format!("{}/chat/completions", p.base_url))
-                .header("Authorization", "Bearer sk-real"),
-            &p.extra_headers,
-        )
-        .build()
-        .expect("request should build");
+        let messages = vec![ChatMessage::user("hello")];
 
+        p.chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "gpt-4o-mini",
+            None,
+        )
+        .await
+        .expect("chat over the wire");
+        server_handle.abort();
+
+        let seen = captured.lock().take().expect("no request captured");
         let header = |name: &str| {
-            request
-                .headers()
-                .get_all(name)
+            seen.get_all(name)
                 .iter()
                 .map(|v| v.to_str().unwrap().to_string())
                 .collect::<Vec<_>>()
