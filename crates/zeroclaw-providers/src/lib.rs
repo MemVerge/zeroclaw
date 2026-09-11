@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod compatible;
 pub mod copilot;
 pub mod dispatch;
+pub(crate) mod extra_headers;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;

@@ -139,6 +139,10 @@ pub struct AnthropicModelProvider {
     /// Serialized verbatim as Anthropic's top-level `output_config.effort`.
     /// Independent of per-request thinking.
     reasoning_effort: Option<String>,
+    /// Caller-supplied headers stamped on every request (validated once at
+    /// build time; see `extra_headers`). Applied per request rather than as
+    /// client default headers so the pooled runtime proxy client stays shared.
+    extra_headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
 }
 
 #[cfg(test)]
@@ -544,6 +548,7 @@ pub struct AnthropicBuilder {
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     reasoning_effort: Option<String>,
+    extra_headers: std::collections::HashMap<String, String>,
 }
 
 impl AnthropicBuilder {
@@ -588,6 +593,16 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Extra HTTP headers to send on every request, e.g. a host's per-turn
+    /// correlation tags. Invalid entries are skipped with a warning, as on the
+    /// compatible provider; names this provider sets itself (`x-api-key`,
+    /// `Authorization`, `anthropic-version`, framing) are dropped with a warning,
+    /// as the Responses provider does for `Authorization`. See `extra_headers`.
+    pub fn extra_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -600,6 +615,7 @@ impl AnthropicBuilder {
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             reasoning_effort: self.reasoning_effort,
+            extra_headers: crate::extra_headers::typed_extra_headers(&self.extra_headers),
         }
     }
 }
@@ -615,6 +631,7 @@ impl AnthropicModelProvider {
             max_tokens: None,
             timeout_secs: None,
             reasoning_effort: None,
+            extra_headers: std::collections::HashMap::new(),
         }
     }
 
@@ -2161,6 +2178,7 @@ impl ModelProvider for AnthropicModelProvider {
             .json(&request);
 
         request = self.apply_auth(request, credential);
+        request = crate::extra_headers::apply_extra_headers(request, &self.extra_headers);
 
         let response = request.send().await?;
 
@@ -2277,7 +2295,11 @@ impl ModelProvider for AnthropicModelProvider {
             .header("content-type", "application/json")
             .json(&native_request);
 
-        let response = self.apply_auth(req, credential).send().await?;
+        let req = crate::extra_headers::apply_extra_headers(
+            self.apply_auth(req, credential),
+            &self.extra_headers,
+        );
+        let response = req.send().await?;
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
@@ -2362,6 +2384,7 @@ impl ModelProvider for AnthropicModelProvider {
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("anthropic-version", "2023-06-01");
             request = self.apply_auth(request, credential);
+            request = crate::extra_headers::apply_extra_headers(request, &self.extra_headers);
             // Send a minimal request; the goal is TLS + HTTP/2 setup, not a valid response.
             // Anthropic has no lightweight GET endpoint, so we accept any non-network error.
             let _ = request.send().await?;
@@ -2479,6 +2502,7 @@ impl ModelProvider for AnthropicModelProvider {
         let client = self.streaming_http_client();
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
+        let extra_headers = self.extra_headers.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -2511,6 +2535,7 @@ impl ModelProvider for AnthropicModelProvider {
             } else {
                 req = req.header("x-api-key", &credential);
             }
+            req = crate::extra_headers::apply_extra_headers(req, &extra_headers);
 
             let response = match req.send().await {
                 Ok(r) => r,
@@ -3426,6 +3451,78 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert!(request.headers().get("authorization").is_none());
         assert!(request.headers().get("anthropic-beta").is_none());
+    }
+
+    #[tokio::test]
+    async fn builder_extra_headers_ride_every_request_but_never_replace_the_credential() {
+        use axum::{Json, Router, routing::post};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<axum::http::HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |headers: axum::http::HeaderMap| {
+                let captured = captured_clone.clone();
+                async move {
+                    *captured.lock() = Some(headers);
+                    Json(serde_json::json!({
+                        "content": [{"type": "text", "text": "ok"}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x-membox-turn-id".to_string(), "membox-round-1".to_string());
+        headers.insert("x-membox-call-kind".to_string(), "main".to_string());
+        headers.insert("x-api-key".to_string(), "stolen".to_string());
+        headers.insert("anthropic-version".to_string(), "2099-01-01".to_string());
+        let model_provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
+            .extra_headers(headers)
+            .build();
+
+        model_provider
+            .chat_with_system(None, "hi", "claude-opus-5", None)
+            .await
+            .expect("chat over the wire");
+        server_handle.abort();
+
+        let seen = captured.lock().take().expect("no request captured");
+        let header = |name: &str| {
+            seen.get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(header("x-membox-turn-id"), vec!["membox-round-1"]);
+        assert_eq!(header("x-membox-call-kind"), vec!["main"]);
+        assert_eq!(
+            header("x-api-key"),
+            vec!["sk-ant-api-key"],
+            "a reserved credential name in extra_headers is dropped, not appended"
+        );
+        assert_eq!(
+            header("anthropic-version"),
+            vec!["2023-06-01"],
+            "the API version is single-valued and stays the provider's"
+        );
+    }
+
+    #[test]
+    fn builder_without_extra_headers_stamps_nothing() {
+        let model_provider = AnthropicModelProvider::builder("test").build();
+        assert!(model_provider.extra_headers.is_empty());
     }
 
     #[tokio::test]
@@ -4597,6 +4694,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             max_tokens: 4096,
             timeout_secs: 120,
             reasoning_effort: None,
+            extra_headers: Vec::new(),
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)

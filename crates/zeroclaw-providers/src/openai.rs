@@ -37,6 +37,10 @@ pub struct OpenAiModelProvider {
     credential: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: u64,
+    /// Caller-supplied headers stamped on every request (validated once at
+    /// build time; see `extra_headers`). Applied per request rather than as
+    /// client default headers so the pooled runtime proxy client stays shared.
+    extra_headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,6 +229,7 @@ pub struct OpenAiBuilder {
     base_url: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
+    extra_headers: std::collections::HashMap<String, String>,
 }
 
 impl OpenAiBuilder {
@@ -260,6 +265,16 @@ impl OpenAiBuilder {
         self
     }
 
+    /// Extra HTTP headers to send on every request, e.g. a host's per-turn
+    /// correlation tags. Invalid entries are skipped with a warning, as on the
+    /// compatible provider; names this provider sets itself (`Authorization`,
+    /// framing) are dropped with a warning, as the Responses provider does for
+    /// `Authorization`. See `extra_headers`.
+    pub fn extra_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
     pub fn build(self) -> OpenAiModelProvider {
         OpenAiModelProvider {
             alias: self.alias,
@@ -267,6 +282,7 @@ impl OpenAiBuilder {
             credential: self.credential,
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs.unwrap_or(120),
+            extra_headers: crate::extra_headers::typed_extra_headers(&self.extra_headers),
         }
     }
 }
@@ -281,6 +297,7 @@ impl OpenAiModelProvider {
             base_url: None,
             max_tokens: None,
             timeout_secs: None,
+            extra_headers: std::collections::HashMap::new(),
         }
     }
 
@@ -487,13 +504,15 @@ impl ModelProvider for OpenAiModelProvider {
             max_tokens: self.max_tokens,
         };
 
-        let response = self
-            .http_client()
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&request)
-            .send()
-            .await?;
+        let response = crate::extra_headers::apply_extra_headers(
+            self.http_client()
+                .post(format!("{}/chat/completions", self.base_url))
+                .header("Authorization", format!("Bearer {credential}"))
+                .json(&request),
+            &self.extra_headers,
+        )
+        .send()
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
@@ -566,13 +585,15 @@ impl ModelProvider for OpenAiModelProvider {
             );
         }
 
-        let response = self
-            .http_client()
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&native_request)
-            .send()
-            .await?;
+        let response = crate::extra_headers::apply_extra_headers(
+            self.http_client()
+                .post(format!("{}/chat/completions", self.base_url))
+                .header("Authorization", format!("Bearer {credential}"))
+                .json(&native_request),
+            &self.extra_headers,
+        )
+        .send()
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
@@ -652,13 +673,15 @@ impl ModelProvider for OpenAiModelProvider {
             max_tokens: self.max_tokens,
         };
 
-        let response = self
-            .http_client()
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&native_request)
-            .send()
-            .await?;
+        let response = crate::extra_headers::apply_extra_headers(
+            self.http_client()
+                .post(format!("{}/chat/completions", self.base_url))
+                .header("Authorization", format!("Bearer {credential}"))
+                .json(&native_request),
+            &self.extra_headers,
+        )
+        .send()
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
@@ -691,12 +714,15 @@ impl ModelProvider for OpenAiModelProvider {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(credential) = self.credential.as_ref() {
-            self.http_client()
-                .get(format!("{}/models", self.base_url))
-                .header("Authorization", format!("Bearer {credential}"))
-                .send()
-                .await?
-                .error_for_status()?;
+            crate::extra_headers::apply_extra_headers(
+                self.http_client()
+                    .get(format!("{}/models", self.base_url))
+                    .header("Authorization", format!("Bearer {credential}")),
+                &self.extra_headers,
+            )
+            .send()
+            .await?
+            .error_for_status()?;
         }
         Ok(())
     }
@@ -1525,6 +1551,84 @@ mod tests {
         assert!(
             p.extra_headers.is_empty(),
             "fresh provider must default extra_headers to an empty HashMap"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_builder_extra_headers_ride_every_request_but_never_replace_the_credential() {
+        use axum::{Json, Router, routing::post};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<axum::http::HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |headers: axum::http::HeaderMap| {
+                let captured = captured_clone.clone();
+                async move {
+                    *captured.lock() = Some(headers);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x-membox-turn-id".to_string(), "membox-round-1".to_string());
+        headers.insert("x-membox-call-kind".to_string(), "main".to_string());
+        headers.insert("Authorization".to_string(), "Bearer stolen".to_string());
+        let p = OpenAiModelProvider::builder("test")
+            .credential(Some("sk-real"))
+            .base_url(&format!("http://{addr}"))
+            .extra_headers(headers)
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        p.chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "gpt-4o-mini",
+            None,
+        )
+        .await
+        .expect("chat over the wire");
+        server_handle.abort();
+
+        let seen = captured.lock().take().expect("no request captured");
+        let header = |name: &str| {
+            seen.get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(header("x-membox-turn-id"), vec!["membox-round-1"]);
+        assert_eq!(header("x-membox-call-kind"), vec!["main"]);
+        assert_eq!(
+            header("authorization"),
+            vec!["Bearer sk-real"],
+            "a reserved name in extra_headers is dropped, not appended"
+        );
+    }
+
+    #[test]
+    fn openai_builder_without_extra_headers_stamps_nothing() {
+        assert!(
+            OpenAiModelProvider::builder("test")
+                .build()
+                .extra_headers
+                .is_empty()
         );
     }
 
