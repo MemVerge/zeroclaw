@@ -4,6 +4,7 @@
 
 use crate::auth::AuthService;
 use crate::multimodal;
+use crate::response_metadata::{ResponseMetadataObserver, begin_request, observe_response};
 use crate::stream_guard::{AbortOnDrop, SseFinish};
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -57,6 +58,7 @@ pub struct OpenAiCompatibleModelProvider {
     timeout_secs: u64,
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
+    response_observer: Option<ResponseMetadataObserver>,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
     reasoning_effort: Option<String>,
     /// Whether stored assistant reasoning should be replayed on outbound
@@ -315,6 +317,7 @@ pub struct OpenAiCompatibleBuilder {
     native_tool_calling_override: Option<bool>,
     timeout_secs: Option<u64>,
     extra_headers: std::collections::HashMap<String, String>,
+    response_observer: Option<ResponseMetadataObserver>,
     reasoning_effort: Option<String>,
     /// Set to `Some(false)` by
     /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
@@ -334,6 +337,12 @@ pub struct OpenAiCompatibleBuilder {
 }
 
 impl OpenAiCompatibleBuilder {
+    /// Observe selected model-response headers without changing the request.
+    pub fn response_observer(mut self, observer: Option<ResponseMetadataObserver>) -> Self {
+        self.response_observer = observer;
+        self
+    }
+
     /// Human-readable display name (e.g. `"Groq"`, `"MiniMax"`). Surfaced
     /// in logs, `Attributable` output, and the onboarding UI. Required.
     pub fn display_name(mut self, name: &str) -> Self {
@@ -570,6 +579,7 @@ impl OpenAiCompatibleBuilder {
             merge_system_into_user,
             timeout_secs: self.timeout_secs.unwrap_or(120),
             extra_headers: self.extra_headers,
+            response_observer: self.response_observer,
             reasoning_effort: self.reasoning_effort,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
             api_path: self.api_path,
@@ -606,6 +616,7 @@ impl OpenAiCompatibleModelProvider {
             native_tool_calling_override: None,
             timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
+            response_observer: None,
             reasoning_effort: None,
             replay_assistant_reasoning_override: None,
             api_path: None,
@@ -2718,6 +2729,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let url = self.chat_completions_url();
 
+        let mut observation = begin_request(&self.response_observer);
         let response = match self
             .apply_auth_header(
                 self.http_client().post(&url).json(&request),
@@ -2732,6 +2744,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
         };
 
+        observe_response(&mut observation, &response);
         if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await?;
@@ -2806,6 +2819,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         };
 
         let url = self.chat_completions_url();
+        let mut observation = begin_request(&self.response_observer);
         let response = match self
             .apply_auth_header(
                 self.http_client().post(&url).json(&request),
@@ -2818,6 +2832,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             Err(chat_error) => return Err(chat_error.into()),
         };
 
+        observe_response(&mut observation, &response);
         if !response.status().is_success() {
             return Err(super::api_error(&self.name, response).await);
         }
@@ -2885,6 +2900,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         );
 
         let url = self.chat_completions_url();
+        let mut observation = begin_request(&self.response_observer);
         let response = match self
             .apply_auth_header(
                 self.http_client().post(&url).json(&request),
@@ -2904,6 +2920,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         self.name
                     )
                 );
+                drop(observation);
                 let text = self.chat_with_history(messages, model, temperature).await?;
                 return Ok(ProviderChatResponse {
                     text: Some(text),
@@ -2914,6 +2931,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
         };
 
+        observe_response(&mut observation, &response);
         if !response.status().is_success() {
             return Err(super::api_error(&self.name, response).await);
         }
@@ -3006,6 +3024,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
 
         let url = self.chat_completions_url();
+        let mut observation = begin_request(&self.response_observer);
         let response = match self
             .apply_auth_header(
                 self.http_client().post(&url).json(&native_request),
@@ -3018,12 +3037,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             Err(chat_error) => return Err(chat_error.into()),
         };
 
+        observe_response(&mut observation, &response);
         if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
             if Self::is_native_tool_schema_unsupported(status, &sanitized) {
+                drop(observation);
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let text = self
@@ -3216,6 +3237,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
+            let mut observation = begin_request(&provider.response_observer);
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -3226,6 +3248,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
             };
 
+            observe_response(&mut observation, &response);
             if !response.status().is_success() {
                 let status = response.status();
                 let error = match response.text().await {
@@ -3363,6 +3386,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             // Send request
+            let mut observation = begin_request(&provider.response_observer);
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -3374,6 +3398,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             // Check status
+            observe_response(&mut observation, &response);
             if !response.status().is_success() {
                 let status = response.status();
                 let error = match response.text().await {
@@ -3475,6 +3500,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
+            let mut observation = begin_request(&provider.response_observer);
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -3485,6 +3511,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
             };
 
+            observe_response(&mut observation, &response);
             if !response.status().is_success() {
                 let status = response.status();
                 let error = match response.text().await {

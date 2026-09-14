@@ -1,3 +1,4 @@
+use crate::response_metadata::{ResponseMetadataObserver, begin_request, observe_response};
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
@@ -143,6 +144,7 @@ pub struct AnthropicModelProvider {
     /// build time; see `extra_headers`). Applied per request rather than as
     /// client default headers so the pooled runtime proxy client stays shared.
     extra_headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
+    response_observer: Option<ResponseMetadataObserver>,
 }
 
 #[cfg(test)]
@@ -549,9 +551,16 @@ pub struct AnthropicBuilder {
     timeout_secs: Option<u64>,
     reasoning_effort: Option<String>,
     extra_headers: std::collections::HashMap<String, String>,
+    response_observer: Option<ResponseMetadataObserver>,
 }
 
 impl AnthropicBuilder {
+    /// Observe selected model-response headers without changing the request.
+    pub fn response_observer(mut self, observer: Option<ResponseMetadataObserver>) -> Self {
+        self.response_observer = observer;
+        self
+    }
+
     /// Explicit API credential. Whitespace-only inputs are normalized
     /// to `None` so a stray `Some("   ")` from config cannot produce a
     /// bogus `Bearer    ` header.
@@ -621,6 +630,7 @@ impl AnthropicBuilder {
                 &self.extra_headers,
                 crate::extra_headers::ReservedHeaders::ANTHROPIC,
             ),
+            response_observer: self.response_observer,
         }
     }
 }
@@ -637,6 +647,7 @@ impl AnthropicModelProvider {
             timeout_secs: None,
             reasoning_effort: None,
             extra_headers: std::collections::HashMap::new(),
+            response_observer: None,
         }
     }
 
@@ -2185,8 +2196,10 @@ impl ModelProvider for AnthropicModelProvider {
         request = self.apply_auth(request, credential);
         request = crate::extra_headers::apply_extra_headers(request, &self.extra_headers);
 
+        let mut observation = begin_request(&self.response_observer);
         let response = request.send().await?;
 
+        observe_response(&mut observation, &response);
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
@@ -2304,7 +2317,9 @@ impl ModelProvider for AnthropicModelProvider {
             self.apply_auth(req, credential),
             &self.extra_headers,
         );
+        let mut observation = begin_request(&self.response_observer);
         let response = req.send().await?;
+        observe_response(&mut observation, &response);
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
@@ -2508,6 +2523,7 @@ impl ModelProvider for AnthropicModelProvider {
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
         let extra_headers = self.extra_headers.clone();
+        let response_observer = self.response_observer.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -2542,6 +2558,7 @@ impl ModelProvider for AnthropicModelProvider {
             }
             req = crate::extra_headers::apply_extra_headers(req, &extra_headers);
 
+            let mut observation = begin_request(&response_observer);
             let response = match req.send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -2552,6 +2569,7 @@ impl ModelProvider for AnthropicModelProvider {
                 }
             };
 
+            observe_response(&mut observation, &response);
             if !response.status().is_success() {
                 let status = response.status();
                 let error = response
@@ -4700,6 +4718,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             timeout_secs: 120,
             reasoning_effort: None,
             extra_headers: Vec::new(),
+            response_observer: None,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
