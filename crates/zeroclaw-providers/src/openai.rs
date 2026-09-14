@@ -2,6 +2,7 @@ use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
     build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
 };
+use crate::response_metadata::{ResponseMetadataObserver, begin_request, observe_response};
 use crate::stream_guard::{AbortOnDrop, SseFinish};
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -41,6 +42,7 @@ pub struct OpenAiModelProvider {
     /// build time; see `extra_headers`). Applied per request rather than as
     /// client default headers so the pooled runtime proxy client stays shared.
     extra_headers: Vec<(HeaderName, HeaderValue)>,
+    response_observer: Option<ResponseMetadataObserver>,
 }
 
 #[derive(Debug, Serialize)]
@@ -230,9 +232,16 @@ pub struct OpenAiBuilder {
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     extra_headers: std::collections::HashMap<String, String>,
+    response_observer: Option<ResponseMetadataObserver>,
 }
 
 impl OpenAiBuilder {
+    /// Observe selected model-response headers without changing the request.
+    pub fn response_observer(mut self, observer: Option<ResponseMetadataObserver>) -> Self {
+        self.response_observer = observer;
+        self
+    }
+
     /// Explicit API credential. Whitespace-only inputs collapse to
     /// `None`.
     pub fn credential(mut self, credential: Option<&str>) -> Self {
@@ -288,6 +297,7 @@ impl OpenAiBuilder {
                 &self.extra_headers,
                 crate::extra_headers::ReservedHeaders::OPENAI,
             ),
+            response_observer: self.response_observer,
         }
     }
 }
@@ -303,6 +313,7 @@ impl OpenAiModelProvider {
             max_tokens: None,
             timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
+            response_observer: None,
         }
     }
 
@@ -509,6 +520,7 @@ impl ModelProvider for OpenAiModelProvider {
             max_tokens: self.max_tokens,
         };
 
+        let mut observation = begin_request(&self.response_observer);
         let response = crate::extra_headers::apply_extra_headers(
             self.http_client()
                 .post(format!("{}/chat/completions", self.base_url))
@@ -519,6 +531,7 @@ impl ModelProvider for OpenAiModelProvider {
         .send()
         .await?;
 
+        observe_response(&mut observation, &response);
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
         }
@@ -590,6 +603,7 @@ impl ModelProvider for OpenAiModelProvider {
             );
         }
 
+        let mut observation = begin_request(&self.response_observer);
         let response = crate::extra_headers::apply_extra_headers(
             self.http_client()
                 .post(format!("{}/chat/completions", self.base_url))
@@ -600,6 +614,7 @@ impl ModelProvider for OpenAiModelProvider {
         .send()
         .await?;
 
+        observe_response(&mut observation, &response);
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
         }
@@ -678,6 +693,7 @@ impl ModelProvider for OpenAiModelProvider {
             max_tokens: self.max_tokens,
         };
 
+        let mut observation = begin_request(&self.response_observer);
         let response = crate::extra_headers::apply_extra_headers(
             self.http_client()
                 .post(format!("{}/chat/completions", self.base_url))
@@ -688,6 +704,7 @@ impl ModelProvider for OpenAiModelProvider {
         .send()
         .await?;
 
+        observe_response(&mut observation, &response);
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
         }
@@ -874,7 +891,9 @@ pub(crate) async fn run_responses_sse(
     request_builder: reqwest::RequestBuilder,
     tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
     count_tokens: bool,
+    response_observer: Option<ResponseMetadataObserver>,
 ) {
+    let mut observation = begin_request(&response_observer);
     let http_response = match request_builder.send().await {
         Ok(r) => r,
         Err(err) => {
@@ -885,6 +904,7 @@ pub(crate) async fn run_responses_sse(
         }
     };
 
+    observe_response(&mut observation, &http_response);
     if !http_response.status().is_success() {
         let status = http_response.status();
         let body = http_response.text().await.unwrap_or_default();
@@ -1007,6 +1027,7 @@ pub struct OpenAiResponsesModelProvider {
     /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
     timeout_secs: u64,
     extra_headers: std::collections::HashMap<String, String>,
+    response_observer: Option<ResponseMetadataObserver>,
 }
 
 /// Typed builder for [`OpenAiResponsesModelProvider`].
@@ -1028,9 +1049,16 @@ pub struct OpenAiResponsesBuilder {
     store: Option<bool>,
     timeout_secs: Option<u64>,
     extra_headers: std::collections::HashMap<String, String>,
+    response_observer: Option<ResponseMetadataObserver>,
 }
 
 impl OpenAiResponsesBuilder {
+    /// Observe selected model-response headers without changing the request.
+    pub fn response_observer(mut self, observer: Option<ResponseMetadataObserver>) -> Self {
+        self.response_observer = observer;
+        self
+    }
+
     /// Override the API endpoint. The `/responses` suffix is appended
     /// automatically if the input does not already end in it.
     pub fn api_url(mut self, api_url: &str) -> Self {
@@ -1108,6 +1136,7 @@ impl OpenAiResponsesBuilder {
             store: self.store,
             timeout_secs: self.timeout_secs.unwrap_or(120),
             extra_headers: self.extra_headers,
+            response_observer: self.response_observer,
         }
     }
 }
@@ -1125,6 +1154,7 @@ impl OpenAiResponsesModelProvider {
             store: None,
             timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
+            response_observer: None,
         }
     }
 
@@ -1270,6 +1300,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             Some(instructions)
         };
         let req = self.build_request(instructions, input, None, model, temperature, false);
+        let mut observation = begin_request(&self.response_observer);
         let response = self
             .http_client()
             .post(&self.responses_url)
@@ -1277,6 +1308,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             .json(&req)
             .send()
             .await?;
+        observe_response(&mut observation, &response);
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
         }
@@ -1320,6 +1352,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 "openai responses provider request prepared"
             );
         }
+        let mut observation = begin_request(&self.response_observer);
         let response = self
             .http_client()
             .post(&self.responses_url)
@@ -1327,6 +1360,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             .json(&req)
             .send()
             .await?;
+        observe_response(&mut observation, &response);
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
         }
@@ -1367,6 +1401,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let max_tokens = self.max_tokens;
         let store = self.store;
         let client = self.streaming_client();
+        let response_observer = self.response_observer.clone();
         let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
@@ -1418,7 +1453,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 .header("Accept", "text/event-stream")
                 .json(&req);
 
-            run_responses_sse(request_builder, &tx, count_tokens).await;
+            run_responses_sse(request_builder, &tx, count_tokens, response_observer).await;
         });
 
         let guard = AbortOnDrop::new(handle.abort_handle());
