@@ -596,8 +596,10 @@ impl AnthropicBuilder {
     /// Extra HTTP headers to send on every request, e.g. a host's per-turn
     /// correlation tags. Invalid entries are skipped with a warning, as on the
     /// compatible provider; names this provider sets itself (`x-api-key`,
-    /// `Authorization`, `anthropic-version`, framing) are dropped with a warning,
-    /// as the Responses provider does for `Authorization`. See `extra_headers`.
+    /// `Authorization`, `anthropic-version`, the OAuth browser-access flag,
+    /// framing) are dropped with a warning, as the Responses provider does for
+    /// `Authorization`. This set is Anthropic's own; the OpenAI chat-completions
+    /// builder reserves only `Authorization`. See `extra_headers`.
     pub fn extra_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
         self.extra_headers = headers;
         self
@@ -615,7 +617,10 @@ impl AnthropicBuilder {
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             reasoning_effort: self.reasoning_effort,
-            extra_headers: crate::extra_headers::typed_extra_headers(&self.extra_headers),
+            extra_headers: crate::extra_headers::typed_extra_headers(
+                &self.extra_headers,
+                crate::extra_headers::ReservedHeaders::ANTHROPIC,
+            ),
         }
     }
 }

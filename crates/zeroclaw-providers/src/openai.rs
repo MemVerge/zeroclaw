@@ -267,9 +267,11 @@ impl OpenAiBuilder {
 
     /// Extra HTTP headers to send on every request, e.g. a host's per-turn
     /// correlation tags. Invalid entries are skipped with a warning, as on the
-    /// compatible provider; names this provider sets itself (`Authorization`,
-    /// framing) are dropped with a warning, as the Responses provider does for
-    /// `Authorization`. See `extra_headers`.
+    /// compatible provider; the one name this provider sets itself
+    /// (`Authorization`) plus framing are dropped with a warning, as the
+    /// Responses provider does for `Authorization`. Anthropic's `x-api-key` /
+    /// `anthropic-version` are NOT reserved here — a custom gateway that wants
+    /// them gets them on both OpenAI wires. See `extra_headers`.
     pub fn extra_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
         self.extra_headers = headers;
         self
@@ -282,7 +284,10 @@ impl OpenAiBuilder {
             credential: self.credential,
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs.unwrap_or(120),
-            extra_headers: crate::extra_headers::typed_extra_headers(&self.extra_headers),
+            extra_headers: crate::extra_headers::typed_extra_headers(
+                &self.extra_headers,
+                crate::extra_headers::ReservedHeaders::OPENAI,
+            ),
         }
     }
 }
@@ -1586,6 +1591,7 @@ mod tests {
         headers.insert("x-membox-turn-id".to_string(), "membox-round-1".to_string());
         headers.insert("x-membox-call-kind".to_string(), "main".to_string());
         headers.insert("Authorization".to_string(), "Bearer stolen".to_string());
+        headers.insert("x-api-key".to_string(), "gateway-key".to_string());
         let p = OpenAiModelProvider::builder("test")
             .credential(Some("sk-real"))
             .base_url(&format!("http://{addr}"))
@@ -1619,6 +1625,11 @@ mod tests {
             header("authorization"),
             vec!["Bearer sk-real"],
             "a reserved name in extra_headers is dropped, not appended"
+        );
+        assert_eq!(
+            header("x-api-key"),
+            vec!["gateway-key"],
+            "Anthropic's credential name is not this provider's to reserve; it rides like any custom header"
         );
     }
 
