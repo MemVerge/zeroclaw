@@ -973,6 +973,9 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         // The Anthropic provider maps it to `output_config.effort` for supported
         // models and ignores it otherwise.
         b = b.reasoning_effort(opts.reasoning_effort.clone());
+        if !opts.extra_headers.is_empty() {
+            b = b.extra_headers(opts.extra_headers.clone());
+        }
         Ok(Box::new(b.build()))
     }
 }
@@ -1032,6 +1035,9 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         }
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(Some(mt));
+        }
+        if !opts.extra_headers.is_empty() {
+            b = b.extra_headers(opts.extra_headers.clone());
         }
         Ok(Box::new(b.build()))
     }
@@ -2079,36 +2085,18 @@ mod tests {
 
     #[tokio::test]
     async fn responses_factory_forwards_extra_headers_to_responses_provider() {
-        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
-        use serde_json::json;
         use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
         use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig, WireApi};
 
-        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
-
-        async fn capture_headers(
-            State(captured): State<Arc<Mutex<Option<HeaderMap>>>>,
-            headers: HeaderMap,
-        ) -> Json<serde_json::Value> {
-            *captured.lock().expect("captured headers mutex") = Some(headers);
-            Json(json!({
+        let (addr, captured, server) = capture_headers_server(
+            "/v1/responses",
+            serde_json::json!({
                 "id": "resp_ok",
                 "object": "response",
                 "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
-            }))
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let addr = listener.local_addr().expect("test server addr");
-        let app = Router::new()
-            .route("/v1/responses", post(capture_headers))
-            .with_state(Arc::clone(&captured));
-        let server = zeroclaw_spawn::spawn!(async move {
-            axum::serve(listener, app).await.expect("serve test server");
-        });
+            }),
+        )
+        .await;
 
         let cfg = CustomModelProviderConfig {
             base: ModelProviderConfig {
@@ -2151,7 +2139,7 @@ mod tests {
             .chat_with_system(None, "hello", "gpt-5", Some(0.7))
             .await;
 
-        server.abort();
+        drop(server);
 
         assert!(result.is_ok(), "fast response should succeed: {result:?}");
 
@@ -2190,6 +2178,174 @@ mod tests {
         assert_eq!(
             auth_values[0], "Bearer test-key",
             "the surviving Authorization must be the built-in bearer credential, not the dropped extra_headers entry"
+        );
+    }
+
+    /// One loopback server + the request headers it saw, for the factory-boundary
+    /// tests below. `route` is the path the provider posts to; `body` is the
+    /// smallest response that provider parses as a successful chat.
+    /// Aborts the loopback server task when dropped, so a failing assertion
+    /// does not leave it running.
+    struct ServerGuard(tokio::task::JoinHandle<()>);
+
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    async fn capture_headers_server(
+        route: &'static str,
+        body: serde_json::Value,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Option<axum::http::HeaderMap>>>,
+        ServerGuard,
+    ) {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        let captured: Arc<Mutex<Option<axum::http::HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let app = Router::new().route(
+            route,
+            post(move |headers: axum::http::HeaderMap| {
+                let captured = Arc::clone(&captured_clone);
+                let body = body.clone();
+                async move {
+                    *captured.lock().expect("captured headers mutex") = Some(headers);
+                    Json(body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (addr, captured, ServerGuard(server))
+    }
+
+    /// The config → factory → request boundary a host such as MemBox actually
+    /// uses: `ModelProviderRuntimeOptions.extra_headers` through
+    /// `FamilyProviderFactory::create_provider`, asserted on the wire. The
+    /// provider-level tests drive the builders directly, so on their own they
+    /// would stay green if either factory forwarding line were dropped.
+    #[tokio::test]
+    async fn anthropic_factory_forwards_runtime_extra_headers_to_the_wire() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::AnthropicModelProviderConfig;
+
+        let (addr, captured, server) = capture_headers_server(
+            "/v1/messages",
+            serde_json::json!({
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+        )
+        .await;
+
+        let mut extra_headers = HashMap::new();
+        extra_headers.insert("x-membox-turn-id".to_string(), "membox-round-1".to_string());
+        extra_headers.insert("x-api-key".to_string(), "stolen".to_string());
+        let opts = ModelProviderRuntimeOptions {
+            extra_headers,
+            ..Default::default()
+        };
+        let provider = AnthropicModelProviderConfig::default()
+            .create_provider(
+                "anthropic",
+                Some("sk-ant-test"),
+                Some(&format!("http://{addr}")),
+                &opts,
+            )
+            .expect("anthropic provider should build");
+
+        let result = provider
+            .chat_with_system(None, "hello", "claude-opus-5", None)
+            .await;
+        drop(server);
+        assert!(result.is_ok(), "loopback chat should succeed: {result:?}");
+
+        let seen = captured
+            .lock()
+            .expect("captured headers mutex")
+            .clone()
+            .expect("server handler must have captured the request headers");
+        let header = |name: &str| -> Vec<String> {
+            seen.get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(header("x-membox-turn-id"), vec!["membox-round-1"]);
+        assert_eq!(
+            header("x-api-key"),
+            vec!["sk-ant-test"],
+            "the factory-forwarded map must not displace the credential the factory also set"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_chat_factory_forwards_runtime_extra_headers_to_the_wire() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+
+        let (addr, captured, server) = capture_headers_server(
+            "/v1/chat/completions",
+            serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+        )
+        .await;
+
+        let mut extra_headers = HashMap::new();
+        extra_headers.insert("x-membox-turn-id".to_string(), "membox-round-1".to_string());
+        extra_headers.insert("Authorization".to_string(), "Bearer stolen".to_string());
+        let opts = ModelProviderRuntimeOptions {
+            extra_headers,
+            ..Default::default()
+        };
+        let cfg = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::ChatCompletions),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "openai",
+                Some("sk-test"),
+                Some(&format!("http://{addr}/v1")),
+                &opts,
+            )
+            .expect("openai chat-completions provider should build");
+
+        let result = provider
+            .chat_with_system(None, "hello", "gpt-4o-mini", None)
+            .await;
+        drop(server);
+        assert!(result.is_ok(), "loopback chat should succeed: {result:?}");
+
+        let seen = captured
+            .lock()
+            .expect("captured headers mutex")
+            .clone()
+            .expect("server handler must have captured the request headers");
+        let header = |name: &str| -> Vec<String> {
+            seen.get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(header("x-membox-turn-id"), vec!["membox-round-1"]);
+        assert_eq!(
+            header("authorization"),
+            vec!["Bearer sk-test"],
+            "the factory-forwarded map must not displace the credential the factory also set"
         );
     }
 
