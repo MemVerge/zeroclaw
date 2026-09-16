@@ -7,6 +7,7 @@ use charset::{
 };
 use futures_util::StreamExt;
 use serde_json::json;
+use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -17,6 +18,39 @@ use zeroclaw_config::schema::FirecrawlConfig;
 /// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
 const FIRECRAWL_MIN_BODY_LEN: usize = 100;
 const RESPONSE_TRUNCATION_MARKER: &str = "... [Response truncated due to size limit] ...";
+const HTTP_FAILURE_DETAIL_LIMIT: usize = 1_024;
+
+struct HttpFailureDiagnostic {
+    category: &'static str,
+    root_cause: String,
+    cause_chain: String,
+}
+
+impl HttpFailureDiagnostic {
+    fn request(error: &reqwest::Error) -> Self {
+        Self::new(classify_reqwest_error(error), error)
+    }
+
+    fn response_body(error: &anyhow::Error) -> Self {
+        let source = error.as_ref();
+        let category = find_reqwest_error(source)
+            .map(classify_reqwest_error)
+            .unwrap_or("response body failed");
+        Self::new(category, source)
+    }
+
+    fn new(category: &'static str, error: &(dyn Error + 'static)) -> Self {
+        Self {
+            category,
+            root_cause: root_cause(error),
+            cause_chain: cause_chain(error),
+        }
+    }
+
+    fn detail(&self) -> String {
+        format!("{}: {}", self.category, self.root_cause)
+    }
+}
 
 struct LimitedResponse {
     output: String,
@@ -314,10 +348,12 @@ impl WebFetchTool {
         let response = match client.get(url).send().await {
             Ok(r) => r,
             Err(e) => {
+                let diagnostic = HttpFailureDiagnostic::request(&e);
+                log_http_failure("web_fetch.request_failed", &diagnostic);
                 return ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("HTTP request failed: {e}")),
+                    error: Some(format!("HTTP request failed: {}", diagnostic.detail())),
                 }
                 .into();
             }
@@ -366,10 +402,15 @@ impl WebFetchTool {
         {
             Ok(t) => t,
             Err(e) => {
+                let diagnostic = HttpFailureDiagnostic::response_body(&e);
+                log_http_failure("web_fetch.response_body_failed", &diagnostic);
                 return ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("Failed to read response body: {e}")),
+                    error: Some(format!(
+                        "Failed to read response body: {}",
+                        diagnostic.detail()
+                    )),
                 }
                 .into();
             }
@@ -664,6 +705,75 @@ fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) ->
     buffer.len() >= hard_cap
 }
 
+fn classify_reqwest_error(error: &reqwest::Error) -> &'static str {
+    match (error.is_timeout(), error.is_connect()) {
+        (true, true) => "connection timed out",
+        (true, false) => "request timed out",
+        (false, true) => "connection failed",
+        _ if error.is_redirect() => "redirect failed",
+        _ if error.is_body() => "response body failed",
+        _ if error.is_decode() => "response decoding failed",
+        _ => "request failed",
+    }
+}
+
+fn find_reqwest_error<'a>(mut error: &'a (dyn Error + 'static)) -> Option<&'a reqwest::Error> {
+    loop {
+        if let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>() {
+            return Some(reqwest_error);
+        }
+        error = error.source()?;
+    }
+}
+
+fn root_cause(mut error: &(dyn Error + 'static)) -> String {
+    while let Some(source) = error.source() {
+        error = source;
+    }
+    truncate_http_failure_detail(&error.to_string())
+}
+
+fn cause_chain(error: &(dyn Error + 'static)) -> String {
+    let mut messages = Vec::new();
+    let mut current = error.source();
+    while let Some(source) = current {
+        messages.push(source.to_string());
+        current = source.source();
+    }
+    let detail = if messages.is_empty() {
+        error.to_string()
+    } else {
+        messages.join(": ")
+    };
+    truncate_http_failure_detail(&detail)
+}
+
+fn truncate_http_failure_detail(detail: &str) -> String {
+    if detail.chars().count() <= HTTP_FAILURE_DETAIL_LIMIT {
+        return detail.to_string();
+    }
+    let mut truncated = detail
+        .chars()
+        .take(HTTP_FAILURE_DETAIL_LIMIT)
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn log_http_failure(error_key: &str, diagnostic: &HttpFailureDiagnostic) {
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "error_key": error_key,
+                "category": diagnostic.category,
+                "cause_chain": diagnostic.cause_chain,
+            })),
+        "web_fetch: HTTP transport failed"
+    );
+}
+
 fn log_decode_errors(content_type: &str, completeness: ResponseCompleteness) {
     ::zeroclaw_log::record!(
         WARN,
@@ -821,6 +931,17 @@ mod tests {
 
     fn test_tool(allowed_domains: Vec<&str>) -> WebFetchTool {
         test_tool_with_blocklist(allowed_domains, vec![])
+    }
+
+    fn assert_http_failure(result: &StandardFetchOutcome, prefix: &str) {
+        let error = result
+            .error
+            .as_ref()
+            .expect("HTTP failure should be reported");
+        assert!(error.starts_with(prefix), "error was: {error}");
+        let root_cause = error.trim_start_matches(prefix);
+        assert!(!root_cause.trim().is_empty(), "error was: {error}");
+        assert!(!root_cause.contains("error sending request for url"));
     }
 
     fn test_tool_with_limit(max_response_size: usize) -> WebFetchTool {
@@ -981,6 +1102,39 @@ mod tests {
         assert!(result.output.starts_with("中"));
         assert!(!result.output.contains('\u{FFFD}'));
         assert!(result.output.contains("[Response truncated"));
+    }
+
+    #[tokio::test]
+    async fn standard_fetch_reports_connection_failure_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let result = test_tool(vec!["*"])
+            .standard_fetch(&reqwest::Client::new(), &url)
+            .await;
+
+        assert_http_failure(&result, "HTTP request failed: connection failed:");
+    }
+
+    #[tokio::test]
+    async fn standard_fetch_reports_request_timeout_cause() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(25))
+            .build()
+            .unwrap();
+        let result = test_tool(vec!["*"])
+            .standard_fetch(&client, &server.uri())
+            .await;
+
+        assert_http_failure(&result, "HTTP request failed: request timed out:");
     }
 
     #[tokio::test]
@@ -1371,6 +1525,24 @@ mod tests {
         assert!(!append_chunk_with_cap(&mut buffer, b"hello", 8));
         assert!(append_chunk_with_cap(&mut buffer, b"world", 8));
         assert_eq!(buffer, b"hellowor");
+    }
+
+    #[test]
+    fn http_failure_diagnostic_bounds_model_and_log_details() {
+        let error = anyhow::Error::msg("x".repeat(HTTP_FAILURE_DETAIL_LIMIT + 10));
+
+        let diagnostic = HttpFailureDiagnostic::response_body(&error);
+
+        assert_eq!(
+            diagnostic.root_cause.chars().count(),
+            HTTP_FAILURE_DETAIL_LIMIT + 3
+        );
+        assert_eq!(
+            diagnostic.cause_chain.chars().count(),
+            HTTP_FAILURE_DETAIL_LIMIT + 3
+        );
+        assert!(diagnostic.root_cause.ends_with("..."));
+        assert!(diagnostic.cause_chain.ends_with("..."));
     }
 
     #[test]
