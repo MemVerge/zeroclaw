@@ -1,4 +1,5 @@
 mod charset;
+mod http_failure;
 
 use crate::helpers::domain_guard;
 use async_trait::async_trait;
@@ -6,6 +7,7 @@ use charset::{
     DecodedResponseBody, ResponseCompleteness, ResponseContentType, decode_response_body,
 };
 use futures_util::StreamExt;
+use http_failure::{HttpFailureDiagnostic, log_http_failure};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -314,10 +316,12 @@ impl WebFetchTool {
         let response = match client.get(url).send().await {
             Ok(r) => r,
             Err(e) => {
+                let diagnostic = HttpFailureDiagnostic::request(&e);
+                log_http_failure("web_fetch.request_failed", &diagnostic);
                 return ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("HTTP request failed: {e}")),
+                    error: Some(format!("HTTP request failed: {}", diagnostic.detail())),
                 }
                 .into();
             }
@@ -366,10 +370,15 @@ impl WebFetchTool {
         {
             Ok(t) => t,
             Err(e) => {
+                let diagnostic = HttpFailureDiagnostic::response_body(&e);
+                log_http_failure("web_fetch.response_body_failed", &diagnostic);
                 return ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("Failed to read response body: {e}")),
+                    error: Some(format!(
+                        "Failed to read response body: {}",
+                        diagnostic.detail()
+                    )),
                 }
                 .into();
             }
@@ -823,6 +832,17 @@ mod tests {
         test_tool_with_blocklist(allowed_domains, vec![])
     }
 
+    fn assert_http_failure(result: &StandardFetchOutcome, prefix: &str) {
+        let error = result
+            .error
+            .as_ref()
+            .expect("HTTP failure should be reported");
+        assert!(error.starts_with(prefix), "error was: {error}");
+        let root_cause = error.trim_start_matches(prefix);
+        assert!(!root_cause.trim().is_empty(), "error was: {error}");
+        assert!(!root_cause.contains("error sending request for url"));
+    }
+
     fn test_tool_with_limit(max_response_size: usize) -> WebFetchTool {
         WebFetchTool::new(
             Arc::new(SecurityPolicy::default()),
@@ -981,6 +1001,65 @@ mod tests {
         assert!(result.output.starts_with("中"));
         assert!(!result.output.contains('\u{FFFD}'));
         assert!(result.output.contains("[Response truncated"));
+    }
+
+    #[tokio::test]
+    async fn standard_fetch_reports_connection_failure_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let result = test_tool(vec!["*"])
+            .standard_fetch(&reqwest::Client::new(), &url)
+            .await;
+
+        assert_http_failure(&result, "HTTP request failed: connection failed:");
+    }
+
+    #[tokio::test]
+    async fn standard_fetch_reports_request_timeout_cause() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(25))
+            .build()
+            .unwrap();
+        let result = test_tool(vec!["*"])
+            .standard_fetch(&client, &server.uri())
+            .await;
+
+        assert_http_failure(&result, "HTTP request failed: request timed out:");
+    }
+
+    #[tokio::test]
+    async fn standard_fetch_reports_interrupted_response_body_cause() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let response =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\nConnection: close\r\n\r\npartial";
+            stream.write_all(response).await.unwrap();
+        });
+
+        let result = test_tool(vec!["*"])
+            .standard_fetch(&reqwest::Client::new(), &url)
+            .await;
+        server_handle.await.unwrap();
+
+        assert_http_failure(
+            &result,
+            "Failed to read response body: response decoding failed:",
+        );
     }
 
     #[tokio::test]
