@@ -9,9 +9,10 @@
 use reqwest::header::{HeaderName, HeaderValue};
 use std::collections::HashMap;
 
-/// Header names every HTTP client owns for the request it frames. Dropped for
-/// every provider; a caller cannot meaningfully set them.
-const FRAMING: &[&str] = &["content-type", "content-length", "host"];
+/// Body-framing headers every provider owns. `Host` is deliberately not global:
+/// compatible gateways may use it for virtual-host routing even when the URL
+/// points at a different transport address.
+const BODY_FRAMING: &[&str] = &["content-type", "content-length"];
 
 /// Single-valued header names a provider sets on every request itself. A
 /// caller-supplied copy is dropped so the built-in credential and API version
@@ -49,19 +50,26 @@ impl ReservedHeaders {
             "x-api-key",
             "anthropic-version",
             "anthropic-dangerous-direct-browser-access",
+            "host",
         ],
     };
-    /// `Authorization` only — the bearer credential is the one header the
-    /// chat-completions provider sets itself.
+    /// Native chat completions owns its bearer credential and historically
+    /// rejects a caller-supplied `Host`.
     pub(crate) const OPENAI: Self = Self {
         provider: "openai",
+        names: &["authorization", "host"],
+    };
+    /// The Responses adapter historically allowed a caller-supplied `Host`
+    /// for compatible virtual-host gateways while owning its bearer credential.
+    pub(crate) const OPENAI_RESPONSES: Self = Self {
+        provider: "openai-responses",
         names: &["authorization"],
     };
 
     fn contains(self, name: &str, additional: &[&str]) -> bool {
         self.names
             .iter()
-            .chain(FRAMING)
+            .chain(BODY_FRAMING)
             .chain(additional)
             .any(|reserved| name.eq_ignore_ascii_case(reserved))
     }
@@ -160,6 +168,7 @@ mod tests {
                 ("Anthropic-Version", "2099-01-01"),
                 ("anthropic-dangerous-direct-browser-access", "true"),
                 ("Content-Length", "0"),
+                ("Host", "evil.example"),
                 ("bad name", "value"),
                 ("x-ok", "line\nbreak"),
             ]),

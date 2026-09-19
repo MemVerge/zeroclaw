@@ -6568,7 +6568,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
 
-        type Observations = Arc<Mutex<Vec<(SocketAddr, String)>>>;
+        type Observations = Arc<Mutex<Vec<(SocketAddr, String, String)>>>;
 
         async fn capture(
             ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -6579,18 +6579,22 @@ mod tests {
                 .to_str()
                 .expect("turn id should be valid")
                 .to_string();
+            let host = headers["host"]
+                .to_str()
+                .expect("host should be valid")
+                .to_string();
             observations
                 .lock()
                 .expect("observations mutex")
-                .push((peer, turn_id));
+                .push((peer, turn_id, host));
             ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
         }
 
-        fn provider(base_url: &str, turn_id: &str) -> OpenAiCompatibleModelProvider {
-            let headers = std::collections::HashMap::from([(
-                "x-membox-turn-id".to_string(),
-                turn_id.to_string(),
-            )]);
+        fn provider(base_url: &str, turn_id: &str, host: &str) -> OpenAiCompatibleModelProvider {
+            let headers = std::collections::HashMap::from([
+                ("x-membox-turn-id".to_string(), turn_id.to_string()),
+                ("Host".to_string(), host.to_string()),
+            ]);
             OpenAiCompatibleModelProvider::builder("test")
                 .display_name("test")
                 .base_url(base_url)
@@ -6632,8 +6636,18 @@ mod tests {
             .unwrap();
         });
 
-        drain_stream(&provider(&format!("http://{address}"), "turn-1")).await;
-        drain_stream(&provider(&format!("http://{address}"), "turn-2")).await;
+        drain_stream(&provider(
+            &format!("http://{address}"),
+            "turn-1",
+            "first.example",
+        ))
+        .await;
+        drain_stream(&provider(
+            &format!("http://{address}"),
+            "turn-2",
+            "second.example",
+        ))
+        .await;
         server.abort();
 
         let observed = observations.lock().expect("observations mutex");
@@ -6641,6 +6655,8 @@ mod tests {
         assert_eq!(observed[0].0, observed[1].0, "connection should be reused");
         assert_eq!(observed[0].1, "turn-1");
         assert_eq!(observed[1].1, "turn-2");
+        assert_eq!(observed[0].2, "first.example");
+        assert_eq!(observed[1].2, "second.example");
     }
 
     #[tokio::test]
