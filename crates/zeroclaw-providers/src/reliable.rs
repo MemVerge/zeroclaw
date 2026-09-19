@@ -39,8 +39,9 @@ pub enum StructuredStreamRetryPolicy {
     /// Preserve ZeroClaw's default retry behavior for transient provider failures.
     #[default]
     BroadTransient,
-    /// Retry connection failures and HTTP 429/502/503/504/529, but not timeouts
-    /// or streams that close before emitting any event.
+    /// Retry connection failures, request-stage transport timeouts, and HTTP
+    /// 429/502/503/504/529, but not unscoped/idle timeouts or streams that close
+    /// before emitting any event.
     ConnectionErrorsAndRetryableStatuses,
 }
 
@@ -1218,8 +1219,8 @@ fn is_retryable_transport_message(message: &str) -> bool {
     if let Some(status) = explicit_http_status(&message) {
         return is_retryable_http_status(status);
     }
-    if message.contains("timed out") || message.contains("timeout") {
-        return false;
+    if is_timeout_message(&message) {
+        return is_request_stage_timeout(&message);
     }
 
     const CONNECTION_MARKERS: [&str; 17] = [
@@ -1242,6 +1243,21 @@ fn is_retryable_transport_message(message: &str) -> bool {
         "unexpected eof",
     ];
     CONNECTION_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+fn is_timeout_message(message: &str) -> bool {
+    message.contains("timed out") || message.contains("timeout")
+}
+
+fn is_request_stage_timeout(message: &str) -> bool {
+    const REQUEST_STAGE_MARKERS: [&str; 3] = [
+        "client error (connect)",
+        "error sending request",
+        "tcp connect error",
+    ];
+    REQUEST_STAGE_MARKERS
         .iter()
         .any(|marker| message.contains(marker))
 }
@@ -5354,6 +5370,7 @@ mod tests {
         BeforeOutputAlways,
         BeforeOutputNonRetryable,
         BeforeOutputTimeout,
+        BeforeOutputRequestStageTimeoutOnce,
         BeforeOutputWindowsResetOnce,
         BeforeOutputCustomOnce,
         EmptyBeforeOutputOnce,
@@ -5431,6 +5448,18 @@ mod tests {
                 return stream::once(async {
                     Err(StreamError::Http(
                         "provider request timed out after 300 seconds".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+            if matches!(
+                self.failure_mode,
+                StreamFailureMode::BeforeOutputRequestStageTimeoutOnce
+            ) && attempt == 0
+            {
+                return stream::once(async {
+                    Err(StreamError::Http(
+                        "error sending request for url (https://example.test/v1/chat/completions): client error (Connect): operation timed out".to_string(),
                     ))
                 })
                 .boxed();
@@ -5717,6 +5746,27 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn connection_policy_retries_request_stage_timeout_before_output() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::BeforeOutputRequestStageTimeoutOnce,
+            1,
+        )
+        .with_structured_stream_retry_policy(
+            StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+        );
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
+                if chunk.delta == "recovered"
+        ));
+    }
+
     #[tokio::test]
     async fn connection_policy_does_not_retry_empty_stream_before_output() {
         let stream_calls = Arc::new(AtomicUsize::new(0));
@@ -5863,9 +5913,46 @@ mod tests {
     }
 
     #[test]
-    fn connection_policy_keeps_tcp_connect_timeouts_terminal() {
-        let error =
-            StreamError::Http("tcp connect error: connection timed out (os error 110)".to_string());
+    fn connection_policy_retries_request_stage_timeout_messages() {
+        let messages = [
+            "error sending request for url (https://example.test/v1/chat/completions): client error (Connect): operation timed out",
+            "model_provider stream error: HTTP error: error sending request for url (https://example.test/v1/chat/completions): operation timed out",
+            "tcp connect error: connection timed out (os error 110)",
+        ];
+
+        for message in messages {
+            let error = StreamError::Http(message.to_string());
+
+            assert!(is_retryable_stream_error(
+                &error,
+                StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+            ));
+        }
+    }
+
+    #[test]
+    fn connection_policy_keeps_unscoped_and_idle_timeouts_terminal() {
+        let messages = [
+            "provider request timed out after 300 seconds",
+            "provider stream idle timeout after 300 seconds",
+        ];
+
+        for message in messages {
+            let error = StreamError::Http(message.to_string());
+
+            assert!(!is_retryable_stream_error(
+                &error,
+                StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+            ));
+        }
+    }
+
+    #[test]
+    fn connection_policy_keeps_timed_out_io_kind_terminal_without_request_context() {
+        let error = StreamError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ));
 
         assert!(!is_retryable_stream_error(
             &error,
