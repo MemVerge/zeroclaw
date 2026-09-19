@@ -1222,25 +1222,23 @@ impl OpenAiResponsesModelProvider {
     }
 
     fn http_client(&self) -> Client {
-        let default_headers = self.build_default_headers();
-        let mut builder = Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .connect_timeout(std::time::Duration::from_secs(10));
-        if !default_headers.is_empty() {
-            builder = builder.default_headers(default_headers);
-        }
-        builder.build().unwrap_or_else(|_| Client::new())
+        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+            "model_provider.openai",
+            self.timeout_secs,
+            10,
+        )
     }
 
     fn streaming_client(&self) -> Client {
-        let default_headers = self.build_default_headers();
-        let mut builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT);
-        if !default_headers.is_empty() {
-            builder = builder.default_headers(default_headers);
-        }
-        builder.build().unwrap_or_else(|_| Client::new())
+        zeroclaw_config::schema::build_runtime_proxy_streaming_client_with_read_timeout(
+            "model_provider.openai",
+            10,
+            STREAM_IDLE_TIMEOUT.as_secs(),
+        )
+    }
+
+    fn apply_extra_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request.headers(self.build_default_headers())
     }
 }
 
@@ -1302,8 +1300,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let req = self.build_request(instructions, input, None, model, temperature, false);
         let mut observation = begin_request(&self.response_observer);
         let response = self
-            .http_client()
-            .post(&self.responses_url)
+            .apply_extra_headers(self.http_client().post(&self.responses_url))
             .header("Authorization", format!("Bearer {credential}"))
             .json(&req)
             .send()
@@ -1354,8 +1351,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         }
         let mut observation = begin_request(&self.response_observer);
         let response = self
-            .http_client()
-            .post(&self.responses_url)
+            .apply_extra_headers(self.http_client().post(&self.responses_url))
             .header("Authorization", format!("Bearer {credential}"))
             .json(&req)
             .send()
@@ -1401,6 +1397,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let max_tokens = self.max_tokens;
         let store = self.store;
         let client = self.streaming_client();
+        let extra_headers = self.build_default_headers();
         let response_observer = self.response_observer.clone();
         let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
@@ -1449,6 +1446,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
 
             let request_builder = client
                 .post(&responses_url)
+                .headers(extra_headers)
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("Accept", "text/event-stream")
                 .json(&req);
@@ -1531,6 +1529,87 @@ mod tests {
         assert_eq!(usage.cached_input_tokens, Some(45));
         assert_eq!(usage.output_tokens, Some(30));
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_streaming_reuses_connection_without_leaking_headers() {
+        use axum::extract::{ConnectInfo, State};
+        use axum::{Router, http::HeaderMap, response::IntoResponse, routing::post};
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        type Observations = Arc<Mutex<Vec<(SocketAddr, String)>>>;
+
+        async fn capture(
+            ConnectInfo(peer): ConnectInfo<SocketAddr>,
+            State(observations): State<Observations>,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            let turn_id = headers["x-membox-turn-id"]
+                .to_str()
+                .expect("turn id should be valid")
+                .to_string();
+            observations
+                .lock()
+                .expect("observations mutex")
+                .push((peer, turn_id));
+            ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
+        }
+
+        fn provider(api_url: &str, turn_id: &str) -> OpenAiResponsesModelProvider {
+            let headers = std::collections::HashMap::from([(
+                "x-membox-turn-id".to_string(),
+                turn_id.to_string(),
+            )]);
+            OpenAiResponsesModelProvider::builder("test")
+                .api_url(api_url)
+                .credential(Some("test-key"))
+                .extra_headers(headers)
+                .build()
+        }
+
+        async fn drain_stream(provider: &OpenAiResponsesModelProvider) {
+            let messages = [ChatMessage::user("hello")];
+            let mut stream = provider.stream_chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-test",
+                None,
+                StreamOptions::new(true),
+            );
+            while let Some(event) = stream.next().await {
+                event.expect("stream should succeed");
+            }
+        }
+
+        let observations = Observations::default();
+        let app = Router::new()
+            .route("/responses", post(capture))
+            .with_state(Arc::clone(&observations));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        drain_stream(&provider(&format!("http://{address}"), "turn-1")).await;
+        drain_stream(&provider(&format!("http://{address}"), "turn-2")).await;
+        server.abort();
+
+        let observed = observations.lock().expect("observations mutex");
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, observed[1].0, "connection should be reused");
+        assert_eq!(observed[0].1, "turn-1");
+        assert_eq!(observed[1].1, "turn-2");
     }
 
     #[test]

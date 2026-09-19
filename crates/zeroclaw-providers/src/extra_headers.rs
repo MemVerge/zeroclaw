@@ -1,13 +1,10 @@
 //! Caller-supplied request headers for providers whose HTTP client is pooled.
 //!
-//! `OpenAiCompatibleModelProvider` and the Responses provider bake `extra_headers`
-//! into a dedicated client's default headers, which costs them connection reuse
-//! whenever the map is non-empty. The Anthropic and OpenAI providers instead share
-//! the runtime proxy client cache, and a host can legitimately build one provider
-//! per turn with a per-turn correlation header — keying a cached client on that
-//! value would grow the cache by one client per turn. So these two validate the map
-//! once at build time and stamp the pairs on each request, leaving the pooled
-//! client untouched.
+//! A host can legitimately build one provider per turn with a per-turn correlation
+//! header. Keying a cached client on that value would grow the cache by one client
+//! per turn, so pooled providers stamp caller headers on each request instead.
+//! Anthropic and the native OpenAI provider use these helpers to validate the map
+//! once at build time while leaving the shared transport client untouched.
 
 use reqwest::header::{HeaderName, HeaderValue};
 use std::collections::HashMap;
@@ -25,7 +22,7 @@ const FRAMING: &[&str] = &["content-type", "content-length", "host"];
 /// header, as its Responses sibling does, so switching `wire_api` does not
 /// change which credential or API-version headers a custom gateway receives.
 /// (Framing is still dropped on this wire only; the Responses provider forwards
-/// it into its client's default headers.) List-valued headers such as
+/// it as a request header.) List-valued headers such as
 /// `anthropic-beta` are deliberately not reserved: a caller's entry becomes a
 /// second field line beside the provider's, which RFC 9110 list-field merging
 /// combines, so appending a beta flag is a legitimate caller use.
