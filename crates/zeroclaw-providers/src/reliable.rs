@@ -45,6 +45,24 @@ pub enum StructuredStreamRetryPolicy {
     ConnectionErrorsAndRetryableStatuses,
 }
 
+impl StructuredStreamRetryPolicy {
+    /// Classify a stream error without applying retry budgets or output-safety gates.
+    ///
+    /// Host retry layers may use this to share ZeroClaw's transport policy while
+    /// retaining their own scheduling and observability. Callers must still avoid
+    /// restarting a stream after it has emitted an event. Context-window recovery
+    /// is intentionally excluded because it bypasses this policy inside
+    /// [`ReliableModelProvider`].
+    pub fn should_retry(self, error: &StreamError) -> bool {
+        match self {
+            Self::BroadTransient => is_broadly_retryable_stream_error(error),
+            Self::ConnectionErrorsAndRetryableStatuses => {
+                is_connection_retryable_stream_error(error)
+            }
+        }
+    }
+}
+
 /// Classifies failures that may restart a structured stream before it emits an event.
 ///
 /// [`ReliableModelProvider`] always treats failures after the first emitted event as
@@ -1168,16 +1186,7 @@ enum StreamAttemptOutcome {
 }
 
 fn is_retryable_stream_error(error: &StreamError, policy: StructuredStreamRetryPolicy) -> bool {
-    if is_context_window_stream_error(error) {
-        return true;
-    }
-
-    match policy {
-        StructuredStreamRetryPolicy::BroadTransient => is_broadly_retryable_stream_error(error),
-        StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses => {
-            is_connection_retryable_stream_error(error)
-        }
-    }
+    is_context_window_stream_error(error) || policy.should_retry(error)
 }
 
 fn is_broadly_retryable_stream_error(error: &StreamError) -> bool {
@@ -5928,6 +5937,20 @@ mod tests {
                 StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
             ));
         }
+    }
+
+    #[test]
+    fn connection_policy_exposes_transport_classification_to_host_retry_layers() {
+        let policy = StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses;
+        let request_timeout = StreamError::Http(
+            "error sending request for url (https://example.test/v1/chat/completions): operation timed out"
+                .to_string(),
+        );
+        let idle_timeout =
+            StreamError::Http("provider stream idle timeout after 300 seconds".to_string());
+
+        assert!(policy.should_retry(&request_timeout));
+        assert!(!policy.should_retry(&idle_timeout));
     }
 
     #[test]
