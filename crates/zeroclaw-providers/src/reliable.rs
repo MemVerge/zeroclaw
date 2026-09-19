@@ -1272,9 +1272,10 @@ fn is_request_stage_timeout(message: &str) -> bool {
 }
 
 fn explicit_http_status(message: &str) -> Option<u16> {
-    const PREFIXES: [&str; 6] = [
+    const PREFIXES: [&str; 7] = [
         "http status client error",
         "http status server error",
+        "modelprovider error",
         "api error",
         "error code",
         "status code",
@@ -5820,6 +5821,7 @@ mod tests {
         let errors = [
             "API error (429 Too Many Requests)",
             "Error code: 429 - Too Many Requests",
+            "ModelProvider error: 429 Too Many Requests",
             "HTTP status server error (502 Bad Gateway)",
             "HTTP 503 Service Unavailable",
             "status code: 504 Gateway Timeout",
