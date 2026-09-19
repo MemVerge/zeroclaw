@@ -1,31 +1,27 @@
 //! Caller-supplied request headers for providers whose HTTP client is pooled.
 //!
-//! `OpenAiCompatibleModelProvider` and the Responses provider bake `extra_headers`
-//! into a dedicated client's default headers, which costs them connection reuse
-//! whenever the map is non-empty. The Anthropic and OpenAI providers instead share
-//! the runtime proxy client cache, and a host can legitimately build one provider
-//! per turn with a per-turn correlation header — keying a cached client on that
-//! value would grow the cache by one client per turn. So these two validate the map
-//! once at build time and stamp the pairs on each request, leaving the pooled
-//! client untouched.
+//! A host can legitimately build one provider per turn with a per-turn correlation
+//! header. Keying a cached client on that value would grow the cache by one client
+//! per turn, so pooled providers stamp caller headers on each request instead.
+//! Anthropic and the native OpenAI provider use these helpers to validate the map
+//! once at build time while leaving the shared transport client untouched.
 
 use reqwest::header::{HeaderName, HeaderValue};
 use std::collections::HashMap;
 
-/// Header names every HTTP client owns for the request it frames. Dropped for
-/// every provider; a caller cannot meaningfully set them.
-const FRAMING: &[&str] = &["content-type", "content-length", "host"];
+/// Body-framing headers every provider owns. `Host` is deliberately not global:
+/// compatible gateways may use it for virtual-host routing even when the URL
+/// points at a different transport address.
+const BODY_FRAMING: &[&str] = &["content-type", "content-length"];
 
 /// Single-valued header names a provider sets on every request itself. A
 /// caller-supplied copy is dropped so the built-in credential and API version
 /// stay authoritative — the Responses provider's `Authorization` rule, widened
 /// only to the names *that provider* would otherwise send twice. The set is
 /// per provider on purpose: `x-api-key` and `anthropic-version` are Anthropic's,
-/// and the OpenAI chat-completions provider forwards them like any other custom
-/// header, as its Responses sibling does, so switching `wire_api` does not
-/// change which credential or API-version headers a custom gateway receives.
-/// (Framing is still dropped on this wire only; the Responses provider forwards
-/// it into its client's default headers.) List-valued headers such as
+/// and the OpenAI providers forward them like any other custom header, so
+/// switching `wire_api` does not change which credential or API-version headers
+/// a custom gateway receives. List-valued headers such as
 /// `anthropic-beta` are deliberately not reserved: a caller's entry becomes a
 /// second field line beside the provider's, which RFC 9110 list-field merging
 /// combines, so appending a beta flag is a legitimate caller use.
@@ -38,6 +34,12 @@ pub(crate) struct ReservedHeaders {
 }
 
 impl ReservedHeaders {
+    /// OpenAI-compatible providers select their credential header dynamically
+    /// from `AuthStyle`; only the shared framing set is static.
+    pub(crate) const COMPATIBLE: Self = Self {
+        provider: "compatible",
+        names: &[],
+    };
     /// `x-api-key` / `Authorization` (credential, one or the other per auth
     /// style), `anthropic-version`, and the browser-access flag the OAuth path
     /// sets — every single-valued header the provider stamps itself.
@@ -48,19 +50,27 @@ impl ReservedHeaders {
             "x-api-key",
             "anthropic-version",
             "anthropic-dangerous-direct-browser-access",
+            "host",
         ],
     };
-    /// `Authorization` only — the bearer credential is the one header the
-    /// chat-completions provider sets itself.
+    /// Native chat completions owns its bearer credential and historically
+    /// rejects a caller-supplied `Host`.
     pub(crate) const OPENAI: Self = Self {
         provider: "openai",
+        names: &["authorization", "host"],
+    };
+    /// The Responses adapter historically allowed a caller-supplied `Host`
+    /// for compatible virtual-host gateways while owning its bearer credential.
+    pub(crate) const OPENAI_RESPONSES: Self = Self {
+        provider: "openai-responses",
         names: &["authorization"],
     };
 
-    fn contains(self, name: &str) -> bool {
+    fn contains(self, name: &str, additional: &[&str]) -> bool {
         self.names
             .iter()
-            .chain(FRAMING)
+            .chain(BODY_FRAMING)
+            .chain(additional)
             .any(|reserved| name.eq_ignore_ascii_case(reserved))
     }
 }
@@ -73,9 +83,19 @@ pub(crate) fn typed_extra_headers(
     extra: &HashMap<String, String>,
     reserved: ReservedHeaders,
 ) -> Vec<(HeaderName, HeaderValue)> {
+    typed_extra_headers_with_additional_reserved(extra, reserved, &[])
+}
+
+/// Validate caller headers while also reserving request-specific names such as
+/// a compatible provider's configured credential header or streaming `Accept`.
+pub(crate) fn typed_extra_headers_with_additional_reserved(
+    extra: &HashMap<String, String>,
+    reserved: ReservedHeaders,
+    additional_reserved: &[&str],
+) -> Vec<(HeaderName, HeaderValue)> {
     let mut typed = Vec::with_capacity(extra.len());
     for (key, value) in extra {
-        if reserved.contains(key) {
+        if reserved.contains(key, additional_reserved) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -85,7 +105,7 @@ pub(crate) fn typed_extra_headers(
                         "provider": reserved.provider,
                         "reason": "reserved_header_owned_by_provider",
                     })),
-                "Dropping reserved entry from extra_headers; the provider's own credential, API-version and framing headers are authoritative"
+                "Dropping reserved entry from extra_headers; provider-owned request headers are authoritative"
             );
             continue;
         }
@@ -148,6 +168,7 @@ mod tests {
                 ("Anthropic-Version", "2099-01-01"),
                 ("anthropic-dangerous-direct-browser-access", "true"),
                 ("Content-Length", "0"),
+                ("Host", "evil.example"),
                 ("bad name", "value"),
                 ("x-ok", "line\nbreak"),
             ]),

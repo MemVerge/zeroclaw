@@ -102,6 +102,16 @@ pub enum AuthStyle {
     ZhipuJwt,
 }
 
+impl AuthStyle {
+    fn credential_header_name(&self) -> &str {
+        match self {
+            Self::Bearer | Self::ZhipuJwt => "authorization",
+            Self::XApiKey => "x-api-key",
+            Self::Custom(header) => header,
+        }
+    }
+}
+
 /// Sanitize a tool-call `arguments` string before it is re-serialized into an
 /// outbound OpenAI-compatible chat-completions request.
 ///
@@ -699,44 +709,10 @@ impl OpenAiCompatibleModelProvider {
 
     fn http_client(&self) -> Client {
         let timeout = self.timeout_secs;
-        let has_user_agent = self.user_agent.is_some();
-        let has_extra_headers = !self.extra_headers.is_empty();
-        let has_tls_cert = self.tls_ca_cert_pem.is_some();
-
-        if has_user_agent || has_extra_headers || has_tls_cert {
-            let mut headers = HeaderMap::new();
-            if let Some(ua) = self.user_agent.as_deref()
-                && let Ok(value) = HeaderValue::from_str(ua)
-            {
-                headers.insert(USER_AGENT, value);
-            }
-            for (key, value) in &self.extra_headers {
-                match (
-                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    (Ok(name), Ok(val)) => {
-                        headers.insert(name, val);
-                    }
-                    _ => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"header": key})),
-                            "Skipping invalid extra header name or value"
-                        );
-                    }
-                }
-            }
-
+        if self.tls_ca_cert_pem.is_some() {
             let builder = Client::builder()
                 .timeout(std::time::Duration::from_secs(timeout))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .default_headers(headers);
+                .connect_timeout(std::time::Duration::from_secs(10));
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
@@ -751,7 +727,7 @@ impl OpenAiCompatibleModelProvider {
                         .with_attrs(
                             ::serde_json::json!({"error": super::format_error_chain(&error)})
                         ),
-                    "Failed to build proxied timeout client with custom headers or TLS certificate: "
+                    "Failed to build proxied timeout client with custom TLS certificate: "
                 );
                 Client::new()
             });
@@ -769,48 +745,14 @@ impl OpenAiCompatibleModelProvider {
     /// idle bound (`STREAM_IDLE_TIMEOUT`) so a silent connection fails fast instead
     /// of hanging forever. Streaming paths must use this client instead of http_client().
     fn streaming_http_client(&self) -> Client {
-        let has_user_agent = self.user_agent.is_some();
-        let has_extra_headers = !self.extra_headers.is_empty();
-        let has_tls_cert = self.tls_ca_cert_pem.is_some();
-
-        if has_user_agent || has_extra_headers || has_tls_cert {
-            let mut headers = HeaderMap::new();
-            if let Some(ua) = self.user_agent.as_deref()
-                && let Ok(value) = HeaderValue::from_str(ua)
-            {
-                headers.insert(USER_AGENT, value);
-            }
-            for (key, value) in &self.extra_headers {
-                match (
-                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    (Ok(name), Ok(val)) => {
-                        headers.insert(name, val);
-                    }
-                    _ => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"header": key})),
-                            "Skipping invalid extra header name or value"
-                        );
-                    }
-                }
-            }
-
+        if self.tls_ca_cert_pem.is_some() {
             let builder = Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(STREAM_IDLE_TIMEOUT)
-                .default_headers(headers);
+                .read_timeout(STREAM_IDLE_TIMEOUT);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
-                "provider.compatible",
+                "model_provider.compatible",
             );
             return builder.build().unwrap_or_else(|error| {
                 ::zeroclaw_log::record!(
@@ -820,27 +762,68 @@ impl OpenAiCompatibleModelProvider {
                         .with_attrs(
                             ::serde_json::json!({"error": super::format_error_chain(&error)})
                         ),
-                    "Failed to build proxied streaming client with custom headers or TLS certificate: "
+                    "Failed to build proxied streaming client with custom TLS certificate: "
                 );
                 Client::new()
             });
         }
 
-        let builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT);
-        let builder =
-            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
-        builder.build().unwrap_or_else(|error| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": super::format_error_chain(&error)})),
-                "Failed to build proxied streaming client: "
-            );
-            Client::new()
-        })
+        zeroclaw_config::schema::build_runtime_proxy_streaming_client_with_read_timeout(
+            "model_provider.compatible",
+            10,
+            STREAM_IDLE_TIMEOUT.as_secs(),
+        )
+    }
+
+    fn request_headers(&self, credential: Option<&str>) -> HeaderMap {
+        self.request_headers_with_additional_reserved(credential, &[])
+    }
+
+    fn streaming_request_headers(&self, credential: Option<&str>) -> HeaderMap {
+        self.request_headers_with_additional_reserved(credential, &["accept"])
+    }
+
+    fn request_headers_with_additional_reserved(
+        &self,
+        credential: Option<&str>,
+        additional: &[&str],
+    ) -> HeaderMap {
+        let mut reserved = Vec::with_capacity(additional.len() + 1);
+        if credential.is_some() {
+            reserved.push(self.auth_header.credential_header_name());
+        }
+        reserved.extend_from_slice(additional);
+
+        let mut headers = HeaderMap::new();
+        if let Some(user_agent) = self.user_agent.as_deref()
+            && let Ok(value) = HeaderValue::from_str(user_agent)
+        {
+            headers.insert(USER_AGENT, value);
+        }
+        for (name, value) in crate::extra_headers::typed_extra_headers_with_additional_reserved(
+            &self.extra_headers,
+            crate::extra_headers::ReservedHeaders::COMPATIBLE,
+            &reserved,
+        ) {
+            headers.insert(name, value);
+        }
+        headers
+    }
+
+    fn apply_request_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+        credential: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        request.headers(self.request_headers(credential))
+    }
+
+    fn apply_streaming_request_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+        credential: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        request.headers(self.streaming_request_headers(credential))
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
@@ -2009,7 +1992,11 @@ impl OpenAiCompatibleModelProvider {
         req: reqwest::RequestBuilder,
         credential: Option<&str>,
     ) -> reqwest::RequestBuilder {
-        apply_auth_to_request(req, &self.auth_header, credential)
+        apply_auth_to_request(
+            self.apply_request_headers(req, credential),
+            &self.auth_header,
+            credential,
+        )
     }
 
     fn convert_tool_specs(
@@ -3233,7 +3220,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
             let targets_mistral_tool_call_contract = provider.targets_mistral_tool_call_contract();
 
-            let mut req_builder = client.post(&url).json(&payload);
+            let mut req_builder = provider.apply_streaming_request_headers(
+                client.post(&url).json(&payload),
+                credential.as_deref(),
+            );
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
@@ -3377,7 +3367,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             // Build request with auth
-            let mut req_builder = client.post(&url).json(&request);
+            let mut req_builder = provider.apply_streaming_request_headers(
+                client.post(&url).json(&request),
+                credential.as_deref(),
+            );
 
             // Apply auth header
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
@@ -3496,7 +3489,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
             };
 
-            let mut req_builder = client.post(&url).json(&request);
+            let mut req_builder = provider.apply_streaming_request_headers(
+                client.post(&url).json(&request),
+                credential.as_deref(),
+            );
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
@@ -6509,6 +6505,226 @@ mod tests {
         assert_eq!(p.extra_headers.len(), 1);
         // Should not panic
         let _client = p.http_client();
+    }
+
+    #[test]
+    fn request_headers_drop_the_active_credential_header() {
+        let cases = [
+            (AuthStyle::Bearer, "Authorization"),
+            (AuthStyle::XApiKey, "x-api-key"),
+            (
+                AuthStyle::Custom("x-provider-key".to_string()),
+                "x-provider-key",
+            ),
+            (AuthStyle::ZhipuJwt, "Authorization"),
+        ];
+
+        for (auth_style, credential_header) in cases {
+            let extra_headers = std::collections::HashMap::from([(
+                credential_header.to_string(),
+                "caller-value".to_string(),
+            )]);
+            let provider = OpenAiCompatibleModelProvider::builder("test")
+                .display_name("test")
+                .base_url("https://example.com")
+                .credential(Some("provider-key"))
+                .auth_style(auth_style)
+                .extra_headers(extra_headers)
+                .build();
+
+            assert!(
+                !provider
+                    .request_headers(Some("provider-key"))
+                    .contains_key(credential_header)
+            );
+        }
+    }
+
+    #[test]
+    fn request_headers_keep_caller_auth_without_a_provider_credential() {
+        let extra_headers = std::collections::HashMap::from([(
+            "Authorization".to_string(),
+            "Bearer caller".to_string(),
+        )]);
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(extra_headers)
+            .build();
+
+        assert_eq!(
+            provider.request_headers(None)["authorization"],
+            "Bearer caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_reuses_connection_across_providers_without_leaking_headers() {
+        use axum::extract::{ConnectInfo, State};
+        use axum::{Router, http::HeaderMap, response::IntoResponse, routing::post};
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        type Observations = Arc<Mutex<Vec<(SocketAddr, String, String)>>>;
+
+        async fn capture(
+            ConnectInfo(peer): ConnectInfo<SocketAddr>,
+            State(observations): State<Observations>,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            let turn_id = headers["x-membox-turn-id"]
+                .to_str()
+                .expect("turn id should be valid")
+                .to_string();
+            let host = headers["host"]
+                .to_str()
+                .expect("host should be valid")
+                .to_string();
+            observations
+                .lock()
+                .expect("observations mutex")
+                .push((peer, turn_id, host));
+            ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
+        }
+
+        fn provider(base_url: &str, turn_id: &str, host: &str) -> OpenAiCompatibleModelProvider {
+            let headers = std::collections::HashMap::from([
+                ("x-membox-turn-id".to_string(), turn_id.to_string()),
+                ("Host".to_string(), host.to_string()),
+            ]);
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("test")
+                .base_url(base_url)
+                .credential(Some("test-key"))
+                .auth_style(AuthStyle::Bearer)
+                .extra_headers(headers)
+                .build()
+        }
+
+        async fn drain_stream(provider: &OpenAiCompatibleModelProvider) {
+            let messages = [ChatMessage::user("hello")];
+            let mut stream = provider.stream_chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-test",
+                None,
+                StreamOptions::new(true),
+            );
+            while let Some(event) = stream.next().await {
+                event.expect("stream should succeed");
+            }
+        }
+
+        let observations = Observations::default();
+        let app = Router::new()
+            .route("/chat/completions", post(capture))
+            .with_state(Arc::clone(&observations));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        drain_stream(&provider(
+            &format!("http://{address}"),
+            "turn-1",
+            "first.example",
+        ))
+        .await;
+        drain_stream(&provider(
+            &format!("http://{address}"),
+            "turn-2",
+            "second.example",
+        ))
+        .await;
+        server.abort();
+
+        let observed = observations.lock().expect("observations mutex");
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, observed[1].0, "connection should be reused");
+        assert_eq!(observed[0].1, "turn-1");
+        assert_eq!(observed[1].1, "turn-2");
+        assert_eq!(observed[0].2, "first.example");
+        assert_eq!(observed[1].2, "second.example");
+    }
+
+    #[tokio::test]
+    async fn streaming_provider_headers_override_conflicting_extra_headers() {
+        use axum::extract::State;
+        use axum::{Router, http::HeaderMap, response::IntoResponse, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        type Observation = Arc<Mutex<Option<HeaderMap>>>;
+
+        async fn capture(
+            State(observation): State<Observation>,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            *observation.lock().expect("observation mutex") = Some(headers);
+            ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
+        }
+
+        let observation = Observation::default();
+        let app = Router::new()
+            .route("/chat/completions", post(capture))
+            .with_state(Arc::clone(&observation));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let extra_headers = std::collections::HashMap::from([
+            ("Authorization".to_string(), "Bearer caller".to_string()),
+            ("Content-Type".to_string(), "text/plain".to_string()),
+            ("Accept".to_string(), "text/plain".to_string()),
+        ]);
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{address}"))
+            .credential(Some("provider-key"))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(extra_headers)
+            .build();
+
+        let messages = [ChatMessage::user("hello")];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "gpt-test",
+            None,
+            StreamOptions::new(true),
+        );
+        while let Some(event) = stream.next().await {
+            event.expect("stream should succeed");
+        }
+        server.abort();
+
+        let observed = observation.lock().expect("observation mutex");
+        let headers = observed.as_ref().expect("request should be captured");
+        assert_eq!(
+            headers.get_all("authorization").iter().collect::<Vec<_>>(),
+            vec!["Bearer provider-key"]
+        );
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(
+            headers.get_all("accept").iter().collect::<Vec<_>>(),
+            vec!["text/event-stream"]
+        );
     }
 
     #[test]

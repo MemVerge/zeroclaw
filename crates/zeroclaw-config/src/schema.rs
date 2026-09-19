@@ -9758,14 +9758,18 @@ fn runtime_proxy_cache_key(
     service_key: &str,
     timeout_secs: Option<u64>,
     connect_timeout_secs: Option<u64>,
+    read_timeout_secs: Option<u64>,
 ) -> String {
     format!(
-        "{}|timeout={}|connect_timeout={}",
+        "{}|timeout={}|connect_timeout={}|read_timeout={}",
         service_key.trim().to_ascii_lowercase(),
         timeout_secs
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string()),
         connect_timeout_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        read_timeout_secs
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string())
     )
@@ -9817,7 +9821,7 @@ pub fn apply_runtime_proxy_to_builder(
 }
 
 pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
-    let cache_key = runtime_proxy_cache_key(service_key, None, None);
+    let cache_key = runtime_proxy_cache_key(service_key, None, None, None);
     if let Some(client) = runtime_proxy_cached_client(&cache_key) {
         return client;
     }
@@ -9844,8 +9848,12 @@ pub fn build_runtime_proxy_client_with_timeouts(
     timeout_secs: u64,
     connect_timeout_secs: u64,
 ) -> reqwest::Client {
-    let cache_key =
-        runtime_proxy_cache_key(service_key, Some(timeout_secs), Some(connect_timeout_secs));
+    let cache_key = runtime_proxy_cache_key(
+        service_key,
+        Some(timeout_secs),
+        Some(connect_timeout_secs),
+        None,
+    );
     if let Some(client) = runtime_proxy_cached_client(&cache_key) {
         return client;
     }
@@ -9883,7 +9891,7 @@ pub fn build_runtime_proxy_streaming_client(
     service_key: &str,
     connect_timeout_secs: u64,
 ) -> reqwest::Client {
-    let cache_key = runtime_proxy_cache_key(service_key, None, Some(connect_timeout_secs));
+    let cache_key = runtime_proxy_cache_key(service_key, None, Some(connect_timeout_secs), None);
     if let Some(client) = runtime_proxy_cached_client(&cache_key) {
         return client;
     }
@@ -9900,6 +9908,43 @@ pub fn build_runtime_proxy_streaming_client(
                     ::serde_json::json!({"service_key": service_key, "error": format!("{}", error)})
                 ),
             "Failed to build proxied streaming client: "
+        );
+        reqwest::Client::new()
+    });
+    set_runtime_proxy_cached_client(cache_key, client.clone());
+    client
+}
+
+/// Build a cached proxy-aware client for streaming protocols whose idle bound
+/// is enforced by reqwest rather than by the caller's parser.
+pub fn build_runtime_proxy_streaming_client_with_read_timeout(
+    service_key: &str,
+    connect_timeout_secs: u64,
+    read_timeout_secs: u64,
+) -> reqwest::Client {
+    let cache_key = runtime_proxy_cache_key(
+        service_key,
+        None,
+        Some(connect_timeout_secs),
+        Some(read_timeout_secs),
+    );
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return client;
+    }
+
+    let builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .read_timeout(std::time::Duration::from_secs(read_timeout_secs));
+    let builder = apply_runtime_proxy_to_builder(builder, service_key);
+    let client = builder.build().unwrap_or_else(|error| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(
+                    ::serde_json::json!({"service_key": service_key, "error": format!("{}", error)})
+                ),
+            "Failed to build proxied streaming client with read timeout: "
         );
         reqwest::Client::new()
     });
@@ -29864,7 +29909,7 @@ api_token = "tok"
                 .expect("system clock should be after unix epoch")
                 .as_nanos()
         );
-        let cache_key = runtime_proxy_cache_key(&service_key, None, None);
+        let cache_key = runtime_proxy_cache_key(&service_key, None, None, None);
 
         clear_runtime_proxy_client_cache();
         assert!(!runtime_proxy_cache_contains(&cache_key));
@@ -29911,7 +29956,7 @@ api_token = "tok"
                 .expect("system clock should be after unix epoch")
                 .as_nanos()
         );
-        let cache_key = runtime_proxy_cache_key(&service_key, Some(30), Some(5));
+        let cache_key = runtime_proxy_cache_key(&service_key, Some(30), Some(5), None);
 
         clear_runtime_proxy_client_cache();
         let _ = build_runtime_proxy_client_with_timeouts(&service_key, 30, 5);
@@ -29934,8 +29979,9 @@ api_token = "tok"
                 .expect("system clock should be after unix epoch")
                 .as_nanos()
         );
-        let streaming_cache_key = runtime_proxy_cache_key(&service_key, None, Some(10));
-        let total_timeout_cache_key = runtime_proxy_cache_key(&service_key, Some(120), Some(10));
+        let streaming_cache_key = runtime_proxy_cache_key(&service_key, None, Some(10), None);
+        let total_timeout_cache_key =
+            runtime_proxy_cache_key(&service_key, Some(120), Some(10), None);
         assert_ne!(streaming_cache_key, total_timeout_cache_key);
 
         clear_runtime_proxy_client_cache();
@@ -29955,7 +30001,7 @@ api_token = "tok"
                 .expect("system clock should be after unix epoch")
                 .as_nanos()
         );
-        let cache_key = runtime_proxy_cache_key(&service_key, None, Some(10));
+        let cache_key = runtime_proxy_cache_key(&service_key, None, Some(10), None);
 
         clear_runtime_proxy_client_cache();
         assert!(!runtime_proxy_cache_contains(&cache_key));
@@ -29965,6 +30011,26 @@ api_token = "tok"
 
         let _ = build_runtime_proxy_streaming_client(&service_key, 10);
         assert!(runtime_proxy_cache_contains(&cache_key));
+    }
+
+    #[test]
+    async fn streaming_read_timeout_is_part_of_the_cache_profile() {
+        let service_key = format!(
+            "model_provider.streaming_read_timeout_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let cache_key = runtime_proxy_cache_key(&service_key, None, Some(10), Some(300));
+        let no_read_timeout_key = runtime_proxy_cache_key(&service_key, None, Some(10), None);
+        assert_ne!(cache_key, no_read_timeout_key);
+
+        clear_runtime_proxy_client_cache();
+        let _ = build_runtime_proxy_streaming_client_with_read_timeout(&service_key, 10, 300);
+
+        assert!(runtime_proxy_cache_contains(&cache_key));
+        assert!(!runtime_proxy_cache_contains(&no_read_timeout_key));
     }
 
     #[test]

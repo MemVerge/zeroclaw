@@ -39,9 +39,28 @@ pub enum StructuredStreamRetryPolicy {
     /// Preserve ZeroClaw's default retry behavior for transient provider failures.
     #[default]
     BroadTransient,
-    /// Retry connection failures and HTTP 429/502/503/504/529, but not timeouts
-    /// or streams that close before emitting any event.
+    /// Retry connection failures, request-stage transport timeouts, and HTTP
+    /// 429/502/503/504/529, but not unscoped/idle timeouts or streams that close
+    /// before emitting any event.
     ConnectionErrorsAndRetryableStatuses,
+}
+
+impl StructuredStreamRetryPolicy {
+    /// Classify a stream error without applying retry budgets or output-safety gates.
+    ///
+    /// Host retry layers may use this to share ZeroClaw's transport policy while
+    /// retaining their own scheduling and observability. Callers must still avoid
+    /// restarting a stream after it has emitted an event. Context-window recovery
+    /// is intentionally excluded because it bypasses this policy inside
+    /// [`ReliableModelProvider`].
+    pub fn should_retry(self, error: &StreamError) -> bool {
+        match self {
+            Self::BroadTransient => is_broadly_retryable_stream_error(error),
+            Self::ConnectionErrorsAndRetryableStatuses => {
+                is_connection_retryable_stream_error(error)
+            }
+        }
+    }
 }
 
 /// Classifies failures that may restart a structured stream before it emits an event.
@@ -1167,16 +1186,7 @@ enum StreamAttemptOutcome {
 }
 
 fn is_retryable_stream_error(error: &StreamError, policy: StructuredStreamRetryPolicy) -> bool {
-    if is_context_window_stream_error(error) {
-        return true;
-    }
-
-    match policy {
-        StructuredStreamRetryPolicy::BroadTransient => is_broadly_retryable_stream_error(error),
-        StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses => {
-            is_connection_retryable_stream_error(error)
-        }
-    }
+    is_context_window_stream_error(error) || policy.should_retry(error)
 }
 
 fn is_broadly_retryable_stream_error(error: &StreamError) -> bool {
@@ -1218,8 +1228,8 @@ fn is_retryable_transport_message(message: &str) -> bool {
     if let Some(status) = explicit_http_status(&message) {
         return is_retryable_http_status(status);
     }
-    if message.contains("timed out") || message.contains("timeout") {
-        return false;
+    if is_timeout_message(&message) {
+        return is_request_stage_timeout(&message);
     }
 
     const CONNECTION_MARKERS: [&str; 17] = [
@@ -1246,10 +1256,26 @@ fn is_retryable_transport_message(message: &str) -> bool {
         .any(|marker| message.contains(marker))
 }
 
+fn is_timeout_message(message: &str) -> bool {
+    message.contains("timed out") || message.contains("timeout")
+}
+
+fn is_request_stage_timeout(message: &str) -> bool {
+    const REQUEST_STAGE_MARKERS: [&str; 3] = [
+        "client error (connect)",
+        "error sending request",
+        "tcp connect error",
+    ];
+    REQUEST_STAGE_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
 fn explicit_http_status(message: &str) -> Option<u16> {
-    const PREFIXES: [&str; 6] = [
+    const PREFIXES: [&str; 7] = [
         "http status client error",
         "http status server error",
+        "modelprovider error",
         "api error",
         "error code",
         "status code",
@@ -5354,6 +5380,7 @@ mod tests {
         BeforeOutputAlways,
         BeforeOutputNonRetryable,
         BeforeOutputTimeout,
+        BeforeOutputRequestStageTimeoutOnce,
         BeforeOutputWindowsResetOnce,
         BeforeOutputCustomOnce,
         EmptyBeforeOutputOnce,
@@ -5431,6 +5458,18 @@ mod tests {
                 return stream::once(async {
                     Err(StreamError::Http(
                         "provider request timed out after 300 seconds".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+            if matches!(
+                self.failure_mode,
+                StreamFailureMode::BeforeOutputRequestStageTimeoutOnce
+            ) && attempt == 0
+            {
+                return stream::once(async {
+                    Err(StreamError::Http(
+                        "error sending request for url (https://example.test/v1/chat/completions): client error (Connect): operation timed out".to_string(),
                     ))
                 })
                 .boxed();
@@ -5717,6 +5756,27 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn connection_policy_retries_request_stage_timeout_before_output() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::BeforeOutputRequestStageTimeoutOnce,
+            1,
+        )
+        .with_structured_stream_retry_policy(
+            StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+        );
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
+                if chunk.delta == "recovered"
+        ));
+    }
+
     #[tokio::test]
     async fn connection_policy_does_not_retry_empty_stream_before_output() {
         let stream_calls = Arc::new(AtomicUsize::new(0));
@@ -5761,6 +5821,7 @@ mod tests {
         let errors = [
             "API error (429 Too Many Requests)",
             "Error code: 429 - Too Many Requests",
+            "ModelProvider error: 429 Too Many Requests",
             "HTTP status server error (502 Bad Gateway)",
             "HTTP 503 Service Unavailable",
             "status code: 504 Gateway Timeout",
@@ -5863,9 +5924,60 @@ mod tests {
     }
 
     #[test]
-    fn connection_policy_keeps_tcp_connect_timeouts_terminal() {
-        let error =
-            StreamError::Http("tcp connect error: connection timed out (os error 110)".to_string());
+    fn connection_policy_retries_request_stage_timeout_messages() {
+        let messages = [
+            "error sending request for url (https://example.test/v1/chat/completions): client error (Connect): operation timed out",
+            "model_provider stream error: HTTP error: error sending request for url (https://example.test/v1/chat/completions): operation timed out",
+            "tcp connect error: connection timed out (os error 110)",
+        ];
+
+        for message in messages {
+            let error = StreamError::Http(message.to_string());
+
+            assert!(is_retryable_stream_error(
+                &error,
+                StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+            ));
+        }
+    }
+
+    #[test]
+    fn connection_policy_exposes_transport_classification_to_host_retry_layers() {
+        let policy = StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses;
+        let request_timeout = StreamError::Http(
+            "error sending request for url (https://example.test/v1/chat/completions): operation timed out"
+                .to_string(),
+        );
+        let idle_timeout =
+            StreamError::Http("provider stream idle timeout after 300 seconds".to_string());
+
+        assert!(policy.should_retry(&request_timeout));
+        assert!(!policy.should_retry(&idle_timeout));
+    }
+
+    #[test]
+    fn connection_policy_keeps_unscoped_and_idle_timeouts_terminal() {
+        let messages = [
+            "provider request timed out after 300 seconds",
+            "provider stream idle timeout after 300 seconds",
+        ];
+
+        for message in messages {
+            let error = StreamError::Http(message.to_string());
+
+            assert!(!is_retryable_stream_error(
+                &error,
+                StructuredStreamRetryPolicy::ConnectionErrorsAndRetryableStatuses,
+            ));
+        }
+    }
+
+    #[test]
+    fn connection_policy_keeps_timed_out_io_kind_terminal_without_request_context() {
+        let error = StreamError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ));
 
         assert!(!is_retryable_stream_error(
             &error,
