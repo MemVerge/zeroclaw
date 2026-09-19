@@ -102,6 +102,16 @@ pub enum AuthStyle {
     ZhipuJwt,
 }
 
+impl AuthStyle {
+    fn credential_header_name(&self) -> &str {
+        match self {
+            Self::Bearer | Self::ZhipuJwt => "authorization",
+            Self::XApiKey => "x-api-key",
+            Self::Custom(header) => header,
+        }
+    }
+}
+
 /// Sanitize a tool-call `arguments` string before it is re-serialized into an
 /// outbound OpenAI-compatible chat-completions request.
 ///
@@ -765,39 +775,55 @@ impl OpenAiCompatibleModelProvider {
         )
     }
 
-    fn request_headers(&self) -> HeaderMap {
+    fn request_headers(&self, credential: Option<&str>) -> HeaderMap {
+        self.request_headers_with_additional_reserved(credential, &[])
+    }
+
+    fn streaming_request_headers(&self, credential: Option<&str>) -> HeaderMap {
+        self.request_headers_with_additional_reserved(credential, &["accept"])
+    }
+
+    fn request_headers_with_additional_reserved(
+        &self,
+        credential: Option<&str>,
+        additional: &[&str],
+    ) -> HeaderMap {
+        let mut reserved = Vec::with_capacity(additional.len() + 1);
+        if credential.is_some() {
+            reserved.push(self.auth_header.credential_header_name());
+        }
+        reserved.extend_from_slice(additional);
+
         let mut headers = HeaderMap::new();
         if let Some(user_agent) = self.user_agent.as_deref()
             && let Ok(value) = HeaderValue::from_str(user_agent)
         {
             headers.insert(USER_AGENT, value);
         }
-        for (key, value) in &self.extra_headers {
-            match (
-                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                HeaderValue::from_str(value),
-            ) {
-                (Ok(name), Ok(value)) => {
-                    headers.insert(name, value);
-                }
-                _ => Self::record_invalid_extra_header(key),
-            }
+        for (name, value) in crate::extra_headers::typed_extra_headers_with_additional_reserved(
+            &self.extra_headers,
+            crate::extra_headers::ReservedHeaders::COMPATIBLE,
+            &reserved,
+        ) {
+            headers.insert(name, value);
         }
         headers
     }
 
-    fn record_invalid_extra_header(header: &str) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"header": header})),
-            "Skipping invalid extra header name or value"
-        );
+    fn apply_request_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+        credential: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        request.headers(self.request_headers(credential))
     }
 
-    fn apply_request_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        request.headers(self.request_headers())
+    fn apply_streaming_request_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+        credential: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        request.headers(self.streaming_request_headers(credential))
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
@@ -1967,7 +1993,7 @@ impl OpenAiCompatibleModelProvider {
         credential: Option<&str>,
     ) -> reqwest::RequestBuilder {
         apply_auth_to_request(
-            self.apply_request_headers(req),
+            self.apply_request_headers(req, credential),
             &self.auth_header,
             credential,
         )
@@ -3194,7 +3220,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
             let targets_mistral_tool_call_contract = provider.targets_mistral_tool_call_contract();
 
-            let mut req_builder = provider.apply_request_headers(client.post(&url).json(&payload));
+            let mut req_builder = provider.apply_streaming_request_headers(
+                client.post(&url).json(&payload),
+                credential.as_deref(),
+            );
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
@@ -3338,7 +3367,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             // Build request with auth
-            let mut req_builder = provider.apply_request_headers(client.post(&url).json(&request));
+            let mut req_builder = provider.apply_streaming_request_headers(
+                client.post(&url).json(&request),
+                credential.as_deref(),
+            );
 
             // Apply auth header
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
@@ -3457,7 +3489,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
             };
 
-            let mut req_builder = provider.apply_request_headers(client.post(&url).json(&request));
+            let mut req_builder = provider.apply_streaming_request_headers(
+                client.post(&url).json(&request),
+                credential.as_deref(),
+            );
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
@@ -6472,6 +6507,59 @@ mod tests {
         let _client = p.http_client();
     }
 
+    #[test]
+    fn request_headers_drop_the_active_credential_header() {
+        let cases = [
+            (AuthStyle::Bearer, "Authorization"),
+            (AuthStyle::XApiKey, "x-api-key"),
+            (
+                AuthStyle::Custom("x-provider-key".to_string()),
+                "x-provider-key",
+            ),
+            (AuthStyle::ZhipuJwt, "Authorization"),
+        ];
+
+        for (auth_style, credential_header) in cases {
+            let extra_headers = std::collections::HashMap::from([(
+                credential_header.to_string(),
+                "caller-value".to_string(),
+            )]);
+            let provider = OpenAiCompatibleModelProvider::builder("test")
+                .display_name("test")
+                .base_url("https://example.com")
+                .credential(Some("provider-key"))
+                .auth_style(auth_style)
+                .extra_headers(extra_headers)
+                .build();
+
+            assert!(
+                !provider
+                    .request_headers(Some("provider-key"))
+                    .contains_key(credential_header)
+            );
+        }
+    }
+
+    #[test]
+    fn request_headers_keep_caller_auth_without_a_provider_credential() {
+        let extra_headers = std::collections::HashMap::from([(
+            "Authorization".to_string(),
+            "Bearer caller".to_string(),
+        )]);
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(extra_headers)
+            .build();
+
+        assert_eq!(
+            provider.request_headers(None)["authorization"],
+            "Bearer caller"
+        );
+    }
+
     #[tokio::test]
     async fn streaming_reuses_connection_across_providers_without_leaking_headers() {
         use axum::extract::{ConnectInfo, State};
@@ -6553,6 +6641,74 @@ mod tests {
         assert_eq!(observed[0].0, observed[1].0, "connection should be reused");
         assert_eq!(observed[0].1, "turn-1");
         assert_eq!(observed[1].1, "turn-2");
+    }
+
+    #[tokio::test]
+    async fn streaming_provider_headers_override_conflicting_extra_headers() {
+        use axum::extract::State;
+        use axum::{Router, http::HeaderMap, response::IntoResponse, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        type Observation = Arc<Mutex<Option<HeaderMap>>>;
+
+        async fn capture(
+            State(observation): State<Observation>,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            *observation.lock().expect("observation mutex") = Some(headers);
+            ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
+        }
+
+        let observation = Observation::default();
+        let app = Router::new()
+            .route("/chat/completions", post(capture))
+            .with_state(Arc::clone(&observation));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let extra_headers = std::collections::HashMap::from([
+            ("Authorization".to_string(), "Bearer caller".to_string()),
+            ("Content-Type".to_string(), "text/plain".to_string()),
+            ("Accept".to_string(), "text/plain".to_string()),
+        ]);
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{address}"))
+            .credential(Some("provider-key"))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(extra_headers)
+            .build();
+
+        let messages = [ChatMessage::user("hello")];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "gpt-test",
+            None,
+            StreamOptions::new(true),
+        );
+        while let Some(event) = stream.next().await {
+            event.expect("stream should succeed");
+        }
+        server.abort();
+
+        let observed = observation.lock().expect("observation mutex");
+        let headers = observed.as_ref().expect("request should be captured");
+        assert_eq!(
+            headers.get_all("authorization").iter().collect::<Vec<_>>(),
+            vec!["Bearer provider-key"]
+        );
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(
+            headers.get_all("accept").iter().collect::<Vec<_>>(),
+            vec!["text/event-stream"]
+        );
     }
 
     #[test]

@@ -18,11 +18,9 @@ const FRAMING: &[&str] = &["content-type", "content-length", "host"];
 /// stay authoritative — the Responses provider's `Authorization` rule, widened
 /// only to the names *that provider* would otherwise send twice. The set is
 /// per provider on purpose: `x-api-key` and `anthropic-version` are Anthropic's,
-/// and the OpenAI chat-completions provider forwards them like any other custom
-/// header, as its Responses sibling does, so switching `wire_api` does not
-/// change which credential or API-version headers a custom gateway receives.
-/// (Framing is still dropped on this wire only; the Responses provider forwards
-/// it as a request header.) List-valued headers such as
+/// and the OpenAI providers forward them like any other custom header, so
+/// switching `wire_api` does not change which credential or API-version headers
+/// a custom gateway receives. List-valued headers such as
 /// `anthropic-beta` are deliberately not reserved: a caller's entry becomes a
 /// second field line beside the provider's, which RFC 9110 list-field merging
 /// combines, so appending a beta flag is a legitimate caller use.
@@ -35,6 +33,12 @@ pub(crate) struct ReservedHeaders {
 }
 
 impl ReservedHeaders {
+    /// OpenAI-compatible providers select their credential header dynamically
+    /// from `AuthStyle`; only the shared framing set is static.
+    pub(crate) const COMPATIBLE: Self = Self {
+        provider: "compatible",
+        names: &[],
+    };
     /// `x-api-key` / `Authorization` (credential, one or the other per auth
     /// style), `anthropic-version`, and the browser-access flag the OAuth path
     /// sets — every single-valued header the provider stamps itself.
@@ -54,10 +58,11 @@ impl ReservedHeaders {
         names: &["authorization"],
     };
 
-    fn contains(self, name: &str) -> bool {
+    fn contains(self, name: &str, additional: &[&str]) -> bool {
         self.names
             .iter()
             .chain(FRAMING)
+            .chain(additional)
             .any(|reserved| name.eq_ignore_ascii_case(reserved))
     }
 }
@@ -70,9 +75,19 @@ pub(crate) fn typed_extra_headers(
     extra: &HashMap<String, String>,
     reserved: ReservedHeaders,
 ) -> Vec<(HeaderName, HeaderValue)> {
+    typed_extra_headers_with_additional_reserved(extra, reserved, &[])
+}
+
+/// Validate caller headers while also reserving request-specific names such as
+/// a compatible provider's configured credential header or streaming `Accept`.
+pub(crate) fn typed_extra_headers_with_additional_reserved(
+    extra: &HashMap<String, String>,
+    reserved: ReservedHeaders,
+    additional_reserved: &[&str],
+) -> Vec<(HeaderName, HeaderValue)> {
     let mut typed = Vec::with_capacity(extra.len());
     for (key, value) in extra {
-        if reserved.contains(key) {
+        if reserved.contains(key, additional_reserved) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -82,7 +97,7 @@ pub(crate) fn typed_extra_headers(
                         "provider": reserved.provider,
                         "reason": "reserved_header_owned_by_provider",
                     })),
-                "Dropping reserved entry from extra_headers; the provider's own credential, API-version and framing headers are authoritative"
+                "Dropping reserved entry from extra_headers; provider-owned request headers are authoritative"
             );
             continue;
         }

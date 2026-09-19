@@ -1185,40 +1185,21 @@ impl OpenAiResponsesModelProvider {
     }
 
     fn build_default_headers(&self) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        for (key, value) in &self.extra_headers {
-            if key.eq_ignore_ascii_case("authorization") {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "header": key,
-                            "reason": "reserved_authorization_overridden_by_provider_credential",
-                        })),
-                    "Dropping reserved 'Authorization' entry from extra_headers; built-in provider credential is authoritative. Rotate the credential via the 'credential' constructor argument instead."
-                );
-                continue;
-            }
-            match (
-                HeaderName::from_bytes(key.as_bytes()),
-                HeaderValue::from_str(value),
-            ) {
-                (Ok(name), Ok(val)) => {
-                    headers.insert(name, val);
-                }
-                _ => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"header": key})),
-                        "Skipping invalid extra header name or value"
-                    );
-                }
-            }
-        }
-        headers
+        self.build_headers_with_additional_reserved(&[])
+    }
+
+    fn build_streaming_headers(&self) -> HeaderMap {
+        self.build_headers_with_additional_reserved(&["accept"])
+    }
+
+    fn build_headers_with_additional_reserved(&self, additional: &[&str]) -> HeaderMap {
+        crate::extra_headers::typed_extra_headers_with_additional_reserved(
+            &self.extra_headers,
+            crate::extra_headers::ReservedHeaders::OPENAI,
+            additional,
+        )
+        .into_iter()
+        .collect()
     }
 
     fn http_client(&self) -> Client {
@@ -1397,7 +1378,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let max_tokens = self.max_tokens;
         let store = self.store;
         let client = self.streaming_client();
-        let extra_headers = self.build_default_headers();
+        let extra_headers = self.build_streaming_headers();
         let response_observer = self.response_observer.clone();
         let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
@@ -1610,6 +1591,72 @@ mod tests {
         assert_eq!(observed[0].0, observed[1].0, "connection should be reused");
         assert_eq!(observed[0].1, "turn-1");
         assert_eq!(observed[1].1, "turn-2");
+    }
+
+    #[tokio::test]
+    async fn responses_streaming_provider_headers_override_conflicting_extra_headers() {
+        use axum::extract::State;
+        use axum::{Router, http::HeaderMap, response::IntoResponse, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        type Observation = Arc<Mutex<Option<HeaderMap>>>;
+
+        async fn capture(
+            State(observation): State<Observation>,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            *observation.lock().expect("observation mutex") = Some(headers);
+            ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
+        }
+
+        let observation = Observation::default();
+        let app = Router::new()
+            .route("/responses", post(capture))
+            .with_state(Arc::clone(&observation));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let extra_headers = std::collections::HashMap::from([
+            ("Authorization".to_string(), "Bearer caller".to_string()),
+            ("Content-Type".to_string(), "text/plain".to_string()),
+            ("Accept".to_string(), "text/plain".to_string()),
+        ]);
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{address}"))
+            .credential(Some("provider-key"))
+            .extra_headers(extra_headers)
+            .build();
+
+        let messages = [ChatMessage::user("hello")];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "gpt-test",
+            None,
+            StreamOptions::new(true),
+        );
+        while let Some(event) = stream.next().await {
+            event.expect("stream should succeed");
+        }
+        server.abort();
+
+        let observed = observation.lock().expect("observation mutex");
+        let headers = observed.as_ref().expect("request should be captured");
+        assert_eq!(
+            headers.get_all("authorization").iter().collect::<Vec<_>>(),
+            vec!["Bearer provider-key"]
+        );
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(
+            headers.get_all("accept").iter().collect::<Vec<_>>(),
+            vec!["text/event-stream"]
+        );
     }
 
     #[test]
