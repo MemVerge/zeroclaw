@@ -1765,9 +1765,10 @@ impl AnthropicModelProvider {
         let mut cached_input_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
 
-        // Reason from `message_delta`. Not a completion signal — only
-        // `message_stop` (or a clean Final emit) marks the stream complete.
+        // `message_delta` supplies the reason; `message_stop` completes the
+        // protocol message. Final must additionally wait for the HTTP body EOF.
         let mut pending_stop = None;
+        let mut completed_stop = None;
 
         loop {
             let line = match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
@@ -1808,6 +1809,12 @@ impl AnthropicModelProvider {
                     return;
                 }
             };
+            // Consumers stop polling at Final and drop the parser's abort guard.
+            // Drain the transport after message_stop so normal completion does
+            // not disconnect the gateway before it finishes usage accounting.
+            if completed_stop.is_some() {
+                continue;
+            }
             let line = line.trim().to_string();
             if !line.starts_with("data: ") {
                 continue;
@@ -2090,12 +2097,7 @@ impl AnthropicModelProvider {
                             })))
                             .await;
                     }
-                    let _ = tx
-                        .send(Ok(StreamEvent::Final {
-                            stop: pending_stop.take().unwrap_or(StopReason::Unspecified),
-                        }))
-                        .await;
-                    return;
+                    completed_stop = Some(pending_stop.take().unwrap_or(StopReason::Unspecified));
                 }
                 "error" => {
                     let msg = event
@@ -2114,7 +2116,7 @@ impl AnthropicModelProvider {
 
         crate::stream_guard::finish_sse_stream(SseFinish {
             tx,
-            stop: None,
+            stop: completed_stop,
             completion_signal: "message_stop",
         })
         .await;
@@ -2611,6 +2613,10 @@ impl ::zeroclaw_api::attribution::Attributable for AnthropicModelProvider {
         &self.alias
     }
 }
+
+#[cfg(test)]
+#[path = "anthropic_stream_completion_tests.rs"]
+mod stream_completion_tests;
 
 #[cfg(test)]
 mod tests {
