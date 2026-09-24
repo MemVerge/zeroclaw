@@ -280,7 +280,39 @@ pub(crate) fn insert_conversation_breadcrumb(history: &mut Vec<ConversationMessa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::model_provider::{MessageContentField, MessageContentSource};
     use zeroclaw_providers::{ToolCall, ToolResultMessage};
+
+    #[test]
+    fn turn_trim_preserves_retained_sources_and_leaves_breadcrumb_unmarked() {
+        let source = |source_id, len| MessageContentSource {
+            source_id,
+            field: MessageContentField::Text,
+            range: 0..len,
+        };
+        let history = vec![
+            ChatMessage::system("system"),
+            ChatMessage {
+                content_sources: vec![source(1, 1000)],
+                ..ChatMessage::user("x".repeat(1000))
+            },
+            ChatMessage::assistant("old answer"),
+            ChatMessage {
+                content_sources: vec![source(2, 3)],
+                ..ChatMessage::user("问")
+            },
+            ChatMessage {
+                content_sources: vec![source(3, 3)],
+                ..ChatMessage::assistant("答")
+            },
+        ];
+        let mut trimmed = trim_to_recent_turns(history, 30);
+        assert!(trimmed.trimmed);
+        insert_breadcrumb_deduped(&mut trimmed.history);
+        assert!(trimmed.history[1].content_sources.is_empty());
+        assert_eq!(trimmed.history[2].content_sources, [source(2, 3)]);
+        assert_eq!(trimmed.history[3].content_sources, [source(3, 3)]);
+    }
 
     fn sys(c: &str) -> ChatMessage {
         ChatMessage::system(c)

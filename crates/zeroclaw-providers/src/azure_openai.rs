@@ -1039,6 +1039,7 @@ mod tests {
         use zeroclaw_api::model_provider::ChatMessage;
 
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "assistant".into(),
             content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
                 .into(),
@@ -1058,6 +1059,7 @@ mod tests {
         use zeroclaw_api::model_provider::ChatMessage;
 
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "assistant".into(),
             content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
                 .into(),

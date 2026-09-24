@@ -1,4 +1,4 @@
-use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::model_provider::{ChatMessage, MessageContentField, remap_content_sources};
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -186,11 +186,25 @@ pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatM
             let salvaged_text = value
                 .get("content")
                 .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .map(ToString::to_string);
+                .filter(|text| !text.trim().is_empty());
             match salvaged_text {
-                Some(text) => messages[idx].content = text,
+                Some(text) => {
+                    let trimmed = text.trim();
+                    let start = text.len() - text.trim_start().len();
+                    let message = &mut messages[idx];
+                    message
+                        .content_sources
+                        .retain(|source| source.field == MessageContentField::JsonContent);
+                    message.content_sources = remap_content_sources(
+                        &message.content_sources,
+                        MessageContentField::JsonContent,
+                        std::slice::from_ref(&(start..start + trimmed.len())),
+                    );
+                    for source in &mut message.content_sources {
+                        source.field = MessageContentField::Text;
+                    }
+                    message.content = trimmed.to_string();
+                }
                 None => {
                     messages.remove(idx);
                 }
@@ -225,11 +239,57 @@ pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatM
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::model_provider::MessageContentSource;
+
+    #[test]
+    fn orphan_tool_salvage_preserves_decoded_prose_sources() {
+        let prose = " \n前\"后\t ";
+        for keep_paired_call in [false, true] {
+            let mut messages = vec![
+                ChatMessage::user("question"),
+                ChatMessage {
+                    content_sources: vec![MessageContentSource {
+                        source_id: 9,
+                        field: MessageContentField::JsonContent,
+                        range: 0..prose.len(),
+                    }],
+                    ..ChatMessage::assistant(
+                        serde_json::json!({
+                            "content": prose,
+                            "tool_calls": [{"id": "orphan"}, {"id": "kept"}],
+                        })
+                        .to_string(),
+                    )
+                },
+            ];
+            if keep_paired_call {
+                messages.push(ChatMessage::tool(
+                    r#"{"tool_call_id":"kept","content":"ok"}"#,
+                ));
+            }
+            assert_eq!(strip_orphaned_tool_calls_from_assistants(&mut messages), 1);
+            let message = &messages[1];
+            let source = &message.content_sources[0];
+            assert_eq!(source.source_id, 9);
+            if keep_paired_call {
+                let envelope: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+                assert_eq!(envelope["content"], prose);
+                assert_eq!(envelope["tool_calls"], serde_json::json!([{"id": "kept"}]));
+                assert_eq!(source.field, MessageContentField::JsonContent);
+                assert_eq!(source.range, 0..prose.len());
+            } else {
+                assert_eq!(message.content, prose.trim());
+                assert_eq!(source.field, MessageContentField::Text);
+                assert_eq!(source.range, 0..prose.trim().len());
+            }
+        }
+    }
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_string(),
             content: content.to_string(),
+            content_sources: Vec::new(),
         }
     }
 

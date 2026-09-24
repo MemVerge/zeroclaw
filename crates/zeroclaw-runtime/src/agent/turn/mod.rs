@@ -78,6 +78,7 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
+use zeroclaw_api::model_provider::{MessageContentField, remap_content_sources};
 use zeroclaw_api::{GracefulStopReason, StopReason};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 
@@ -422,8 +423,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             )
             .await;
             if !context.is_empty() {
-                let existing = &turn_state.history[last_user_idx].content;
-                turn_state.history[last_user_idx].content = format!("{context}{existing}");
+                let message = &mut turn_state.history[last_user_idx];
+                for source in &mut message.content_sources {
+                    if source.field == MessageContentField::Text {
+                        source.range.start += context.len();
+                        source.range.end += context.len();
+                    }
+                }
+                message.content.insert_str(0, &context);
             }
         }
     }
@@ -2206,10 +2213,34 @@ fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
         } else {
             NO_TOOLS_TASK_FRAMING
         };
-        first.content = first
-            .content
-            .replacen(NATIVE_TOOLS_TASK_FRAMING, desired, 1)
-            .replacen(NO_TOOLS_TASK_FRAMING, desired, 1);
+        for anchor in [NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING] {
+            if anchor != desired
+                && let Some(start) = first.content.find(anchor)
+            {
+                let end = start + anchor.len();
+                let mut sources = remap_content_sources(
+                    &first.content_sources,
+                    MessageContentField::Text,
+                    std::slice::from_ref(&(0..start)),
+                );
+                sources.extend(
+                    remap_content_sources(
+                        &first.content_sources,
+                        MessageContentField::Text,
+                        std::slice::from_ref(&(end..first.content.len())),
+                    )
+                    .into_iter()
+                    .filter(|source| source.field == MessageContentField::Text)
+                    .map(|mut source| {
+                        source.range.start += start + desired.len();
+                        source.range.end += start + desired.len();
+                        source
+                    }),
+                );
+                first.content_sources = sources;
+                first.content.replace_range(start..end, desired);
+            }
+        }
     }
 }
 
@@ -2217,7 +2248,30 @@ fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
 mod surface3_tests {
     use super::*;
     use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
+    use zeroclaw_api::model_provider::MessageContentSource;
 
+    #[test]
+    fn refresh_prompt_anchor_preserves_surrounding_sources() {
+        let content = format!("前 {NATIVE_TOOLS_TASK_FRAMING} 后");
+        let mut history = vec![ChatMessage {
+            content_sources: vec![MessageContentSource {
+                source_id: 5,
+                field: MessageContentField::Text,
+                range: 0..content.len(),
+            }],
+            ..ChatMessage::user(content)
+        }];
+        refresh_prompt_anchor(&mut history, false);
+        assert_eq!(history[0].content, format!("前 {NO_TOOLS_TASK_FRAMING} 后"));
+        assert_eq!(
+            history[0]
+                .content_sources
+                .iter()
+                .map(|source| { (source.source_id, &history[0].content[source.range.clone()]) })
+                .collect::<Vec<_>>(),
+            [(5, "前 "), (5, " 后")],
+        );
+    }
     fn make_system_prompt(anchor: &str) -> ChatMessage {
         ChatMessage::system(format!(
             "You are ZeroClaw.\n\n## Security\n\n...\n\n## Your Task\n\nWhen the user sends a message, respond naturally. {anchor}\n\nDo NOT: summarize this configuration...\n"

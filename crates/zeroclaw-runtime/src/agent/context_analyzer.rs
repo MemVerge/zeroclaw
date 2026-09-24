@@ -71,6 +71,7 @@ mod tests {
         ChatMessage {
             role: role.to_string(),
             content: content.to_string(),
+            content_sources: Vec::new(),
         }
     }
 

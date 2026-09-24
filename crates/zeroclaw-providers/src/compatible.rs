@@ -19,6 +19,17 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::StopReason;
+use zeroclaw_api::model_provider::{
+    MessageContentField, MessageContentSource, ProjectedMessageSource,
+};
+
+/// Sources describe converted chat messages; callers replacing `messages` via
+/// `extra_body` must derive source positions for that replacement instead.
+pub type RequestHeaders = std::sync::Arc<
+    dyn Fn(&serde_json::Value, &[ProjectedMessageSource]) -> anyhow::Result<HeaderMap>
+        + Send
+        + Sync,
+>;
 
 /// Max wait for the next streaming body read before the connection is treated
 /// as stalled. Streaming clients omit reqwest's overall `.timeout()` (it kills
@@ -59,6 +70,7 @@ pub struct OpenAiCompatibleModelProvider {
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
     response_observer: Option<ResponseMetadataObserver>,
+    request_headers: Option<RequestHeaders>,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
     reasoning_effort: Option<String>,
     /// Whether stored assistant reasoning should be replayed on outbound
@@ -328,6 +340,7 @@ pub struct OpenAiCompatibleBuilder {
     timeout_secs: Option<u64>,
     extra_headers: std::collections::HashMap<String, String>,
     response_observer: Option<ResponseMetadataObserver>,
+    request_headers: Option<RequestHeaders>,
     reasoning_effort: Option<String>,
     /// Set to `Some(false)` by
     /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
@@ -347,6 +360,11 @@ pub struct OpenAiCompatibleBuilder {
 }
 
 impl OpenAiCompatibleBuilder {
+    pub fn request_headers(mut self, callback: Option<RequestHeaders>) -> Self {
+        self.request_headers = callback;
+        self
+    }
+
     /// Observe selected model-response headers without changing the request.
     pub fn response_observer(mut self, observer: Option<ResponseMetadataObserver>) -> Self {
         self.response_observer = observer;
@@ -590,6 +608,7 @@ impl OpenAiCompatibleBuilder {
             timeout_secs: self.timeout_secs.unwrap_or(120),
             extra_headers: self.extra_headers,
             response_observer: self.response_observer,
+            request_headers: self.request_headers,
             reasoning_effort: self.reasoning_effort,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
             api_path: self.api_path,
@@ -627,6 +646,7 @@ impl OpenAiCompatibleModelProvider {
             timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             response_observer: None,
+            request_headers: None,
             reasoning_effort: None,
             replay_assistant_reasoning_override: None,
             api_path: None,
@@ -666,6 +686,7 @@ impl OpenAiCompatibleModelProvider {
     fn flatten_system_messages(messages: &[ChatMessage], merge: bool) -> Vec<ChatMessage> {
         let mut saw_system = false;
         let mut system_content = String::new();
+        let mut system_sources = Vec::new();
         let mut result: Vec<ChatMessage> = Vec::with_capacity(messages.len());
 
         for message in messages {
@@ -675,6 +696,14 @@ impl OpenAiCompatibleModelProvider {
                     if !system_content.is_empty() {
                         system_content.push_str("\n\n");
                     }
+                    let offset = system_content.len();
+                    system_sources.extend(message.content_sources.iter().cloned().map(
+                        |mut source| {
+                            source.range.start += offset;
+                            source.range.end += offset;
+                            source
+                        },
+                    ));
                     system_content.push_str(&message.content);
                 }
             } else {
@@ -691,17 +720,35 @@ impl OpenAiCompatibleModelProvider {
         }
 
         if !merge {
-            result.insert(0, ChatMessage::system(system_content));
+            result.insert(
+                0,
+                ChatMessage {
+                    content_sources: system_sources,
+                    ..ChatMessage::system(system_content)
+                },
+            );
             return result;
         }
 
         if let Some(first_user) = result.iter_mut().find(|m| m.role == "user") {
             if !system_content.is_empty() {
+                for source in &mut first_user.content_sources {
+                    source.range.start += system_content.len() + 2;
+                    source.range.end += system_content.len() + 2;
+                }
+                system_sources.append(&mut first_user.content_sources);
+                first_user.content_sources = system_sources;
                 first_user.content = format!("{system_content}\n\n{}", first_user.content);
             }
         } else {
             // No user message found: insert a synthetic user message with system content
-            result.insert(0, ChatMessage::user(&system_content));
+            result.insert(
+                0,
+                ChatMessage {
+                    content_sources: system_sources,
+                    ..ChatMessage::user(&system_content)
+                },
+            );
         }
 
         result
@@ -962,6 +1009,170 @@ impl OpenAiCompatibleModelProvider {
     }
 }
 
+fn native_assistant_envelope(
+    content: &str,
+) -> Option<(serde_json::Value, Option<Vec<ProviderToolCall>>)> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    if let Some(calls) = value.get("tool_calls") {
+        let calls = serde_json::from_value::<Vec<ProviderToolCall>>(calls.clone()).ok()?;
+        Some((value, Some(calls)))
+    } else if OpenAiCompatibleModelProvider::assistant_reasoning_value(&value).is_some()
+        && matches!(
+            value.get("content"),
+            None | Some(serde_json::Value::Null | serde_json::Value::String(_))
+        )
+    {
+        Some((value, None))
+    } else {
+        None
+    }
+}
+
+/// The same envelope projection used by compatible chat conversion; other JSON remains prose.
+pub fn assistant_text_content(content: &str) -> Option<String> {
+    let (value, _) = native_assistant_envelope(content)?;
+    Some(
+        value
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+    )
+}
+
+fn json_content_boundaries(content: &str) -> Option<Vec<(usize, usize)>> {
+    let fields = serde_json::from_str::<
+        std::collections::BTreeMap<String, &serde_json::value::RawValue>,
+    >(content)
+    .ok()?;
+    let raw = fields.get("content")?.get();
+    let decoded = serde_json::from_str::<String>(raw).ok()?;
+    let offset = raw.as_ptr() as usize - content.as_ptr() as usize;
+    let mut cursor = 1;
+    let mut boundaries = vec![(0, offset + cursor)];
+    for (index, character) in decoded.char_indices() {
+        cursor += if raw.as_bytes()[cursor] == b'\\' {
+            if raw.as_bytes()[cursor + 1] == b'u' {
+                if character.len_utf16() == 2 { 12 } else { 6 }
+            } else {
+                2
+            }
+        } else {
+            character.len_utf8()
+        };
+        boundaries.push((index + character.len_utf8(), offset + cursor));
+    }
+    Some(boundaries)
+}
+
+fn encoded_json_content_sources(message: &ChatMessage) -> Vec<MessageContentSource> {
+    let Some(boundaries) = json_content_boundaries(&message.content) else {
+        return Vec::new();
+    };
+    message
+        .content_sources
+        .iter()
+        .filter(|source| source.field == MessageContentField::JsonContent)
+        .filter_map(|source| {
+            let start = boundaries
+                .binary_search_by_key(&source.range.start, |(decoded, _)| *decoded)
+                .ok()?;
+            let end = boundaries
+                .binary_search_by_key(&source.range.end, |(decoded, _)| *decoded)
+                .ok()?;
+            Some(MessageContentSource {
+                source_id: source.source_id,
+                field: MessageContentField::Text,
+                range: boundaries[start].1..boundaries[end].1,
+            })
+        })
+        .collect()
+}
+
+fn decoded_json_content_sources(message: &ChatMessage) -> Vec<MessageContentSource> {
+    let mut sources = message
+        .content_sources
+        .iter()
+        .filter(|source| source.field == MessageContentField::JsonContent)
+        .cloned()
+        .map(|mut source| {
+            source.field = MessageContentField::Text;
+            source
+        })
+        .collect::<Vec<_>>();
+    if message
+        .content_sources
+        .iter()
+        .any(|source| source.field == MessageContentField::Text)
+        && let Some(boundaries) = json_content_boundaries(&message.content)
+    {
+        sources.extend(
+            message
+                .content_sources
+                .iter()
+                .filter(|source| source.field == MessageContentField::Text)
+                .filter_map(|source| {
+                    let (start, _) = boundaries
+                        .iter()
+                        .find(|(_, encoded)| *encoded >= source.range.start)?;
+                    let (end, _) = boundaries
+                        .iter()
+                        .rev()
+                        .find(|(_, encoded)| *encoded <= source.range.end)?;
+                    (*start < *end).then_some(MessageContentSource {
+                        source_id: source.source_id,
+                        field: MessageContentField::Text,
+                        range: *start..*end,
+                    })
+                }),
+        );
+    }
+    sources
+}
+
+pub(crate) fn request_with_sources(
+    callback: &Option<RequestHeaders>,
+    builder: reqwest::RequestBuilder,
+    request: &impl Serialize,
+    sources: Vec<ProjectedMessageSource>,
+) -> anyhow::Result<reqwest::RequestBuilder> {
+    match callback {
+        Some(callback) => {
+            let body = serde_json::to_value(request)?;
+            let headers = callback(&body, &sources)?;
+            Ok(builder.headers(headers).json(request))
+        }
+        None => Ok(builder.json(request)),
+    }
+}
+
+pub(crate) fn projected_sources<'a>(
+    messages: impl IntoIterator<Item = &'a Vec<MessageContentSource>>,
+) -> Vec<ProjectedMessageSource> {
+    let mut result: Vec<ProjectedMessageSource> = Vec::new();
+    for (message_index, sources) in messages.into_iter().enumerate() {
+        for source in sources {
+            if source.range.is_empty() {
+                continue;
+            }
+            if let Some(previous) = result.last_mut()
+                && previous.message_index == message_index
+                && previous.source_id == source.source_id
+                && previous.range.end == source.range.start
+            {
+                previous.range.end = source.range.end;
+            } else {
+                result.push(ProjectedMessageSource {
+                    source_id: source.source_id,
+                    message_index,
+                    range: source.range.clone(),
+                });
+            }
+        }
+    }
+    result
+}
+
 #[derive(Debug, Serialize)]
 struct ApiChatRequest {
     model: String,
@@ -995,6 +1206,8 @@ struct StreamOptionsBody {
 
 #[derive(Debug, Serialize)]
 struct Message {
+    #[serde(skip)]
+    content_sources: Vec<MessageContentSource>,
     role: String,
     content: MessageContent,
 }
@@ -1330,6 +1543,8 @@ struct NativeChatRequest {
 
 #[derive(Debug, Serialize)]
 struct NativeMessage {
+    #[serde(skip)]
+    content_sources: Vec<MessageContentSource>,
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<MessageContent>,
@@ -2096,6 +2311,64 @@ impl OpenAiCompatibleModelProvider {
         Ok(prepared.messages)
     }
 
+    pub(crate) fn text_sources(
+        message: &ChatMessage,
+        allow_user_image_parts: bool,
+    ) -> Vec<MessageContentSource> {
+        if message.content_sources.is_empty() {
+            return Vec::new();
+        }
+        let mut sources = message
+            .content_sources
+            .iter()
+            .filter(|source| source.field == MessageContentField::Text)
+            .cloned()
+            .collect::<Vec<_>>();
+        if message
+            .content_sources
+            .iter()
+            .any(|source| source.field == MessageContentField::JsonContent)
+        {
+            sources.extend(encoded_json_content_sources(message));
+        }
+        if message.role == "user" && allow_user_image_parts {
+            multimodal::image_text_sources(&message.content, &sources)
+        } else {
+            sources
+        }
+    }
+
+    fn json_content_sources(
+        message: &ChatMessage,
+        value: &serde_json::Value,
+        content: Option<&MessageContent>,
+    ) -> Vec<MessageContentSource> {
+        let Some(content) = content else {
+            return Vec::new();
+        };
+        let sources = message
+            .content_sources
+            .iter()
+            .filter(|source| source.field == MessageContentField::JsonContent)
+            .cloned()
+            .map(|mut source| {
+                source.field = MessageContentField::Text;
+                source
+            })
+            .collect::<Vec<_>>();
+        match content {
+            MessageContent::Text(text) if text.is_empty() => Vec::new(),
+            MessageContent::Text(_) => sources,
+            MessageContent::Parts(_) => multimodal::image_text_sources(
+                value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                &sources,
+            ),
+        }
+    }
+
     fn to_message_content(
         role: &str,
         content: &str,
@@ -2145,76 +2418,73 @@ impl OpenAiCompatibleModelProvider {
         messages
             .iter()
             .map(|message| {
-                if message.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
-                    && let Some(tool_calls_value) = value.get("tool_calls")
-                    && let Ok(parsed_calls) =
-                        serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
-                {
-                    let tool_calls = parsed_calls
-                        .into_iter()
-                        .map(|tc| {
-                            let tc_id = tc.id.clone();
-                            let tc_name = tc.name.clone();
-                            tool_name_map.insert(tc_id, tc_name);
-                            ToolCall {
-                                id: Some({
-                                    let normalized_id = reserve_tool_call_id_for_contract(
-                                        targets_mistral_tool_call_contract,
-                                        Some(tc.id.clone()),
-                                        &mut used_tool_call_ids,
-                                    );
-                                    tool_call_id_map.insert(tc.id.clone(), normalized_id.clone());
-                                    normalized_id
-                                }),
-                                kind: Some("function".to_string()),
-                                function: Some(Function {
-                                    name: Some(tc.name),
-                                    arguments: Some(tc.arguments),
-                                }),
-                                name: None,
-                                arguments: None,
-                                parameters: None,
-                                // Round-trip extra_content (e.g. Gemini
-                                // thoughtSignature) — dropping it here was the bug.
-                                extra_content: tc.extra_content,
-                            }
-                        })
-                        .collect::<Vec<_>>();
+                let assistant_envelope = (message.role == "assistant")
+                    .then(|| native_assistant_envelope(&message.content))
+                    .flatten();
+                if let Some((value, parsed_calls)) = assistant_envelope {
+                    if let Some(parsed_calls) = parsed_calls {
+                        let tool_calls = parsed_calls
+                            .into_iter()
+                            .map(|tc| {
+                                let tc_id = tc.id.clone();
+                                let tc_name = tc.name.clone();
+                                tool_name_map.insert(tc_id, tc_name);
+                                ToolCall {
+                                    id: Some({
+                                        let normalized_id = reserve_tool_call_id_for_contract(
+                                            targets_mistral_tool_call_contract,
+                                            Some(tc.id.clone()),
+                                            &mut used_tool_call_ids,
+                                        );
+                                        tool_call_id_map
+                                            .insert(tc.id.clone(), normalized_id.clone());
+                                        normalized_id
+                                    }),
+                                    kind: Some("function".to_string()),
+                                    function: Some(Function {
+                                        name: Some(tc.name),
+                                        arguments: Some(tc.arguments),
+                                    }),
+                                    name: None,
+                                    arguments: None,
+                                    parameters: None,
+                                    // Round-trip extra_content (e.g. Gemini
+                                    // thoughtSignature) — dropping it here was the bug.
+                                    extra_content: tc.extra_content,
+                                }
+                            })
+                            .collect::<Vec<_>>();
 
-                    last_assistant_tool_call_ids =
-                        tool_calls.iter().filter_map(|tc| tc.id.clone()).collect();
+                        last_assistant_tool_call_ids =
+                            tool_calls.iter().filter_map(|tc| tc.id.clone()).collect();
 
-                    let content = crate::request_payload::non_empty_string_field(&value, "content")
-                        .map(MessageContent::Text)
-                        .or_else(|| {
-                            requires_string_tool_call_content
-                                .then(|| MessageContent::Text(String::new()))
-                        });
+                        let content =
+                            crate::request_payload::non_empty_string_field(&value, "content")
+                                .map(MessageContent::Text)
+                                .or_else(|| {
+                                    requires_string_tool_call_content
+                                        .then(|| MessageContent::Text(String::new()))
+                                });
 
-                    let (reasoning_content, reasoning) =
-                        self.assistant_reasoning_pair_for_replay(&value);
+                        let (reasoning_content, reasoning) =
+                            self.assistant_reasoning_pair_for_replay(&value);
 
-                    return NativeMessage {
-                        role: "assistant".to_string(),
-                        content,
-                        tool_call_id: None,
-                        tool_calls: Some(tool_calls),
-                        reasoning_content,
-                        reasoning,
-                        name: None,
-                    };
-                }
+                        return NativeMessage {
+                            content_sources: Self::json_content_sources(
+                                message,
+                                &value,
+                                content.as_ref(),
+                            ),
+                            role: "assistant".to_string(),
+                            content,
+                            tool_call_id: None,
+                            tool_calls: Some(tool_calls),
+                            reasoning_content,
+                            reasoning,
+                            name: None,
+                        };
+                    }
 
-                if message.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
-                    && value.get("tool_calls").is_none()
-                    && Self::assistant_reasoning_value(&value).is_some()
-                    && matches!(
-                        value.get("content"),
-                        None | Some(serde_json::Value::Null | serde_json::Value::String(_))
-                    )
-                {
                     let content = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
@@ -2224,6 +2494,11 @@ impl OpenAiCompatibleModelProvider {
                         self.assistant_reasoning_pair_for_replay(&value);
 
                     return NativeMessage {
+                        content_sources: Self::json_content_sources(
+                            message,
+                            &value,
+                            content.as_ref(),
+                        ),
                         role: "assistant".to_string(),
                         content,
                         tool_call_id: None,
@@ -2286,6 +2561,11 @@ impl OpenAiCompatibleModelProvider {
                         });
 
                     return NativeMessage {
+                        content_sources: Self::json_content_sources(
+                            message,
+                            &value,
+                            content.as_ref(),
+                        ),
                         role: "tool".to_string(),
                         content,
                         tool_call_id,
@@ -2297,6 +2577,7 @@ impl OpenAiCompatibleModelProvider {
                 }
 
                 NativeMessage {
+                    content_sources: Self::text_sources(message, allow_user_image_parts),
                     role: message.role.clone(),
                     content: Some(Self::to_message_content(
                         &message.role,
@@ -2336,18 +2617,41 @@ impl OpenAiCompatibleModelProvider {
                 return if text.is_empty() {
                     None
                 } else {
-                    Some(ChatMessage::assistant(&text))
+                    Some(ChatMessage {
+                        content_sources: decoded_json_content_sources(msg),
+                        ..ChatMessage::assistant(&text)
+                    })
                 };
             }
-            Some(msg.clone())
+            Some(ChatMessage {
+                content_sources: Self::text_sources(msg, false),
+                ..msg.clone()
+            })
         });
 
         let mut coalesced: Vec<ChatMessage> = Vec::with_capacity(messages.len());
         for msg in intermediate {
             match coalesced.last_mut() {
                 Some(last) if last.role == msg.role && msg.role != "system" => {
+                    let separator_start = last.content.len();
                     if !last.content.is_empty() && !msg.content.is_empty() {
                         last.content.push_str("\n\n");
+                    }
+                    let offset = last.content.len();
+                    for mut source in msg.content_sources {
+                        if let Some(previous) = last.content_sources.last_mut()
+                            && previous.field == MessageContentField::Text
+                            && source.field == MessageContentField::Text
+                            && previous.source_id == source.source_id
+                            && previous.range.end == separator_start
+                            && source.range.start == 0
+                        {
+                            previous.range.end = offset + source.range.end;
+                        } else {
+                            source.range.start += offset;
+                            source.range.end += offset;
+                            last.content_sources.push(source);
+                        }
                     }
                     last.content.push_str(&msg.content);
                 }
@@ -2666,6 +2970,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // attachments) into base64 data URIs before this message reaches the
         // upstream provider.
         let user_msg = ChatMessage {
+            content_sources: Vec::new(),
             role: "user".to_string(),
             content: message.to_string(),
         };
@@ -2685,17 +2990,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 None => normalized_message,
             };
             messages.push(Message {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: Self::to_message_content("user", &content, !merge),
             });
         } else {
             if let Some(sys) = system_prompt {
                 messages.push(Message {
+                    content_sources: Vec::new(),
                     role: "system".to_string(),
                     content: MessageContent::Text(sys.to_string()),
                 });
             }
             messages.push(Message {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: Self::to_message_content("user", &normalized_message, true),
             });
@@ -2719,7 +3027,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let mut observation = begin_request(&self.response_observer);
         let response = match self
             .apply_auth_header(
-                self.http_client().post(&url).json(&request),
+                request_with_sources(
+                    &self.request_headers,
+                    self.http_client().post(&url),
+                    &request,
+                    projected_sources(
+                        request
+                            .messages
+                            .iter()
+                            .map(|message| &message.content_sources),
+                    ),
+                )?,
                 credential.as_deref(),
             )
             .send()
@@ -2787,6 +3105,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
+                content_sources: Self::text_sources(m, !merge),
                 role: m.role.clone(),
                 content: Self::to_message_content(&m.role, &m.content, !merge),
             })
@@ -2809,7 +3128,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let mut observation = begin_request(&self.response_observer);
         let response = match self
             .apply_auth_header(
-                self.http_client().post(&url).json(&request),
+                request_with_sources(
+                    &self.request_headers,
+                    self.http_client().post(&url),
+                    &request,
+                    projected_sources(
+                        request
+                            .messages
+                            .iter()
+                            .map(|message| &message.content_sources),
+                    ),
+                )?,
                 credential.as_deref(),
             )
             .send()
@@ -2890,7 +3219,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let mut observation = begin_request(&self.response_observer);
         let response = match self
             .apply_auth_header(
-                self.http_client().post(&url).json(&request),
+                request_with_sources(
+                    &self.request_headers,
+                    self.http_client().post(&url),
+                    &request,
+                    projected_sources(
+                        request
+                            .messages
+                            .iter()
+                            .map(|message| &message.content_sources),
+                    ),
+                )?,
                 credential.as_deref(),
             )
             .send()
@@ -3014,7 +3353,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let mut observation = begin_request(&self.response_observer);
         let response = match self
             .apply_auth_header(
-                self.http_client().post(&url).json(&native_request),
+                request_with_sources(
+                    &self.request_headers,
+                    self.http_client().post(&url),
+                    &native_request,
+                    projected_sources(
+                        native_request
+                            .messages
+                            .iter()
+                            .map(|message| &message.content_sources),
+                    ),
+                )?,
                 credential.as_deref(),
             )
             .send()
@@ -3140,8 +3489,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 );
             }
 
+            let sources;
             let payload_result = if has_tools {
-                serde_json::to_value(NativeChatRequest {
+                let request = NativeChatRequest {
                     model: model.clone(),
                     messages: provider.convert_messages_for_native(&effective_messages, !merge),
                     temperature,
@@ -3168,17 +3518,25 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
                     max_tokens: provider.max_tokens,
                     extra_body: provider.extra_body.clone(),
-                })
+                };
+                sources = projected_sources(
+                    request
+                        .messages
+                        .iter()
+                        .map(|message| &message.content_sources),
+                );
+                serde_json::to_value(request)
             } else {
                 let messages = effective_messages
                     .iter()
                     .map(|message| Message {
+                        content_sources: Self::text_sources(message, !merge),
                         role: message.role.clone(),
                         content: Self::to_message_content(&message.role, &message.content, !merge),
                     })
                     .collect();
 
-                serde_json::to_value(ApiChatRequest {
+                let request = ApiChatRequest {
                     model: model.clone(),
                     messages,
                     temperature,
@@ -3195,7 +3553,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools: None,
                     tool_choice: None,
                     max_tokens: provider.max_tokens,
-                })
+                };
+                sources = projected_sources(
+                    request
+                        .messages
+                        .iter()
+                        .map(|message| &message.content_sources),
+                );
+                serde_json::to_value(request)
             };
 
             let payload = match payload_result {
@@ -3220,10 +3585,22 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
             let targets_mistral_tool_call_contract = provider.targets_mistral_tool_call_contract();
 
-            let mut req_builder = provider.apply_streaming_request_headers(
-                client.post(&url).json(&payload),
-                credential.as_deref(),
-            );
+            let builder = match request_with_sources(
+                &provider.request_headers,
+                client.post(&url),
+                &payload,
+                sources,
+            ) {
+                Ok(builder) => builder,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
+            let mut req_builder =
+                provider.apply_streaming_request_headers(builder, credential.as_deref());
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
@@ -3296,6 +3673,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // forwarding upstream — seefor the OpenAI-compatible
             // remote-vs-local file path problem.
             let user_msg = ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: message_owned,
             };
@@ -3322,17 +3700,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     None => normalized_message_content,
                 };
                 messages.push(Message {
+                    content_sources: Vec::new(),
                     role: "user".to_string(),
                     content: Self::to_message_content("user", &content, !merge),
                 });
             } else {
                 if let Some(sys) = system_prompt_owned {
                     messages.push(Message {
+                        content_sources: Vec::new(),
                         role: "system".to_string(),
                         content: MessageContent::Text(sys),
                     });
                 }
                 messages.push(Message {
+                    content_sources: Vec::new(),
                     role: "user".to_string(),
                     content: Self::to_message_content("user", &normalized_message_content, !merge),
                 });
@@ -3367,10 +3748,27 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             // Build request with auth
-            let mut req_builder = provider.apply_streaming_request_headers(
-                client.post(&url).json(&request),
-                credential.as_deref(),
-            );
+            let builder = match request_with_sources(
+                &provider.request_headers,
+                client.post(&url),
+                &request,
+                projected_sources(
+                    request
+                        .messages
+                        .iter()
+                        .map(|message| &message.content_sources),
+                ),
+            ) {
+                Ok(builder) => builder,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
+            let mut req_builder =
+                provider.apply_streaming_request_headers(builder, credential.as_deref());
 
             // Apply auth header
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
@@ -3456,6 +3854,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let api_messages: Vec<Message> = effective_messages
                 .iter()
                 .map(|m| Message {
+                    content_sources: Self::text_sources(m, !merge),
                     role: m.role.clone(),
                     content: Self::to_message_content(&m.role, &m.content, !merge),
                 })
@@ -3489,10 +3888,27 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
             };
 
-            let mut req_builder = provider.apply_streaming_request_headers(
-                client.post(&url).json(&request),
-                credential.as_deref(),
-            );
+            let builder = match request_with_sources(
+                &provider.request_headers,
+                client.post(&url),
+                &request,
+                projected_sources(
+                    request
+                        .messages
+                        .iter()
+                        .map(|message| &message.content_sources),
+                ),
+            ) {
+                Ok(builder) => builder,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
+            let mut req_builder =
+                provider.apply_streaming_request_headers(builder, credential.as_deref());
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
@@ -3876,6 +4292,7 @@ mod tests {
         let req = NativeChatRequest {
             model: "gpt-4o".to_string(),
             messages: vec![NativeMessage {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("hello".to_string())),
                 tool_call_id: None,
@@ -3980,10 +4397,12 @@ mod tests {
             model: "llama-3.3-70b".to_string(),
             messages: vec![
                 Message {
+                    content_sources: Vec::new(),
                     role: "system".to_string(),
                     content: MessageContent::Text("You are ZeroClaw".to_string()),
                 },
                 Message {
+                    content_sources: Vec::new(),
                     role: "user".to_string(),
                     content: MessageContent::Text("hello".to_string()),
                 },
@@ -4654,6 +5073,7 @@ mod tests {
         // Role "tool" messages must include `name` when set; non-tool
         // messages and tool messages without a name must omit the key.
         let tool_with_name = NativeMessage {
+            content_sources: Vec::new(),
             role: "tool".to_string(),
             content: Some(MessageContent::Text("result".to_string())),
             tool_call_id: Some("call_1".to_string()),
@@ -4669,6 +5089,7 @@ mod tests {
         );
 
         let tool_without_name = NativeMessage {
+            content_sources: Vec::new(),
             role: "tool".to_string(),
             content: Some(MessageContent::Text("result".to_string())),
             tool_call_id: Some("call_2".to_string()),
@@ -4684,6 +5105,7 @@ mod tests {
         );
 
         let assistant_msg = NativeMessage {
+            content_sources: Vec::new(),
             role: "assistant".to_string(),
             content: Some(MessageContent::Text("hello".to_string())),
             tool_call_id: None,
@@ -5198,6 +5620,7 @@ mod tests {
         let path_str = path.to_string_lossy().into_owned();
 
         let msg = ChatMessage {
+            content_sources: Vec::new(),
             role: "user".into(),
             content: format!("Caption please [IMAGE:{}]", path_str),
         };
@@ -5239,6 +5662,7 @@ mod tests {
         let req = ApiChatRequest {
             model: "test-model".to_string(),
             messages: vec![Message {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: MessageContent::Text("What is the weather?".to_string()),
             }],
@@ -5263,6 +5687,7 @@ mod tests {
         let req = ApiChatRequest {
             model: "glm-5".to_string(),
             messages: vec![Message {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: MessageContent::Text("List /tmp".to_string()),
             }],
@@ -5298,6 +5723,7 @@ mod tests {
         let req = ApiChatRequest {
             model: "test-model".to_string(),
             messages: vec![Message {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: MessageContent::Text("List /tmp".to_string()),
             }],
@@ -5424,6 +5850,7 @@ mod tests {
     async fn chat_with_tools_without_key_attempts_request() {
         let p = make_model_provider("TestProvider", "http://127.0.0.1:1", None);
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "user".to_string(),
             content: "hello".to_string(),
         }];
@@ -6388,6 +6815,7 @@ mod tests {
     fn convert_messages_for_native_reasoning_content_serialized_only_when_present() {
         // Verify skip_serializing_if works: reasoning_content omitted from JSON when None
         let msg_without = NativeMessage {
+            content_sources: Vec::new(),
             role: "assistant".to_string(),
             content: Some(MessageContent::Text("hi".to_string())),
             tool_call_id: None,
@@ -6403,6 +6831,7 @@ mod tests {
         );
 
         let msg_with = NativeMessage {
+            content_sources: Vec::new(),
             role: "assistant".to_string(),
             content: Some(MessageContent::Text("hi".to_string())),
             tool_call_id: None,
@@ -6918,6 +7347,7 @@ mod tests {
     fn strip_native_tool_messages_drops_internal_pruning_markers_before_coalescing() {
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: ChatMessage::pruned_tool_exchange_summary(1),
             },
@@ -7054,6 +7484,7 @@ mod tests {
         ApiChatRequest {
             model: "any-model".to_string(),
             messages: vec![Message {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: MessageContent::Text("hi".to_string()),
             }],
@@ -7485,3 +7916,6 @@ mod tests {
         assert_eq!(native[1].tool_call_id.as_deref(), Some("fc_456"));
     }
 }
+
+#[cfg(test)]
+mod source_tests;

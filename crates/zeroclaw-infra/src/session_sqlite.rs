@@ -239,6 +239,7 @@ impl SessionBackend for SqliteSessionBackend {
             Ok(ChatMessage {
                 role: row.get(0)?,
                 content: row.get(1)?,
+                content_sources: Vec::new(),
             })
         }) {
             Ok(r) => r,
@@ -270,7 +271,11 @@ impl SessionBackend for SqliteSessionBackend {
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
             Ok(TimestampedMessage {
-                message: ChatMessage { role, content },
+                message: ChatMessage {
+                    role,
+                    content,
+                    content_sources: Vec::new(),
+                },
                 created_at,
             })
         }) {

@@ -2198,6 +2198,7 @@ mod tests {
         let mut messages = vec![ChatMessage::system("System")];
         for i in 0..5 {
             messages.push(ChatMessage {
+                content_sources: Vec::new(),
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("Message {i}"),
             });
@@ -2497,6 +2498,7 @@ mod tests {
                 r#"{"content":"","tool_calls":[{"id":"tool_1","name":"shell","arguments":"{}"}]}"#,
             ),
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "tool".to_string(),
                 content: "not valid json".to_string(),
             },
@@ -2519,6 +2521,7 @@ mod tests {
                 r#"{"content":"","tool_calls":[{"id":"tool_abc","name":"shell","arguments":"{}"}]}"#,
             ),
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "tool".to_string(),
                 content: "raw output with no json".to_string(),
             },
@@ -2658,6 +2661,7 @@ mod tests {
         let messages = vec![
             ChatMessage::user("Hello"),
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: String::new(),
             },

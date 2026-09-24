@@ -1925,6 +1925,7 @@ impl Agent {
             return Ok(());
         }
         first.content = new_prompt;
+        first.content_sources.clear();
         Ok(())
     }
 

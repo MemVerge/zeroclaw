@@ -4312,10 +4312,12 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn should_cache_conversation_short() {
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "system".to_string(),
                 content: "System prompt".to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: "Hello".to_string(),
             },
@@ -4329,12 +4331,14 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn should_cache_conversation_long() {
         let mut messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "system".to_string(),
             content: "System prompt".to_string(),
         }];
         // Add 3 non-system messages
         for i in 0..3 {
             messages.push(ChatMessage {
+                content_sources: Vec::new(),
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("Message {i}"),
             });
@@ -4345,6 +4349,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn should_cache_conversation_boundary() {
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "user".to_string(),
             content: "Hello".to_string(),
         }];
@@ -4356,10 +4361,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Add one more to cross boundary (>1)
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: "Hello".to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: "Hi".to_string(),
             },
@@ -4757,6 +4764,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_messages_small_system_prompt_uses_blocks_with_cache() {
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "system".to_string(),
             content: "Short system prompt".to_string(),
         }];
@@ -4782,6 +4790,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn convert_messages_large_system_prompt() {
         let large_content = "a".repeat(3073);
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "system".to_string(),
             content: large_content.clone(),
         }];
@@ -4871,18 +4880,22 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn convert_messages_preserves_multi_turn_history() {
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "system".to_string(),
                 content: "You are helpful.".to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: "gen a 2 sum in golang".to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: "```go\nfunc twoSum(nums []int) {}\n```".to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: "what's meaning of make here?".to_string(),
             },
@@ -5461,6 +5474,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_messages_with_image_marker_data_uri() {
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "user".to_string(),
             content: "Check this image: [IMAGE:data:image/jpeg;base64,/9j/4AAQ] What do you see?"
                 .to_string(),
@@ -5500,6 +5514,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_messages_with_only_image_marker() {
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "user".to_string(),
             content: "[IMAGE:data:image/png;base64,iVBORw0KGgo]".to_string(),
         }];
@@ -5529,6 +5544,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_messages_without_image_marker() {
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "user".to_string(),
             content: "Hello, how are you?".to_string(),
         }];
@@ -5573,14 +5589,17 @@ data: {\"type\":\"message_stop\"}\n\n";
         // followed by two separate tool result messages.
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "system".to_string(),
                 content: "You are helpful.".to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: "Do two things.".to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: serde_json::json!({
                     "content": "",
@@ -5592,6 +5611,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "tool".to_string(),
                 content: serde_json::json!({
                     "tool_call_id": "call_1",
@@ -5600,6 +5620,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "tool".to_string(),
                 content: serde_json::json!({
                     "tool_call_id": "call_2",
@@ -5767,10 +5788,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         // synthesize a stub tool_result so the history stays well-formed.
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: "Do a thing.".to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: serde_json::json!({
                     "content": "",
@@ -5781,6 +5804,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: "Actually, never mind.".to_string(),
             },
@@ -5822,10 +5846,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         // following message at all. A tool_result message must be appended.
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: "Do a thing.".to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: serde_json::json!({
                     "content": "",
@@ -5856,10 +5882,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         // same role, regardless of input ordering.
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: "Hello".to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: serde_json::json!({
                     "content": "I'll run a command",
@@ -5870,6 +5898,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "tool".to_string(),
                 content: serde_json::json!({
                     "tool_call_id": "tc1",
@@ -5878,6 +5907,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .to_string(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: "Thanks!".to_string(),
             },
