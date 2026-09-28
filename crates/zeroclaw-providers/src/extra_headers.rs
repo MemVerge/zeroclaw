@@ -66,7 +66,7 @@ impl ReservedHeaders {
         names: &["authorization"],
     };
 
-    fn contains(self, name: &str, additional: &[&str]) -> bool {
+    pub(crate) fn contains(self, name: &str, additional: &[&str]) -> bool {
         self.names
             .iter()
             .chain(BODY_FRAMING)

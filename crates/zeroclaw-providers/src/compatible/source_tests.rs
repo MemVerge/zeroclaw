@@ -71,6 +71,54 @@ fn native_projection_preserves_empty_blank_null_and_reasoning_tool_messages() {
 }
 
 #[test]
+fn native_projection_preserves_raw_envelope_sources() {
+    let text = "查\\\r\n\"结果\"";
+    for (role, value) in [
+        (
+            "assistant",
+            serde_json::json!({"content":text,"tool_calls":[]}),
+        ),
+        (
+            "assistant",
+            serde_json::json!({"content":text,"reasoning_content":"thinking"}),
+        ),
+        (
+            "tool",
+            serde_json::json!({"content":text,"tool_call_id":"call_1"}),
+        ),
+        (
+            "tool",
+            serde_json::json!({"status":"done","tool_call_id":"call_1"}),
+        ),
+    ] {
+        let content = value.to_string();
+        let expected = value
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&content)
+            .to_owned();
+        let message = ChatMessage {
+            content_sources: vec![source(7, MessageContentField::Text, 0..content.len())],
+            role: role.into(),
+            content,
+        };
+        let native = provider().convert_messages_for_native(&[message], true);
+        assert_eq!(
+            serde_json::to_value(&native[0]).unwrap()["content"],
+            expected
+        );
+        assert_eq!(
+            projected_sources(native.iter().map(|message| &message.content_sources)),
+            vec![ProjectedMessageSource {
+                source_id: 7,
+                message_index: 0,
+                range: 0..expected.len(),
+            }]
+        );
+    }
+}
+
+#[test]
 fn sources_follow_system_merge_media_conversion_and_assistant_coalescing() {
     let mut current = ChatMessage::user("  问题[IMAGE:https://example.com/a.png]尾巴  ");
     current.content_sources = vec![source(
@@ -137,6 +185,17 @@ async fn request_headers_follow_the_final_body_on_all_chat_paths() {
         observed_tx.send((body.clone(), spans.to_vec())).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("x-source-projection", HeaderValue::from_static("present"));
+        for (name, value) in [
+            ("authorization", "Bearer callback"),
+            ("x-api-key", "gateway-key"),
+            ("x-test-key", "callback-key"),
+            ("content-type", "text/plain"),
+            ("content-length", "1"),
+            ("host", "gateway.example"),
+            ("accept", "text/plain"),
+        ] {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
         Ok(headers)
     });
     let mut message = ChatMessage::user("host 当前");
@@ -159,8 +218,14 @@ async fn request_headers_follow_the_final_body_on_all_chat_paths() {
         "lookup",
         serde_json::json!({"type":"object","properties":{}}),
     )];
-    for openai in [false, true] {
-        for mode in 0..if openai { 3 } else { 6 } {
+    for (openai, auth_style, credential) in [
+        (false, AuthStyle::Bearer, Some("key")),
+        (true, AuthStyle::Bearer, Some("key")),
+        (false, AuthStyle::XApiKey, Some("key")),
+        (false, AuthStyle::Custom("x-test-key".into()), Some("key")),
+        (false, AuthStyle::Bearer, None),
+    ] {
+        for mode in 0..if openai { 3 } else { 8 } {
             let mut previous = None;
             for callback in [None, Some(callback.clone())] {
                 let tagged = callback.is_some();
@@ -168,7 +233,7 @@ async fn request_headers_follow_the_final_body_on_all_chat_paths() {
                     Box::new(
                         crate::openai::OpenAiModelProvider::builder("test")
                             .base_url(&base)
-                            .credential(Some("key"))
+                            .credential(credential)
                             .request_headers(callback)
                             .build(),
                     )
@@ -177,8 +242,8 @@ async fn request_headers_follow_the_final_body_on_all_chat_paths() {
                         OpenAiCompatibleModelProvider::builder("test")
                             .display_name("test")
                             .base_url(&base)
-                            .auth_style(AuthStyle::Bearer)
-                            .credential(Some("key"))
+                            .auth_style(auth_style.clone())
+                            .credential(credential)
                             .request_headers(callback)
                             .build(),
                     )
@@ -226,10 +291,29 @@ async fn request_headers_follow_the_final_body_on_all_chat_paths() {
                             .await;
                         assert!(results.iter().all(Result::is_ok));
                     }
-                    _ => {
+                    5 => {
                         let results = provider
                             .stream_chat_with_history(
                                 &messages,
+                                "test",
+                                None,
+                                StreamOptions::new(true),
+                            )
+                            .collect::<Vec<_>>()
+                            .await;
+                        assert!(results.iter().all(Result::is_ok));
+                    }
+                    6 => {
+                        provider
+                            .chat_with_system(Some("instruction"), "current", "test", None)
+                            .await
+                            .unwrap();
+                    }
+                    _ => {
+                        let results = provider
+                            .stream_chat_with_system(
+                                Some("instruction"),
+                                "current",
                                 "test",
                                 None,
                                 StreamOptions::new(true),
@@ -242,10 +326,50 @@ async fn request_headers_follow_the_final_body_on_all_chat_paths() {
                 let (headers, body, raw_body) = received.recv().await.unwrap();
                 if tagged {
                     assert_eq!(headers.get("x-source-projection").unwrap(), "present");
+                    assert_eq!(headers["content-type"], "application/json");
+                    assert_eq!(headers["content-length"], raw_body.len().to_string());
+                    assert_eq!(
+                        headers["host"],
+                        if openai {
+                            base.strip_prefix("http://").unwrap()
+                        } else {
+                            "gateway.example"
+                        }
+                    );
+                    assert_eq!(headers.get_all("accept").iter().count(), 1);
+                    assert_eq!(
+                        headers["accept"],
+                        if matches!(mode, 3..=5 | 7) {
+                            "text/event-stream"
+                        } else {
+                            "text/plain"
+                        }
+                    );
+                    for (name, callback_value) in [
+                        ("authorization", "Bearer callback"),
+                        ("x-api-key", "gateway-key"),
+                        ("x-test-key", "callback-key"),
+                    ] {
+                        let expected = if credential.is_some()
+                            && name == auth_style.credential_header_name()
+                        {
+                            if name == "authorization" {
+                                "Bearer key"
+                            } else {
+                                "key"
+                            }
+                        } else {
+                            callback_value
+                        };
+                        assert_eq!(headers.get_all(name).iter().count(), 1);
+                        assert_eq!(headers[name], expected);
+                    }
                     let (observed, spans) = observed_rx.recv().await.unwrap();
                     assert_eq!(observed, body);
                     assert_eq!(previous.as_ref(), Some(&raw_body));
-                    if openai && mode == 2 {
+                    if mode >= 6 {
+                        assert!(spans.is_empty());
+                    } else if openai && mode == 2 {
                         assert_eq!(
                             spans,
                             vec![ProjectedMessageSource {

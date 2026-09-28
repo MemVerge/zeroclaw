@@ -23,7 +23,10 @@ use zeroclaw_api::model_provider::{
     MessageContentField, MessageContentSource, ProjectedMessageSource,
 };
 
-/// Sources describe converted chat messages; callers replacing `messages` via
+/// Final-request headers for compatible/OpenAI Chat Completions, not Responses.
+/// Provider-owned headers are filtered as for `extra_headers`; callback errors
+/// abort the request. Sources use decoded UTF-8 coordinates in the final messages.
+/// Callers replacing `messages` via
 /// `extra_body` must derive source positions for that replacement instead.
 pub type RequestHeaders = std::sync::Arc<
     dyn Fn(&serde_json::Value, &[ProjectedMessageSource]) -> anyhow::Result<HeaderMap>
@@ -360,6 +363,7 @@ pub struct OpenAiCompatibleBuilder {
 }
 
 impl OpenAiCompatibleBuilder {
+    /// Set the opt-in Chat Completions callback described by [`RequestHeaders`].
     pub fn request_headers(mut self, callback: Option<RequestHeaders>) -> Self {
         self.request_headers = callback;
         self
@@ -835,11 +839,7 @@ impl OpenAiCompatibleModelProvider {
         credential: Option<&str>,
         additional: &[&str],
     ) -> HeaderMap {
-        let mut reserved = Vec::with_capacity(additional.len() + 1);
-        if credential.is_some() {
-            reserved.push(self.auth_header.credential_header_name());
-        }
-        reserved.extend_from_slice(additional);
+        let reserved = self.additional_reserved_headers(credential, additional);
 
         let mut headers = HeaderMap::new();
         if let Some(user_agent) = self.user_agent.as_deref()
@@ -855,6 +855,19 @@ impl OpenAiCompatibleModelProvider {
             headers.insert(name, value);
         }
         headers
+    }
+
+    fn additional_reserved_headers<'a>(
+        &'a self,
+        credential: Option<&str>,
+        additional: &[&'a str],
+    ) -> Vec<&'a str> {
+        let mut reserved = Vec::with_capacity(additional.len() + 1);
+        if credential.is_some() {
+            reserved.push(self.auth_header.credential_header_name());
+        }
+        reserved.extend_from_slice(additional);
+        reserved
     }
 
     fn apply_request_headers(
@@ -1089,7 +1102,7 @@ fn encoded_json_content_sources(message: &ChatMessage) -> Vec<MessageContentSour
         .collect()
 }
 
-fn decoded_json_content_sources(message: &ChatMessage) -> Vec<MessageContentSource> {
+pub fn decoded_json_content_sources(message: &ChatMessage) -> Vec<MessageContentSource> {
     let mut sources = message
         .content_sources
         .iter()
@@ -1132,6 +1145,8 @@ fn decoded_json_content_sources(message: &ChatMessage) -> Vec<MessageContentSour
 
 pub(crate) fn request_with_sources(
     callback: &Option<RequestHeaders>,
+    reserved: crate::extra_headers::ReservedHeaders,
+    additional_reserved: &[&str],
     builder: reqwest::RequestBuilder,
     request: &impl Serialize,
     sources: Vec<ProjectedMessageSource>,
@@ -1139,7 +1154,15 @@ pub(crate) fn request_with_sources(
     match callback {
         Some(callback) => {
             let body = serde_json::to_value(request)?;
-            let headers = callback(&body, &sources)?;
+            let mut headers = callback(&body, &sources)?;
+            let owned = headers
+                .keys()
+                .filter(|name| reserved.contains(name.as_str(), additional_reserved))
+                .cloned()
+                .collect::<Vec<_>>();
+            for name in owned {
+                headers.remove(name);
+            }
             Ok(builder.headers(headers).json(request))
         }
         None => Ok(builder.json(request)),
@@ -2346,16 +2369,15 @@ impl OpenAiCompatibleModelProvider {
         let Some(content) = content else {
             return Vec::new();
         };
-        let sources = message
-            .content_sources
-            .iter()
-            .filter(|source| source.field == MessageContentField::JsonContent)
-            .cloned()
-            .map(|mut source| {
-                source.field = MessageContentField::Text;
-                source
-            })
-            .collect::<Vec<_>>();
+        let sources = if value
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        {
+            decoded_json_content_sources(message)
+        } else {
+            Self::text_sources(message, false)
+        };
         match content {
             MessageContent::Text(text) if text.is_empty() => Vec::new(),
             MessageContent::Text(_) => sources,
@@ -3029,6 +3051,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .apply_auth_header(
                 request_with_sources(
                     &self.request_headers,
+                    crate::extra_headers::ReservedHeaders::COMPATIBLE,
+                    &self.additional_reserved_headers(credential.as_deref(), &[]),
                     self.http_client().post(&url),
                     &request,
                     projected_sources(
@@ -3130,6 +3154,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .apply_auth_header(
                 request_with_sources(
                     &self.request_headers,
+                    crate::extra_headers::ReservedHeaders::COMPATIBLE,
+                    &self.additional_reserved_headers(credential.as_deref(), &[]),
                     self.http_client().post(&url),
                     &request,
                     projected_sources(
@@ -3221,6 +3247,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .apply_auth_header(
                 request_with_sources(
                     &self.request_headers,
+                    crate::extra_headers::ReservedHeaders::COMPATIBLE,
+                    &self.additional_reserved_headers(credential.as_deref(), &[]),
                     self.http_client().post(&url),
                     &request,
                     projected_sources(
@@ -3355,6 +3383,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .apply_auth_header(
                 request_with_sources(
                     &self.request_headers,
+                    crate::extra_headers::ReservedHeaders::COMPATIBLE,
+                    &self.additional_reserved_headers(credential.as_deref(), &[]),
                     self.http_client().post(&url),
                     &native_request,
                     projected_sources(
@@ -3587,6 +3617,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let builder = match request_with_sources(
                 &provider.request_headers,
+                crate::extra_headers::ReservedHeaders::COMPATIBLE,
+                &provider.additional_reserved_headers(credential.as_deref(), &["accept"]),
                 client.post(&url),
                 &payload,
                 sources,
@@ -3750,6 +3782,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // Build request with auth
             let builder = match request_with_sources(
                 &provider.request_headers,
+                crate::extra_headers::ReservedHeaders::COMPATIBLE,
+                &provider.additional_reserved_headers(credential.as_deref(), &["accept"]),
                 client.post(&url),
                 &request,
                 projected_sources(
@@ -3890,6 +3924,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let builder = match request_with_sources(
                 &provider.request_headers,
+                crate::extra_headers::ReservedHeaders::COMPATIBLE,
+                &provider.additional_reserved_headers(credential.as_deref(), &["accept"]),
                 client.post(&url),
                 &request,
                 projected_sources(

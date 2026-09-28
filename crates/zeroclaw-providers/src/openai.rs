@@ -1,5 +1,6 @@
 use crate::compatible::{
-    OpenAiCompatibleModelProvider, RequestHeaders, projected_sources, request_with_sources,
+    OpenAiCompatibleModelProvider, RequestHeaders, decoded_json_content_sources, projected_sources,
+    request_with_sources,
 };
 use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
@@ -18,7 +19,7 @@ use futures_util::stream;
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use zeroclaw_api::model_provider::{MessageContentField, MessageContentSource};
+use zeroclaw_api::model_provider::MessageContentSource;
 use zeroclaw_api::tool::ToolSpec;
 
 /// OpenAI's public API endpoint.
@@ -246,6 +247,8 @@ pub struct OpenAiBuilder {
 }
 
 impl OpenAiBuilder {
+    /// Set the opt-in Chat Completions callback described by [`RequestHeaders`].
+    /// This does not enable source projection on [`OpenAiResponsesModelProvider`].
     pub fn request_headers(mut self, callback: Option<RequestHeaders>) -> Self {
         self.request_headers = callback;
         self
@@ -418,15 +421,7 @@ impl OpenAiModelProvider {
                         .map(ToString::to_string);
                     return NativeMessage {
                         content_sources: if content.is_some() {
-                            m.content_sources
-                                .iter()
-                                .filter(|source| source.field == MessageContentField::JsonContent)
-                                .cloned()
-                                .map(|mut source| {
-                                    source.field = MessageContentField::Text;
-                                    source
-                                })
-                                .collect()
+                            decoded_json_content_sources(m)
                         } else {
                             Vec::new()
                         },
@@ -451,15 +446,7 @@ impl OpenAiModelProvider {
                         .map(ToString::to_string);
                     return NativeMessage {
                         content_sources: if content.is_some() {
-                            m.content_sources
-                                .iter()
-                                .filter(|source| source.field == MessageContentField::JsonContent)
-                                .cloned()
-                                .map(|mut source| {
-                                    source.field = MessageContentField::Text;
-                                    source
-                                })
-                                .collect()
+                            decoded_json_content_sources(m)
                         } else {
                             Vec::new()
                         },
@@ -537,6 +524,8 @@ impl OpenAiModelProvider {
         let response = crate::extra_headers::apply_extra_headers(
             request_with_sources(
                 &self.request_headers,
+                crate::extra_headers::ReservedHeaders::OPENAI,
+                &[],
                 self.http_client()
                     .post(format!("{}/chat/completions", self.base_url))
                     .header("Authorization", format!("Bearer {credential}")),
@@ -703,6 +692,8 @@ impl ModelProvider for OpenAiModelProvider {
         let response = crate::extra_headers::apply_extra_headers(
             request_with_sources(
                 &self.request_headers,
+                crate::extra_headers::ReservedHeaders::OPENAI,
+                &[],
                 self.http_client()
                     .post(format!("{}/chat/completions", self.base_url))
                     .header("Authorization", format!("Bearer {credential}")),
@@ -802,6 +793,8 @@ impl ModelProvider for OpenAiModelProvider {
         let response = crate::extra_headers::apply_extra_headers(
             request_with_sources(
                 &self.request_headers,
+                crate::extra_headers::ReservedHeaders::OPENAI,
+                &[],
                 self.http_client()
                     .post(format!("{}/chat/completions", self.base_url))
                     .header("Authorization", format!("Bearer {credential}")),
@@ -2603,6 +2596,44 @@ mod tests {
         let native = OpenAiModelProvider::convert_messages(&messages);
         let tool_calls = native[0].tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn convert_messages_preserves_raw_envelope_sources() {
+        use zeroclaw_api::model_provider::MessageContentField;
+
+        let text = "查\\\r\n\"结果\"";
+        for (role, value) in [
+            (
+                "assistant",
+                serde_json::json!({"content":text,"tool_calls":[]}),
+            ),
+            (
+                "tool",
+                serde_json::json!({"content":text,"tool_call_id":"call_1"}),
+            ),
+        ] {
+            let content = value.to_string();
+            let message = ChatMessage {
+                content_sources: vec![MessageContentSource {
+                    source_id: 7,
+                    field: MessageContentField::Text,
+                    range: 0..content.len(),
+                }],
+                role: role.into(),
+                content,
+            };
+            let native = OpenAiModelProvider::convert_messages(&[message]);
+            assert_eq!(native[0].content.as_deref(), Some(text));
+            assert_eq!(
+                native[0].content_sources,
+                vec![MessageContentSource {
+                    source_id: 7,
+                    field: MessageContentField::Text,
+                    range: 0..text.len(),
+                }]
+            );
+        }
     }
 
     #[test]
