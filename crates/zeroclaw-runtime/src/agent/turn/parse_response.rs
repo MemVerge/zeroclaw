@@ -116,6 +116,25 @@ pub(crate) struct InterpretedResponse {
     pub(crate) input_tokens: Option<u64>,
 }
 
+fn parse_native_tool_call(call: &ToolCall) -> Result<ParsedToolCall, String> {
+    let arguments =
+        serde_json::from_str::<serde_json::Value>(&call.arguments).map_err(|error| {
+            format!(
+                "native tool call '{}' has invalid JSON arguments: {error}",
+                call.name
+            )
+        })?;
+    Ok(ParsedToolCall {
+        name: call.name.clone(),
+        arguments,
+        tool_call_id: Some(call.id.clone()),
+    })
+}
+
+fn parse_native_tool_calls(tool_calls: &[ToolCall]) -> Result<Vec<ParsedToolCall>, String> {
+    tool_calls.iter().map(parse_native_tool_call).collect()
+}
+
 /// Interpret a successful chat response. Takes the response by value and
 /// holds no borrows of `ctx` past the call (RUN_SHEET `turn.parse_response`).
 pub(crate) async fn interpret_chat_response(
@@ -177,22 +196,18 @@ pub(crate) async fn interpret_chat_response(
     // Fall back to text-based parsing (XML tags, markdown blocks,
     // GLM format) only if the model_provider returned no native calls —
     // this ensures we support both native and prompt-guided models.
-    let mut calls: Vec<ParsedToolCall> = if specs.tool_specs.is_empty() {
-        Vec::new()
+    let (mut calls, native_parse_issue) = if specs.tool_specs.is_empty() {
+        (Vec::new(), None)
     } else {
-        resp.tool_calls
-            .iter()
-            .map(|call| ParsedToolCall {
-                name: call.name.clone(),
-                arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
-                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-                tool_call_id: Some(call.id.clone()),
-            })
-            .collect()
+        match parse_native_tool_calls(&resp.tool_calls) {
+            Ok(calls) => (calls, None),
+            Err(issue) => (Vec::new(), Some(issue)),
+        }
     };
     let mut parsed_text = String::new();
 
     if calls.is_empty()
+        && resp.tool_calls.is_empty()
         && !specs.tool_specs.is_empty()
         && !ctx.strict_tool_parsing
         && !looks_like_tool_protocol_example(&response_text)
@@ -212,7 +227,7 @@ pub(crate) async fn interpret_chat_response(
         calls = filtered_calls;
     }
 
-    let parse_issue = if ctx.strict_tool_parsing {
+    let protocol_parse_issue = if ctx.strict_tool_parsing {
         None
     } else if specs.tool_specs.is_empty() {
         // Knob-gated (embedders return model text verbatim); a live stream
@@ -238,6 +253,7 @@ pub(crate) async fn interpret_chat_response(
             })
         })
     };
+    let parse_issue = native_parse_issue.or(protocol_parse_issue);
     if let Some(ref issue) = parse_issue {
         ::zeroclaw_log::record!(
             WARN,
@@ -311,8 +327,40 @@ pub(crate) async fn interpret_chat_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_native_assistant_history, unforwarded_narration};
+    use super::{build_native_assistant_history, parse_native_tool_calls, unforwarded_narration};
     use zeroclaw_providers::ToolCall;
+
+    #[test]
+    fn invalid_native_tool_arguments_are_rejected_instead_of_defaulting_to_empty_object() {
+        let calls = vec![ToolCall {
+            id: "toolu_1".to_string(),
+            name: "run_javascript".to_string(),
+            arguments: r#"{"code":"const value ="#.to_string(),
+            extra_content: None,
+        }];
+
+        let error = parse_native_tool_calls(&calls).unwrap_err();
+
+        assert!(error.contains("run_javascript"));
+        assert!(error.contains("invalid JSON arguments"));
+    }
+
+    #[test]
+    fn valid_native_tool_arguments_preserve_the_provider_call_id() {
+        let calls = vec![ToolCall {
+            id: "toolu_1".to_string(),
+            name: "search".to_string(),
+            arguments: r#"{"query":"MemBox"}"#.to_string(),
+            extra_content: None,
+        }];
+
+        let parsed = parse_native_tool_calls(&calls).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "search");
+        assert_eq!(parsed[0].arguments["query"], "MemBox");
+        assert_eq!(parsed[0].tool_call_id.as_deref(), Some("toolu_1"));
+    }
 
     #[test]
     fn native_assistant_history_preserves_tool_call_extra_content() {
