@@ -1759,6 +1759,7 @@ impl AnthropicModelProvider {
     async fn parse_anthropic_sse(
         response: reqwest::Response,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+        emit_tool_input_liveness: bool,
     ) {
         use tokio_util::io::StreamReader;
 
@@ -1766,14 +1767,26 @@ impl AnthropicModelProvider {
             .bytes_stream()
             .map(|result| result.map_err(std::io::Error::other));
         let reader = StreamReader::new(byte_stream);
-        Self::parse_anthropic_sse_from_reader(reader, tx).await;
+        Self::parse_anthropic_sse_from_reader_with_liveness(reader, tx, emit_tool_input_liveness)
+            .await;
     }
 
     /// Inner loop split out of `parse_anthropic_sse` so unit tests can feed a
     /// `Cursor<&[u8]>` directly without spinning up a mock HTTP server.
+    #[cfg(test)]
     async fn parse_anthropic_sse_from_reader<R>(
         reader: R,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+    ) where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        Self::parse_anthropic_sse_from_reader_with_liveness(reader, tx, false).await;
+    }
+
+    async fn parse_anthropic_sse_from_reader_with_liveness<R>(
+        reader: R,
+        tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+        emit_tool_input_liveness: bool,
     ) where
         R: tokio::io::AsyncBufRead + Unpin,
     {
@@ -1978,12 +1991,13 @@ impl AnthropicModelProvider {
                                     // potentially invalid tool input as assistant text. Empty
                                     // text deltas are ignored by the runtime but reset caller
                                     // idle timers while eager tool input is being generated.
-                                    if tx
-                                        .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
-                                            String::new(),
-                                        ))))
-                                        .await
-                                        .is_err()
+                                    if emit_tool_input_liveness
+                                        && tx
+                                            .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                                                String::new(),
+                                            ))))
+                                            .await
+                                            .is_err()
                                     {
                                         return;
                                     }
@@ -2569,6 +2583,7 @@ impl ModelProvider for AnthropicModelProvider {
         let is_oauth = Self::is_setup_token(&credential);
         let extra_headers = self.extra_headers.clone();
         let response_observer = self.response_observer.clone();
+        let emit_tool_input_liveness = self.eager_input_streaming;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -2629,7 +2644,7 @@ impl ModelProvider for AnthropicModelProvider {
                 return;
             }
 
-            Self::parse_anthropic_sse(response, &tx).await;
+            Self::parse_anthropic_sse(response, &tx, emit_tool_input_liveness).await;
         });
 
         // The guard travels inside the unfold state so it is dropped at the
@@ -2802,7 +2817,8 @@ data: {\"type\":\"message_stop\"}\n\n"
 
         let reader = tokio::io::BufReader::new(Cursor::new(fake_eager_tool_input_sse()));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
-        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        AnthropicModelProvider::parse_anthropic_sse_from_reader_with_liveness(reader, &tx, true)
+            .await;
 
         let mut liveness_chunks = 0;
         let mut tool_call = None;
@@ -2819,6 +2835,24 @@ data: {\"type\":\"message_stop\"}\n\n"
             tool_call.expect("completed tool call").arguments,
             r#"{"code":"return 1;"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn default_streaming_tool_input_does_not_emit_liveness_chunks() {
+        use std::io::Cursor;
+
+        let reader = tokio::io::BufReader::new(Cursor::new(fake_eager_tool_input_sse()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.expect("valid stream event"));
+        }
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], StreamEvent::ToolCall(_)));
+        assert!(matches!(events[1], StreamEvent::Final { .. }));
     }
 
     #[tokio::test]
