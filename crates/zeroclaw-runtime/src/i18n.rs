@@ -594,6 +594,16 @@ mod tests {
     fn channel_runtime_committed_cli_catalogs_format_from_fluent() {
         let cases = [
             (
+                "turn-malformed-tool-content-filtered",
+                &[][..],
+                [].as_slice(),
+            ),
+            (
+                "turn-malformed-tool-output-truncated",
+                &[][..],
+                [].as_slice(),
+            ),
+            (
                 "channel-runtime-malformed-tool-output",
                 &[][..],
                 [].as_slice(),

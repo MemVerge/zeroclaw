@@ -13,10 +13,12 @@ use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
 use std::time::{Duration, Instant};
+use zeroclaw_api::StopReason;
 use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider, ProviderDispatch};
 
 pub(crate) struct ProviderCallOutcome {
     pub(crate) chat_result: Result<ChatResponse>,
+    pub(crate) stop_reason: StopReason,
     pub(crate) streamed_live_deltas: bool,
     pub(crate) streamed_protocol_suppressed: bool,
     pub(crate) streamed_visible_text: String,
@@ -154,6 +156,7 @@ pub(crate) async fn call_provider(
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();
+    let mut stop_reason = StopReason::Unspecified;
 
     let chat_result = if should_consume_provider_stream {
         // Attribution is opened by ProviderDispatch::from_ref(...).stream_chat
@@ -172,6 +175,7 @@ pub(crate) async fn call_provider(
         );
         match stream_future.await {
             Ok(streamed) => {
+                stop_reason = streamed.stop.clone();
                 streamed_live_deltas = streamed.forwarded_live_deltas;
                 streamed_protocol_suppressed = streamed.suppressed_protocol;
                 streamed_visible_text = streamed.forwarded_visible_text;
@@ -294,6 +298,7 @@ pub(crate) async fn call_provider(
 
     Ok(ProviderCallOutcome {
         chat_result,
+        stop_reason,
         streamed_live_deltas,
         streamed_protocol_suppressed,
         streamed_visible_text,
@@ -310,8 +315,8 @@ mod stream_failure_tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
-    use zeroclaw_api::agent::TurnEvent;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::{StopReason, agent::TurnEvent};
     use zeroclaw_config::schema::PacingConfig;
     use zeroclaw_providers::traits::{
         StreamChunk, StreamError, StreamEvent, StreamOptions, StreamResult,
@@ -320,6 +325,7 @@ mod stream_failure_tests {
 
     #[derive(Clone, Copy)]
     enum StreamScenario {
+        CompleteContentFiltered,
         FailBeforeOutput,
         FailAfterReasoning,
         WaitForCancellation,
@@ -370,6 +376,11 @@ mod stream_failure_tests {
             _options: StreamOptions,
         ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
             match self.stream_scenario {
+                StreamScenario::CompleteContentFiltered => {
+                    Box::pin(futures_util::stream::iter(vec![Ok(StreamEvent::Final {
+                        stop: StopReason::ContentFiltered,
+                    })]))
+                }
                 StreamScenario::FailBeforeOutput => {
                     Box::pin(futures_util::stream::iter(vec![Err(
                         StreamError::ModelProvider("stream failed".to_string()),
@@ -386,6 +397,35 @@ mod stream_failure_tests {
                 ])),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn successful_stream_preserves_content_filtered_stop_reason() {
+        let provider = ScriptedStreamProvider {
+            chat_calls: AtomicUsize::new(0),
+            stream_scenario: StreamScenario::CompleteContentFiltered,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = test_ctx(&observer, &pacing);
+        let messages = [ChatMessage::user("hello")];
+
+        let outcome = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &messages,
+            None,
+            true,
+            StreamFailureBehavior::ReturnError,
+            0,
+        )
+        .await
+        .expect("provider dispatch should complete");
+
+        assert!(outcome.chat_result.is_ok());
+        assert_eq!(outcome.stop_reason, StopReason::ContentFiltered);
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
     }
 
     impl Attributable for ScriptedStreamProvider {

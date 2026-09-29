@@ -3188,7 +3188,10 @@ mod tests {
 
     const BLANK_TURN_ERROR: &str = "empty user message: refusing to dispatch a blank turn";
 
-    fn blank_input_agent(model_provider: Box<dyn ModelProvider>) -> Agent {
+    fn basic_test_agent(
+        model_provider: Box<dyn ModelProvider>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> Agent {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
             ..zeroclaw_config::schema::MemoryConfig::default()
@@ -3200,13 +3203,17 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         Agent::builder()
             .model_provider(model_provider)
-            .tools(Vec::new())
+            .tools(tools)
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
             .expect("agent builder should succeed with valid config")
+    }
+
+    fn blank_input_agent(model_provider: Box<dyn ModelProvider>) -> Agent {
+        basic_test_agent(model_provider, Vec::new())
     }
 
     #[tokio::test]
@@ -4185,6 +4192,170 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    struct MalformedStoppedToolStreamProvider {
+        calls: Arc<AtomicUsize>,
+        stop_reason: zeroclaw_api::StopReason,
+    }
+
+    #[async_trait]
+    impl ModelProvider for MalformedStoppedToolStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unexpected non-streaming provider call")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            anyhow::bail!("unexpected non-streaming provider call")
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::StreamExt as _;
+
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                return futures_util::stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                        zeroclaw_providers::traits::StreamChunk::delta(
+                            "Recovered after invalid tool input",
+                        ),
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final {
+                        stop: zeroclaw_api::StopReason::Complete,
+                    }),
+                ])
+                .boxed();
+            }
+            futures_util::stream::iter(vec![
+                Ok(zeroclaw_providers::traits::StreamEvent::ToolCall(
+                    zeroclaw_providers::ToolCall {
+                        id: "toolu_incomplete".into(),
+                        name: "echo".into(),
+                        arguments: r#"{"value":"unfinished"#.into(),
+                        extra_content: None,
+                    },
+                )),
+                Ok(zeroclaw_providers::traits::StreamEvent::Final {
+                    stop: self.stop_reason.clone(),
+                }),
+            ])
+            .boxed()
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MalformedStoppedToolStreamProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "MalformedStoppedToolStreamProvider"
+        }
+    }
+
+    fn malformed_stopped_tool_agent(
+        stop_reason: zeroclaw_api::StopReason,
+    ) -> (Agent, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let provider = MalformedStoppedToolStreamProvider {
+            calls: Arc::clone(&provider_calls),
+            stop_reason,
+        };
+        let tool = CountingTool {
+            calls: Arc::clone(&tool_calls),
+        };
+        let agent = basic_test_agent(Box::new(provider), vec![Box::new(tool)]);
+        (agent, provider_calls, tool_calls)
+    }
+
+    async fn assert_malformed_stream_stop_is_terminal(
+        stop_reason: zeroclaw_api::StopReason,
+        message_key: &str,
+    ) {
+        let (mut agent, provider_calls, tool_calls) = malformed_stopped_tool_agent(stop_reason);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+
+        let error = agent
+            .turn_streamed("use the echo tool", event_tx, None)
+            .await
+            .expect_err("terminal stop reason must reject incomplete tool input");
+
+        assert_eq!(
+            error.to_string(),
+            crate::i18n::get_required_cli_string(message_key)
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn content_filter_does_not_retry_malformed_streamed_tool_input() {
+        assert_malformed_stream_stop_is_terminal(
+            zeroclaw_api::StopReason::ContentFiltered,
+            "turn-malformed-tool-content-filtered",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn output_truncation_does_not_retry_malformed_streamed_tool_input() {
+        assert_malformed_stream_stop_is_terminal(
+            zeroclaw_api::StopReason::OutputTruncated,
+            "turn-malformed-tool-output-truncated",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tool_use_stop_still_retries_malformed_streamed_tool_input() {
+        let (mut agent, provider_calls, tool_calls) =
+            malformed_stopped_tool_agent(zeroclaw_api::StopReason::ToolUse);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+
+        let (response, _) = agent
+            .turn_streamed("use the echo tool", event_tx, None)
+            .await
+            .expect("tool-use stop should retain malformed-tool recovery");
+
+        assert_eq!(response, "Recovered after invalid tool input");
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

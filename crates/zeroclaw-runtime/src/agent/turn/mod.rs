@@ -75,14 +75,23 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-use zeroclaw_api::GracefulStopReason;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
+use zeroclaw_api::{GracefulStopReason, StopReason};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 
 /// Maximum malformed internal tool-protocol retries before returning a safe fallback.
 pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
+
+fn terminal_malformed_tool_message(stop_reason: &StopReason) -> Option<String> {
+    let message_key = match stop_reason {
+        StopReason::ContentFiltered => "turn-malformed-tool-content-filtered",
+        StopReason::OutputTruncated => "turn-malformed-tool-output-truncated",
+        _ => return None,
+    };
+    Some(crate::i18n::get_required_cli_string(message_key))
+}
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
@@ -744,6 +753,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let ProviderCallOutcome {
             chat_result,
+            stop_reason,
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
@@ -850,6 +860,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Native provider tool_calls are converted into parsed `tool_calls`
         // above; if this branch is reached there is no valid native call to run.
         if tool_calls.is_empty() && parse_issue_detected {
+            if let Some(message) = terminal_malformed_tool_message(&stop_reason) {
+                anyhow::bail!(message);
+            }
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
