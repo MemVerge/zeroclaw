@@ -397,6 +397,8 @@ enum NativeContentOut {
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(skip_serializing_if = "is_false")]
+        is_error: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -1217,11 +1219,16 @@ impl AnthropicModelProvider {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string();
+        let is_error = value
+            .get("is_error")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         Some(NativeMessage {
             role: "user".to_string(),
             content: vec![NativeContentOut::ToolResult {
                 tool_use_id,
                 content: result,
+                is_error,
                 cache_control: None,
             }],
         })
@@ -1455,11 +1462,13 @@ impl AnthropicModelProvider {
                 NativeContentOut::ToolResult {
                     tool_use_id,
                     content,
+                    is_error,
                     cache_control,
                 } if declared_ids.contains(&tool_use_id) => {
                     matched_results.push(NativeContentOut::ToolResult {
                         tool_use_id,
                         content,
+                        is_error,
                         cache_control,
                     });
                 }
@@ -1529,6 +1538,7 @@ impl AnthropicModelProvider {
                     content: "[tool result missing from history — the turn was \
                               interrupted before this tool finished]"
                         .to_string(),
+                    is_error: true,
                     cache_control: None,
                 })
                 .collect();
@@ -1964,6 +1974,19 @@ impl AnthropicModelProvider {
                                     delta.get("partial_json").and_then(|j| j.as_str())
                                 {
                                     tool_input_json.push_str(json);
+                                    // Surface transport activity without exposing partial,
+                                    // potentially invalid tool input as assistant text. Empty
+                                    // text deltas are ignored by the runtime but reset caller
+                                    // idle timers while eager tool input is being generated.
+                                    if tx
+                                        .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                                            String::new(),
+                                        ))))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                             "thinking_delta" => {
@@ -2758,6 +2781,44 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":5}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    fn fake_eager_tool_input_sse() -> &'static [u8] {
+        b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"run_javascript\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"code\\\":\\\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"return 1;\\\"}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_input_deltas_emit_invisible_liveness_chunks() {
+        use std::io::Cursor;
+
+        let reader = tokio::io::BufReader::new(Cursor::new(fake_eager_tool_input_sse()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut liveness_chunks = 0;
+        let mut tool_call = None;
+        while let Ok(event) = rx.try_recv() {
+            match event.expect("valid stream event") {
+                StreamEvent::TextDelta(chunk) if chunk.delta.is_empty() => liveness_chunks += 1,
+                StreamEvent::ToolCall(call) => tool_call = Some(call),
+                _ => {}
+            }
+        }
+
+        assert_eq!(liveness_chunks, 2);
+        assert_eq!(
+            tool_call.expect("completed tool call").arguments,
+            r#"{"code":"return 1;"}"#
+        );
     }
 
     #[tokio::test]
@@ -4114,6 +4175,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let content = NativeContentOut::ToolResult {
             tool_use_id: "tool_123".to_string(),
             content: "Result data".to_string(),
+            is_error: false,
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&content).unwrap();
@@ -4121,6 +4183,65 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(json.contains("tool_123"));
         assert!(json.contains("Result data"));
         assert!(json.contains(r#""cache_control":{"type":"ephemeral"}"#));
+    }
+
+    #[test]
+    fn malformed_tool_result_serializes_anthropic_error_flag() {
+        let content = NativeContentOut::ToolResult {
+            tool_use_id: "tool_123".to_string(),
+            content: r#"{"INVALID_JSON":"{"}"#.to_string(),
+            is_error: true,
+            cache_control: None,
+        };
+
+        let json = serde_json::to_value(content).unwrap();
+
+        assert_eq!(json["is_error"], true);
+        assert_eq!(json["tool_use_id"], "tool_123");
+    }
+
+    #[test]
+    fn convert_messages_preserves_malformed_tool_result_as_provider_error() {
+        let invalid_arguments = r#"{"value":"unfinished"#;
+        let messages = vec![
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "toolu_bad",
+                        "name": "counter",
+                        "arguments": invalid_arguments,
+                    }],
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "toolu_bad",
+                    "content": serde_json::json!({"INVALID_JSON": invalid_arguments}).to_string(),
+                    "is_error": true,
+                })
+                .to_string(),
+            ),
+        ];
+
+        let (_, native_messages) = AnthropicModelProvider::convert_messages(&messages);
+
+        assert_eq!(native_messages.len(), 2);
+        assert!(matches!(
+            &native_messages[0].content[0],
+            NativeContentOut::ToolUse { id, input, .. }
+                if id == "toolu_bad" && input == &serde_json::json!({})
+        ));
+        assert!(matches!(
+            &native_messages[1].content[0],
+            NativeContentOut::ToolResult {
+                tool_use_id,
+                content,
+                is_error: true,
+                ..
+            } if tool_use_id == "toolu_bad" && content.contains("INVALID_JSON")
+        ));
     }
 
     #[test]
@@ -4402,6 +4523,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             content: vec![NativeContentOut::ToolResult {
                 tool_use_id: "tool_123".to_string(),
                 content: "Result".to_string(),
+                is_error: false,
                 cache_control: None,
             }],
         }];
