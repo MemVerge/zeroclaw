@@ -864,8 +864,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             );
 
             if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
-                // This is model feedback, not a tool result: malformed protocol
-                // output has no valid tool_call_id to attach a role=tool message to.
+                // This is model feedback, not a tool result: the malformed
+                // assistant response is omitted from history, so a role=tool
+                // message would have no preceding tool call to reference even
+                // when the provider supplied an ID.
                 let msg = ChatMessage::user(
                     "[Tool call parse error]\n\
                      Your previous response looked like an internal tool-call protocol payload, \
