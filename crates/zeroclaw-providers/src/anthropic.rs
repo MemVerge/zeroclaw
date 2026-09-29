@@ -140,6 +140,9 @@ pub struct AnthropicModelProvider {
     /// Serialized verbatim as Anthropic's top-level `output_config.effort`.
     /// Independent of per-request thinking.
     reasoning_effort: Option<String>,
+    /// Stream tool-input deltas as they are generated instead of waiting for
+    /// Anthropic to buffer and validate the complete JSON object.
+    eager_input_streaming: bool,
     /// Caller-supplied headers stamped on every request (validated once at
     /// build time; see `extra_headers`). Applied per request rather than as
     /// client default headers so the pooled runtime proxy client stays shared.
@@ -394,6 +397,8 @@ enum NativeContentOut {
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(skip_serializing_if = "is_false")]
+        is_error: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -454,8 +459,14 @@ struct NativeToolSpec {
     /// is required — serialized transparently, deep-cloned only for schemas
     /// the Anthropic cleaner actually rewrites
     input_schema: std::sync::Arc<serde_json::Value>,
+    #[serde(skip_serializing_if = "is_false")]
+    eager_input_streaming: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -550,6 +561,7 @@ pub struct AnthropicBuilder {
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     reasoning_effort: Option<String>,
+    eager_input_streaming: bool,
     extra_headers: std::collections::HashMap<String, String>,
     response_observer: Option<ResponseMetadataObserver>,
 }
@@ -602,6 +614,13 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Ask Anthropic to stream tool input without server-side JSON buffering.
+    /// Callers enabling this must reject malformed accumulated arguments.
+    pub fn eager_input_streaming(mut self) -> Self {
+        self.eager_input_streaming = true;
+        self
+    }
+
     /// Extra HTTP headers to send on every request, e.g. a host's per-turn
     /// correlation tags. Invalid entries are skipped with a warning, as on the
     /// compatible provider; names this provider sets itself (`x-api-key`,
@@ -626,6 +645,7 @@ impl AnthropicBuilder {
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             reasoning_effort: self.reasoning_effort,
+            eager_input_streaming: self.eager_input_streaming,
             extra_headers: crate::extra_headers::typed_extra_headers(
                 &self.extra_headers,
                 crate::extra_headers::ReservedHeaders::ANTHROPIC,
@@ -646,6 +666,7 @@ impl AnthropicModelProvider {
             max_tokens: None,
             timeout_secs: None,
             reasoning_effort: None,
+            eager_input_streaming: false,
             extra_headers: std::collections::HashMap::new(),
             response_observer: None,
         }
@@ -1129,7 +1150,7 @@ impl AnthropicModelProvider {
         blocks
     }
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
+    fn convert_tools(&self, tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
             return None;
@@ -1143,6 +1164,7 @@ impl AnthropicModelProvider {
                     &tool.parameters,
                     zeroclaw_api::schema::CleaningStrategy::Anthropic,
                 ),
+                eager_input_streaming: self.eager_input_streaming,
                 cache_control: None,
             })
             .collect();
@@ -1197,11 +1219,16 @@ impl AnthropicModelProvider {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string();
+        let is_error = value
+            .get("is_error")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         Some(NativeMessage {
             role: "user".to_string(),
             content: vec![NativeContentOut::ToolResult {
                 tool_use_id,
                 content: result,
+                is_error,
                 cache_control: None,
             }],
         })
@@ -1435,11 +1462,13 @@ impl AnthropicModelProvider {
                 NativeContentOut::ToolResult {
                     tool_use_id,
                     content,
+                    is_error,
                     cache_control,
                 } if declared_ids.contains(&tool_use_id) => {
                     matched_results.push(NativeContentOut::ToolResult {
                         tool_use_id,
                         content,
+                        is_error,
                         cache_control,
                     });
                 }
@@ -1509,6 +1538,7 @@ impl AnthropicModelProvider {
                     content: "[tool result missing from history — the turn was \
                               interrupted before this tool finished]"
                         .to_string(),
+                    is_error: true,
                     cache_control: None,
                 })
                 .collect();
@@ -1729,6 +1759,7 @@ impl AnthropicModelProvider {
     async fn parse_anthropic_sse(
         response: reqwest::Response,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+        emit_tool_input_liveness: bool,
     ) {
         use tokio_util::io::StreamReader;
 
@@ -1736,14 +1767,26 @@ impl AnthropicModelProvider {
             .bytes_stream()
             .map(|result| result.map_err(std::io::Error::other));
         let reader = StreamReader::new(byte_stream);
-        Self::parse_anthropic_sse_from_reader(reader, tx).await;
+        Self::parse_anthropic_sse_from_reader_with_liveness(reader, tx, emit_tool_input_liveness)
+            .await;
     }
 
     /// Inner loop split out of `parse_anthropic_sse` so unit tests can feed a
     /// `Cursor<&[u8]>` directly without spinning up a mock HTTP server.
+    #[cfg(test)]
     async fn parse_anthropic_sse_from_reader<R>(
         reader: R,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+    ) where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        Self::parse_anthropic_sse_from_reader_with_liveness(reader, tx, false).await;
+    }
+
+    async fn parse_anthropic_sse_from_reader_with_liveness<R>(
+        reader: R,
+        tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+        emit_tool_input_liveness: bool,
     ) where
         R: tokio::io::AsyncBufRead + Unpin,
     {
@@ -1944,6 +1987,20 @@ impl AnthropicModelProvider {
                                     delta.get("partial_json").and_then(|j| j.as_str())
                                 {
                                     tool_input_json.push_str(json);
+                                    // Surface transport activity without exposing partial,
+                                    // potentially invalid tool input as assistant text. Empty
+                                    // text deltas are ignored by the runtime but reset caller
+                                    // idle timers while eager tool input is being generated.
+                                    if emit_tool_input_liveness
+                                        && tx
+                                            .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                                                String::new(),
+                                            ))))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                             "thinking_delta" => {
@@ -2251,7 +2308,7 @@ impl ModelProvider for AnthropicModelProvider {
             .try_with(Clone::clone)
             .ok()
             .flatten();
-        let native_tools = Self::convert_tools(request.tools);
+        let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
@@ -2458,7 +2515,7 @@ impl ModelProvider for AnthropicModelProvider {
             .try_with(Clone::clone)
             .ok()
             .flatten();
-        let native_tools = Self::convert_tools(request.tools);
+        let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
@@ -2526,6 +2583,7 @@ impl ModelProvider for AnthropicModelProvider {
         let is_oauth = Self::is_setup_token(&credential);
         let extra_headers = self.extra_headers.clone();
         let response_observer = self.response_observer.clone();
+        let emit_tool_input_liveness = self.eager_input_streaming;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -2586,7 +2644,7 @@ impl ModelProvider for AnthropicModelProvider {
                 return;
             }
 
-            Self::parse_anthropic_sse(response, &tx).await;
+            Self::parse_anthropic_sse(response, &tx, emit_tool_input_liveness).await;
         });
 
         // The guard travels inside the unfold state so it is dropped at the
@@ -2622,6 +2680,10 @@ mod stream_completion_tests;
 mod tests {
     use super::*;
     use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
+
+    fn default_provider() -> AnthropicModelProvider {
+        AnthropicModelProvider::builder("test").build()
+    }
 
     fn replay_blocks(reasoning_content: &str) -> Vec<serde_json::Value> {
         AnthropicReplayEnvelope::decode(reasoning_content)
@@ -2734,6 +2796,63 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":5}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    fn fake_eager_tool_input_sse() -> &'static [u8] {
+        b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"run_javascript\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"code\\\":\\\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"return 1;\\\"}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_input_deltas_emit_invisible_liveness_chunks() {
+        use std::io::Cursor;
+
+        let reader = tokio::io::BufReader::new(Cursor::new(fake_eager_tool_input_sse()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader_with_liveness(reader, &tx, true)
+            .await;
+
+        let mut liveness_chunks = 0;
+        let mut tool_call = None;
+        while let Ok(event) = rx.try_recv() {
+            match event.expect("valid stream event") {
+                StreamEvent::TextDelta(chunk) if chunk.delta.is_empty() => liveness_chunks += 1,
+                StreamEvent::ToolCall(call) => tool_call = Some(call),
+                _ => {}
+            }
+        }
+
+        assert_eq!(liveness_chunks, 2);
+        assert_eq!(
+            tool_call.expect("completed tool call").arguments,
+            r#"{"code":"return 1;"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn default_streaming_tool_input_does_not_emit_liveness_chunks() {
+        use std::io::Cursor;
+
+        let reader = tokio::io::BufReader::new(Cursor::new(fake_eager_tool_input_sse()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.expect("valid stream event"));
+        }
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], StreamEvent::ToolCall(_)));
+        assert!(matches!(events[1], StreamEvent::Final { .. }));
     }
 
     #[tokio::test]
@@ -4090,6 +4209,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let content = NativeContentOut::ToolResult {
             tool_use_id: "tool_123".to_string(),
             content: "Result data".to_string(),
+            is_error: false,
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&content).unwrap();
@@ -4100,12 +4220,72 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
+    fn malformed_tool_result_serializes_anthropic_error_flag() {
+        let content = NativeContentOut::ToolResult {
+            tool_use_id: "tool_123".to_string(),
+            content: r#"{"INVALID_JSON":"{"}"#.to_string(),
+            is_error: true,
+            cache_control: None,
+        };
+
+        let json = serde_json::to_value(content).unwrap();
+
+        assert_eq!(json["is_error"], true);
+        assert_eq!(json["tool_use_id"], "tool_123");
+    }
+
+    #[test]
+    fn convert_messages_preserves_malformed_tool_result_as_provider_error() {
+        let invalid_arguments = r#"{"value":"unfinished"#;
+        let messages = vec![
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "toolu_bad",
+                        "name": "counter",
+                        "arguments": invalid_arguments,
+                    }],
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "toolu_bad",
+                    "content": serde_json::json!({"INVALID_JSON": invalid_arguments}).to_string(),
+                    "is_error": true,
+                })
+                .to_string(),
+            ),
+        ];
+
+        let (_, native_messages) = AnthropicModelProvider::convert_messages(&messages);
+
+        assert_eq!(native_messages.len(), 2);
+        assert!(matches!(
+            &native_messages[0].content[0],
+            NativeContentOut::ToolUse { id, input, .. }
+                if id == "toolu_bad" && input == &serde_json::json!({})
+        ));
+        assert!(matches!(
+            &native_messages[1].content[0],
+            NativeContentOut::ToolResult {
+                tool_use_id,
+                content,
+                is_error: true,
+                ..
+            } if tool_use_id == "toolu_bad" && content.contains("INVALID_JSON")
+        ));
+    }
+
+    #[test]
     fn native_tool_spec_without_cache_control() {
         let schema = serde_json::json!({"type": "object"});
         let tool = NativeToolSpec {
             name: "get_weather".to_string(),
             description: "Get weather info".to_string(),
             input_schema: schema.into(),
+            eager_input_streaming: false,
             cache_control: None,
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -4120,6 +4300,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             name: "get_weather".to_string(),
             description: "Get weather info".to_string(),
             input_schema: schema.into(),
+            eager_input_streaming: false,
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -4321,7 +4502,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         ];
         let (system, mut native) = AnthropicModelProvider::convert_messages(&messages);
         AnthropicModelProvider::apply_conversation_cache_control(&messages, &mut native);
-        let tools = AnthropicModelProvider::convert_tools(Some(&[ToolSpec::new(
+        let tools = default_provider().convert_tools(Some(&[ToolSpec::new(
             "search",
             "Search",
             serde_json::json!({"type": "object"}),
@@ -4376,6 +4557,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             content: vec![NativeContentOut::ToolResult {
                 tool_use_id: "tool_123".to_string(),
                 content: "Result".to_string(),
+                is_error: false,
                 cache_control: None,
             }],
         }];
@@ -4432,9 +4614,47 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = default_provider().convert_tools(Some(&tools)).unwrap();
 
         assert_eq!(native_tools.len(), 2);
+        assert!(native_tools[0].cache_control.is_none());
+        assert!(native_tools[1].cache_control.is_some());
+    }
+
+    #[test]
+    fn convert_tools_omits_eager_input_streaming_by_default() {
+        let provider = default_provider();
+        let tools = vec![ToolSpec::new(
+            "run_javascript",
+            "Run JavaScript",
+            serde_json::json!({"type": "object"}),
+        )];
+
+        let native_tools = provider.convert_tools(Some(&tools)).unwrap();
+        let wire = serde_json::to_value(&native_tools).unwrap();
+
+        assert!(wire[0].get("eager_input_streaming").is_none());
+    }
+
+    #[test]
+    fn convert_tools_enables_eager_input_streaming_for_every_tool() {
+        let provider = AnthropicModelProvider::builder("test")
+            .eager_input_streaming()
+            .build();
+        let tools = vec![
+            ToolSpec::new("search", "Search", serde_json::json!({"type": "object"})),
+            ToolSpec::new(
+                "run_javascript",
+                "Run JavaScript",
+                serde_json::json!({"type": "object"}),
+            ),
+        ];
+
+        let native_tools = provider.convert_tools(Some(&tools)).unwrap();
+        let wire = serde_json::to_value(&native_tools).unwrap();
+
+        assert_eq!(wire[0]["eager_input_streaming"], true);
+        assert_eq!(wire[1]["eager_input_streaming"], true);
         assert!(native_tools[0].cache_control.is_none());
         assert!(native_tools[1].cache_control.is_some());
     }
@@ -4447,7 +4667,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             serde_json::json!({"type": "object"}),
         )];
 
-        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = default_provider().convert_tools(Some(&tools)).unwrap();
 
         assert_eq!(native_tools.len(), 1);
         assert!(native_tools[0].cache_control.is_some());
@@ -4476,7 +4696,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }),
         )];
 
-        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = default_provider().convert_tools(Some(&tools)).unwrap();
         let schema = &native_tools[0].input_schema;
 
         let filter = &schema["properties"]["filter"];
@@ -4509,7 +4729,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }),
         )];
 
-        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = default_provider().convert_tools(Some(&tools)).unwrap();
         let schema = &native_tools[0].input_schema;
 
         let filter = &schema["properties"]["filter"];
@@ -4524,13 +4744,13 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_tools_empty_tools_returns_none() {
         let tools: Vec<ToolSpec> = vec![];
-        let result = AnthropicModelProvider::convert_tools(Some(&tools));
+        let result = default_provider().convert_tools(Some(&tools));
         assert!(result.is_none());
     }
 
     #[test]
     fn convert_tools_none_returns_none() {
-        let result: Option<Vec<NativeToolSpec>> = AnthropicModelProvider::convert_tools(None);
+        let result: Option<Vec<NativeToolSpec>> = default_provider().convert_tools(None);
         assert!(result.is_none());
     }
 
@@ -4723,6 +4943,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             max_tokens: 4096,
             timeout_secs: 120,
             reasoning_effort: None,
+            eager_input_streaming: false,
             extra_headers: Vec::new(),
             response_observer: None,
         };

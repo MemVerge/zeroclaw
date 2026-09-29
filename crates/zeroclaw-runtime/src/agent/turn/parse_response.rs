@@ -112,8 +112,86 @@ pub(crate) struct InterpretedResponse {
     pub(crate) tool_calls: Vec<ParsedToolCall>,
     pub(crate) assistant_history_content: String,
     pub(crate) native_tool_calls: Vec<ToolCall>,
+    pub(crate) native_tool_rejection: Option<NativeToolCallRejection>,
     pub(crate) parse_issue_detected: bool,
     pub(crate) input_tokens: Option<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RejectedNativeToolCall {
+    pub(crate) tool_call_id: String,
+    pub(crate) content: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeToolCallRejection {
+    issue: String,
+    pub(crate) results: Vec<RejectedNativeToolCall>,
+}
+
+fn parse_native_tool_call(call: &ToolCall) -> Result<ParsedToolCall, String> {
+    let arguments =
+        serde_json::from_str::<serde_json::Value>(&call.arguments).map_err(|error| {
+            format!(
+                "native tool call '{}' has invalid JSON arguments: {error}",
+                call.name
+            )
+        })?;
+    Ok(ParsedToolCall {
+        name: call.name.clone(),
+        arguments,
+        tool_call_id: Some(call.id.clone()),
+    })
+}
+
+fn rejected_tool_result(call: &ToolCall, invalid: bool) -> RejectedNativeToolCall {
+    let content = if invalid {
+        serde_json::json!({"INVALID_JSON": call.arguments}).to_string()
+    } else {
+        serde_json::json!({
+            "error": "Tool execution skipped because another call had invalid JSON arguments."
+        })
+        .to_string()
+    };
+    RejectedNativeToolCall {
+        tool_call_id: call.id.clone(),
+        content,
+    }
+}
+
+fn native_tool_call_rejection(
+    tool_calls: &[ToolCall],
+    failures: &[(usize, String)],
+) -> NativeToolCallRejection {
+    let results = tool_calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| rejected_tool_result(call, failures.iter().any(|f| f.0 == index)))
+        .collect();
+    let issue = failures
+        .iter()
+        .map(|(_, error)| error.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    NativeToolCallRejection { issue, results }
+}
+
+fn parse_native_tool_calls(
+    tool_calls: &[ToolCall],
+) -> Result<Vec<ParsedToolCall>, NativeToolCallRejection> {
+    let mut parsed = Vec::with_capacity(tool_calls.len());
+    let mut failures = Vec::new();
+    for (index, call) in tool_calls.iter().enumerate() {
+        match parse_native_tool_call(call) {
+            Ok(call) => parsed.push(call),
+            Err(error) => failures.push((index, error)),
+        }
+    }
+    if failures.is_empty() {
+        Ok(parsed)
+    } else {
+        Err(native_tool_call_rejection(tool_calls, &failures))
+    }
 }
 
 /// Interpret a successful chat response. Takes the response by value and
@@ -177,22 +255,18 @@ pub(crate) async fn interpret_chat_response(
     // Fall back to text-based parsing (XML tags, markdown blocks,
     // GLM format) only if the model_provider returned no native calls —
     // this ensures we support both native and prompt-guided models.
-    let mut calls: Vec<ParsedToolCall> = if specs.tool_specs.is_empty() {
-        Vec::new()
+    let (mut calls, native_tool_rejection) = if specs.tool_specs.is_empty() {
+        (Vec::new(), None)
     } else {
-        resp.tool_calls
-            .iter()
-            .map(|call| ParsedToolCall {
-                name: call.name.clone(),
-                arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
-                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-                tool_call_id: Some(call.id.clone()),
-            })
-            .collect()
+        match parse_native_tool_calls(&resp.tool_calls) {
+            Ok(calls) => (calls, None),
+            Err(rejection) => (Vec::new(), Some(rejection)),
+        }
     };
     let mut parsed_text = String::new();
 
     if calls.is_empty()
+        && resp.tool_calls.is_empty()
         && !specs.tool_specs.is_empty()
         && !ctx.strict_tool_parsing
         && !looks_like_tool_protocol_example(&response_text)
@@ -212,7 +286,7 @@ pub(crate) async fn interpret_chat_response(
         calls = filtered_calls;
     }
 
-    let parse_issue = if ctx.strict_tool_parsing {
+    let protocol_parse_issue = if ctx.strict_tool_parsing {
         None
     } else if specs.tool_specs.is_empty() {
         // Knob-gated (embedders return model text verbatim); a live stream
@@ -238,7 +312,11 @@ pub(crate) async fn interpret_chat_response(
             })
         })
     };
-    if let Some(ref issue) = parse_issue {
+    let parse_issue = native_tool_rejection
+        .as_ref()
+        .map(|rejection| rejection.issue.as_str())
+        .or(protocol_parse_issue.as_deref());
+    if let Some(issue) = parse_issue {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -247,13 +325,14 @@ pub(crate) async fn interpret_chat_response(
                 .with_attrs(::serde_json::json!({
                     "model": ctx.model,
                     "iteration": iteration + 1,
-                    "issue": issue.as_str(),
+                    "issue": issue,
                     "response": scrub_credentials(&response_text),
                     "trace_id": ctx.turn_id,
                 })),
             "tool_call_parse_issue"
         );
     }
+    let parse_issue_detected = parse_issue.is_some();
 
     ::zeroclaw_log::record!(
         INFO,
@@ -304,15 +383,51 @@ pub(crate) async fn interpret_chat_response(
         tool_calls: calls,
         assistant_history_content,
         native_tool_calls: native_calls,
-        parse_issue_detected: parse_issue.is_some(),
+        native_tool_rejection,
+        parse_issue_detected,
         input_tokens: resp_input_tokens,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_native_assistant_history, unforwarded_narration};
+    use super::{build_native_assistant_history, parse_native_tool_calls, unforwarded_narration};
     use zeroclaw_providers::ToolCall;
+
+    #[test]
+    fn invalid_native_tool_arguments_are_rejected_instead_of_defaulting_to_empty_object() {
+        let calls = vec![ToolCall {
+            id: "toolu_1".to_string(),
+            name: "run_javascript".to_string(),
+            arguments: r#"{"code":"const value ="#.to_string(),
+            extra_content: None,
+        }];
+
+        let rejection = parse_native_tool_calls(&calls).unwrap_err();
+
+        assert!(rejection.issue.contains("run_javascript"));
+        assert!(rejection.issue.contains("invalid JSON arguments"));
+        assert_eq!(rejection.results[0].tool_call_id, "toolu_1");
+        assert!(rejection.results[0].content.contains("INVALID_JSON"));
+        assert!(rejection.results[0].content.contains("const value ="));
+    }
+
+    #[test]
+    fn valid_native_tool_arguments_preserve_the_provider_call_id() {
+        let calls = vec![ToolCall {
+            id: "toolu_1".to_string(),
+            name: "search".to_string(),
+            arguments: r#"{"query":"MemBox"}"#.to_string(),
+            extra_content: None,
+        }];
+
+        let parsed = parse_native_tool_calls(&calls).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "search");
+        assert_eq!(parsed[0].arguments["query"], "MemBox");
+        assert_eq!(parsed[0].tool_call_id.as_deref(), Some("toolu_1"));
+    }
 
     #[test]
     fn native_assistant_history_preserves_tool_call_extra_content() {

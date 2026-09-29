@@ -3,7 +3,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use zeroclaw::providers::traits::{ChatMessage, TokenUsage};
+use zeroclaw::providers::traits::{ChatMessage, ProviderCapabilities, TokenUsage};
 use zeroclaw::providers::{ChatRequest, ChatResponse, ModelProvider, ToolCall};
 
 use super::trace::{LlmTrace, TraceResponse};
@@ -73,6 +73,7 @@ impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
 pub struct RecordingModelProvider {
     responses: Mutex<Vec<ChatResponse>>,
     recorded_requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    capabilities: ProviderCapabilities,
 }
 
 impl RecordingModelProvider {
@@ -81,13 +82,27 @@ impl RecordingModelProvider {
         let model_provider = Self {
             responses: Mutex::new(responses),
             recorded_requests: recorded.clone(),
+            capabilities: ProviderCapabilities::default(),
         };
+        (model_provider, recorded)
+    }
+
+    pub fn with_capabilities(
+        responses: Vec<ChatResponse>,
+        capabilities: ProviderCapabilities,
+    ) -> (Self, Arc<Mutex<Vec<Vec<ChatMessage>>>>) {
+        let (mut model_provider, recorded) = Self::new(responses);
+        model_provider.capabilities = capabilities;
         (model_provider, recorded)
     }
 }
 
 #[async_trait]
 impl ModelProvider for RecordingModelProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.capabilities.clone()
+    }
+
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,

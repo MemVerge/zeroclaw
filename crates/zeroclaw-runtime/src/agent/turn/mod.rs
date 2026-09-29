@@ -255,6 +255,22 @@ impl<'a> TurnState<'a> {
         self.synced = self.canonical.as_ref().map_or(0, |c| c.len());
     }
 
+    fn append_native_rejection(
+        &mut self,
+        assistant_history_content: String,
+        rejection: parse_response::NativeToolCallRejection,
+    ) {
+        self.push_dual(ChatMessage::assistant(assistant_history_content));
+        for result in rejection.results {
+            let content = serde_json::json!({
+                "tool_call_id": result.tool_call_id,
+                "content": result.content,
+                "is_error": true,
+            });
+            self.push_dual(ChatMessage::tool(content.to_string()));
+        }
+    }
+
     /// Trim history to the given token budget, writing the result back
     /// into `self.history`.  Returns the trim metadata so the caller can
     /// emit log/observer events (the returned `history` field is empty —
@@ -749,6 +765,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             tool_calls,
             assistant_history_content,
             native_tool_calls,
+            native_tool_rejection,
             parse_issue_detected,
             protocol_suppressed,
             response_streamed_live,
@@ -772,6 +789,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     interpreted.tool_calls,
                     interpreted.assistant_history_content,
                     interpreted.native_tool_calls,
+                    interpreted.native_tool_rejection,
                     interpreted.parse_issue_detected,
                     streamed_protocol_suppressed,
                     streamed_live_deltas,
@@ -864,16 +882,18 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             );
 
             if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
-                // This is model feedback, not a tool result: malformed protocol
-                // output has no valid tool_call_id to attach a role=tool message to.
-                let msg = ChatMessage::user(
-                    "[Tool call parse error]\n\
-                     Your previous response looked like an internal tool-call protocol payload, \
-                     but ZeroClaw could not parse it into a valid tool call. Use the supported \
-                     tool-call schema, or answer in natural language if no tool is needed."
-                        .to_string(),
-                );
-                turn_state.push_dual(msg);
+                if let Some(rejection) = native_tool_rejection {
+                    turn_state.append_native_rejection(assistant_history_content, rejection);
+                } else {
+                    let msg = ChatMessage::user(
+                        "[Tool call parse error]\n\
+                         Your previous response looked like an internal tool-call protocol payload, \
+                         but ZeroClaw could not parse it into a valid tool call. Use the supported \
+                         tool-call schema, or answer in natural language if no tool is needed."
+                            .to_string(),
+                    );
+                    turn_state.push_dual(msg);
+                }
                 continue;
             }
 

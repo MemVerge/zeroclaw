@@ -1,7 +1,10 @@
 //! TG4: Agent Loop Robustness Tests
 
 use crate::support::helpers::{build_agent, text_response, tool_response};
-use crate::support::{CountingTool, EchoTool, FailingTool, MockModelProvider};
+use crate::support::{
+    CountingTool, EchoTool, FailingTool, MockModelProvider, RecordingModelProvider,
+};
+use zeroclaw::providers::traits::ProviderCapabilities;
 use zeroclaw::providers::{ChatResponse, ToolCall};
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -37,6 +40,58 @@ async fn agent_handles_tool_call_with_empty_arguments() {
     let mut agent = build_agent(model_provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("call with empty args").await.unwrap();
     assert!(!response.is_empty());
+}
+
+#[tokio::test]
+async fn agent_rejects_malformed_native_tool_call_and_retries_with_error_result() {
+    let invalid_arguments = r#"{"value":"unfinished"#;
+    let responses = vec![
+        tool_response(vec![ToolCall {
+            id: "toolu_bad".into(),
+            name: "counter".into(),
+            arguments: invalid_arguments.into(),
+            extra_content: None,
+        }]),
+        text_response("Recovered after invalid tool input"),
+    ];
+    let capabilities = ProviderCapabilities {
+        native_tool_calling: true,
+        ..ProviderCapabilities::default()
+    };
+    let (model_provider, recorded_requests) =
+        RecordingModelProvider::with_capabilities(responses, capabilities);
+    let (counting_tool, invocation_count) = CountingTool::new();
+    let mut agent = build_agent(Box::new(model_provider), vec![Box::new(counting_tool)]);
+
+    let response = agent.turn("use the counter").await.unwrap();
+
+    assert_eq!(response, "Recovered after invalid tool input");
+    assert_eq!(*invocation_count.lock().unwrap(), 0);
+    let requests = recorded_requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let retry_messages = &requests[1];
+    let assistant = retry_messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .expect("retry should preserve the rejected assistant tool call");
+    let assistant_content: serde_json::Value = serde_json::from_str(&assistant.content).unwrap();
+    assert_eq!(assistant_content["tool_calls"][0]["id"], "toolu_bad");
+    assert_eq!(
+        assistant_content["tool_calls"][0]["arguments"],
+        invalid_arguments
+    );
+    let tool_message = retry_messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "tool")
+        .expect("retry should include a provider-native error tool result");
+    let tool_result: serde_json::Value = serde_json::from_str(&tool_message.content).unwrap();
+    assert_eq!(tool_result["tool_call_id"], "toolu_bad");
+    assert_eq!(tool_result["is_error"], true);
+    let error_content: serde_json::Value =
+        serde_json::from_str(tool_result["content"].as_str().unwrap()).unwrap();
+    assert_eq!(error_content["INVALID_JSON"], invalid_arguments);
 }
 
 #[tokio::test]

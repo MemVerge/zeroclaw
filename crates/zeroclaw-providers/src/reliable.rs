@@ -1351,7 +1351,7 @@ async fn forward_stream_attempt(
         match result {
             Ok(event) => {
                 let is_final = event.is_final();
-                emitted_event = true;
+                emitted_event |= is_committed_stream_event(&event);
                 if tx.send(Ok(event)).await.is_err() {
                     return StreamAttemptOutcome::ConsumerDropped;
                 }
@@ -1371,6 +1371,20 @@ async fn forward_stream_attempt(
         StreamAttemptOutcome::Retry(error)
     } else {
         StreamAttemptOutcome::Terminal(error)
+    }
+}
+
+fn is_committed_stream_event(event: &StreamEvent) -> bool {
+    match event {
+        StreamEvent::TextDelta(chunk) => {
+            chunk.is_final
+                || !chunk.delta.is_empty()
+                || chunk
+                    .reasoning
+                    .as_ref()
+                    .is_some_and(|text| !text.is_empty())
+        }
+        _ => true,
     }
 }
 
@@ -5387,6 +5401,7 @@ mod tests {
         ContextWindowUntilTruncated,
         ConnectionThenContextWindowUntilTruncated,
         ContextWindowAlways,
+        AfterLivenessOnce,
         AfterOutput,
     }
 
@@ -5500,6 +5515,13 @@ mod tests {
             {
                 return stream::empty().boxed();
             }
+            if matches!(self.failure_mode, StreamFailureMode::AfterLivenessOnce) && attempt == 0 {
+                return stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(""))),
+                    Err(StreamError::Http("connection reset".to_string())),
+                ])
+                .boxed();
+            }
             if matches!(self.failure_mode, StreamFailureMode::AfterOutput) {
                 return stream::iter(vec![
                     Ok(StreamEvent::TextDelta(StreamChunk::delta("partial"))),
@@ -5605,6 +5627,25 @@ mod tests {
             events.as_slice(),
             [Ok(StreamEvent::TextDelta(chunk)), Ok(StreamEvent::Final { .. })]
                 if chunk.delta == "recovered"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_chat_retries_after_liveness_without_committed_output() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = interrupting_provider(
+            Arc::clone(&stream_calls),
+            StreamFailureMode::AfterLivenessOnce,
+            1,
+        );
+
+        let events = collect_interrupting_stream(&model_provider).await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::TextDelta(liveness)), Ok(StreamEvent::TextDelta(recovered)), Ok(StreamEvent::Final { .. })]
+                if liveness.delta.is_empty() && recovered.delta == "recovered"
         ));
     }
 
