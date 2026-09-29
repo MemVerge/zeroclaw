@@ -4,6 +4,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
+use zeroclaw_api::model_provider::MessageContentField;
 use zeroclaw_providers::ChatMessage;
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
@@ -267,6 +268,7 @@ pub fn context_floor_remediation(system_floor: usize, budget: usize) -> String {
 pub fn normalize_system_messages(history: &mut Vec<ChatMessage>) {
     let mut saw_system = false;
     let mut system_content = String::new();
+    let mut system_sources = Vec::new();
     let mut non_system = Vec::with_capacity(history.len());
 
     for message in history.drain(..) {
@@ -276,6 +278,14 @@ pub fn normalize_system_messages(history: &mut Vec<ChatMessage>) {
                 if !system_content.is_empty() {
                     system_content.push_str("\n\n");
                 }
+                let offset = system_content.len();
+                system_sources.extend(message.content_sources.into_iter().map(|mut source| {
+                    if source.field == MessageContentField::Text {
+                        source.range.start += offset;
+                        source.range.end += offset;
+                    }
+                    source
+                }));
                 system_content.push_str(&message.content);
             }
         } else {
@@ -284,7 +294,10 @@ pub fn normalize_system_messages(history: &mut Vec<ChatMessage>) {
     }
 
     if saw_system && !system_content.is_empty() {
-        history.push(ChatMessage::system(system_content));
+        history.push(ChatMessage {
+            content_sources: system_sources,
+            ..ChatMessage::system(system_content)
+        });
     }
     history.extend(non_system);
 }
@@ -435,6 +448,36 @@ pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::model_provider::MessageContentSource;
+
+    #[test]
+    fn normalize_system_messages_preserves_source_ranges_without_marking_separators() {
+        let source = |source_id| MessageContentSource {
+            source_id,
+            field: MessageContentField::Text,
+            range: 0..3,
+        };
+        let mut history = vec![
+            ChatMessage {
+                content_sources: vec![source(1)],
+                ..ChatMessage::system("前")
+            },
+            ChatMessage {
+                content_sources: vec![source(2)],
+                ..ChatMessage::user("问")
+            },
+            ChatMessage {
+                content_sources: vec![source(3)],
+                ..ChatMessage::system("后")
+            },
+        ];
+        normalize_system_messages(&mut history);
+        assert_eq!(history[0].content, "前\n\n后");
+        assert_eq!(history[0].content_sources[0], source(1));
+        assert_eq!(history[0].content_sources[1].source_id, 3);
+        assert_eq!(history[0].content_sources[1].range, 5..8);
+        assert_eq!(history[1].content_sources, [source(2)]);
+    }
 
     #[test]
     fn estimate_system_floor_counts_only_system_messages() {

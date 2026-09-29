@@ -1,3 +1,7 @@
+use crate::compatible::{
+    OpenAiCompatibleModelProvider, RequestHeaders, decoded_json_content_sources, projected_sources,
+    request_with_sources,
+};
 use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
     build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
@@ -15,6 +19,7 @@ use futures_util::stream;
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
+use zeroclaw_api::model_provider::MessageContentSource;
 use zeroclaw_api::tool::ToolSpec;
 
 /// OpenAI's public API endpoint.
@@ -43,6 +48,7 @@ pub struct OpenAiModelProvider {
     /// client default headers so the pooled runtime proxy client stays shared.
     extra_headers: Vec<(HeaderName, HeaderValue)>,
     response_observer: Option<ResponseMetadataObserver>,
+    request_headers: Option<RequestHeaders>,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,6 +63,8 @@ struct ChatRequest {
 
 #[derive(Debug, Serialize)]
 struct Message {
+    #[serde(skip)]
+    content_sources: Vec<MessageContentSource>,
     role: String,
     content: String,
 }
@@ -105,6 +113,8 @@ struct NativeChatRequest {
 
 #[derive(Debug, Serialize)]
 struct NativeMessage {
+    #[serde(skip)]
+    content_sources: Vec<MessageContentSource>,
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
@@ -233,9 +243,17 @@ pub struct OpenAiBuilder {
     timeout_secs: Option<u64>,
     extra_headers: std::collections::HashMap<String, String>,
     response_observer: Option<ResponseMetadataObserver>,
+    request_headers: Option<RequestHeaders>,
 }
 
 impl OpenAiBuilder {
+    /// Set the opt-in Chat Completions callback described by [`RequestHeaders`].
+    /// This does not enable source projection on [`OpenAiResponsesModelProvider`].
+    pub fn request_headers(mut self, callback: Option<RequestHeaders>) -> Self {
+        self.request_headers = callback;
+        self
+    }
+
     /// Observe selected model-response headers without changing the request.
     pub fn response_observer(mut self, observer: Option<ResponseMetadataObserver>) -> Self {
         self.response_observer = observer;
@@ -298,6 +316,7 @@ impl OpenAiBuilder {
                 crate::extra_headers::ReservedHeaders::OPENAI,
             ),
             response_observer: self.response_observer,
+            request_headers: self.request_headers,
         }
     }
 }
@@ -314,6 +333,7 @@ impl OpenAiModelProvider {
             timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             response_observer: None,
+            request_headers: None,
         }
     }
 
@@ -400,6 +420,11 @@ impl OpenAiModelProvider {
                         .and_then(serde_json::Value::as_str)
                         .map(ToString::to_string);
                     return NativeMessage {
+                        content_sources: if content.is_some() {
+                            decoded_json_content_sources(m)
+                        } else {
+                            Vec::new()
+                        },
                         role: "assistant".to_string(),
                         content,
                         tool_call_id: None,
@@ -420,6 +445,11 @@ impl OpenAiModelProvider {
                         .and_then(serde_json::Value::as_str)
                         .map(ToString::to_string);
                     return NativeMessage {
+                        content_sources: if content.is_some() {
+                            decoded_json_content_sources(m)
+                        } else {
+                            Vec::new()
+                        },
                         role: "tool".to_string(),
                         content,
                         tool_call_id,
@@ -429,6 +459,7 @@ impl OpenAiModelProvider {
                 }
 
                 NativeMessage {
+                    content_sources: OpenAiCompatibleModelProvider::text_sources(m, false),
                     role: m.role.clone(),
                     content: Some(m.content.clone()),
                     tool_call_id: None,
@@ -462,26 +493,9 @@ impl OpenAiModelProvider {
         }
     }
 
-    fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "model_provider.openai",
-            self.timeout_secs,
-            10,
-        )
-    }
-}
-
-#[async_trait]
-impl ModelProvider for OpenAiModelProvider {
-    // ── ModelProvider-family defaults ──
-    fn default_base_url(&self) -> Option<&str> {
-        Some(BASE_URL)
-    }
-
-    async fn chat_with_system(
+    async fn chat_with_projected_messages(
         &self,
-        system_prompt: Option<&str>,
-        message: &str,
+        messages: Vec<Message>,
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
@@ -499,20 +513,6 @@ impl ModelProvider for OpenAiModelProvider {
         let adjusted_temperature =
             temperature.map(|t| Self::adjust_temperature_for_model(model, t));
 
-        let mut messages = Vec::new();
-
-        if let Some(sys) = system_prompt {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: sys.to_string(),
-            });
-        }
-
-        messages.push(Message {
-            role: "user".to_string(),
-            content: message.to_string(),
-        });
-
         let request = ChatRequest {
             model: model.to_string(),
             messages,
@@ -522,10 +522,21 @@ impl ModelProvider for OpenAiModelProvider {
 
         let mut observation = begin_request(&self.response_observer);
         let response = crate::extra_headers::apply_extra_headers(
-            self.http_client()
-                .post(format!("{}/chat/completions", self.base_url))
-                .header("Authorization", format!("Bearer {credential}"))
-                .json(&request),
+            request_with_sources(
+                &self.request_headers,
+                crate::extra_headers::ReservedHeaders::OPENAI,
+                &[],
+                self.http_client()
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .header("Authorization", format!("Bearer {credential}")),
+                &request,
+                projected_sources(
+                    request
+                        .messages
+                        .iter()
+                        .map(|message| &message.content_sources),
+                ),
+            )?,
             &self.extra_headers,
         )
         .send()
@@ -552,6 +563,80 @@ impl ModelProvider for OpenAiModelProvider {
                 );
                 anyhow::Error::msg("No response from OpenAI")
             })
+    }
+
+    fn http_client(&self) -> Client {
+        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+            "model_provider.openai",
+            self.timeout_secs,
+            10,
+        )
+    }
+}
+
+#[async_trait]
+impl ModelProvider for OpenAiModelProvider {
+    // ── ModelProvider-family defaults ──
+    fn default_base_url(&self) -> Option<&str> {
+        Some(BASE_URL)
+    }
+
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        let mut messages = Vec::new();
+
+        if let Some(sys) = system_prompt {
+            messages.push(Message {
+                content_sources: Vec::new(),
+                role: "system".to_string(),
+                content: sys.to_string(),
+            });
+        }
+
+        messages.push(Message {
+            content_sources: Vec::new(),
+            role: "user".to_string(),
+            content: message.to_string(),
+        });
+
+        self.chat_with_projected_messages(messages, model, temperature)
+            .await
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        let mut selected = Vec::new();
+        if let Some(system) = messages.iter().find(|message| message.role == "system") {
+            selected.push(Message {
+                role: system.role.clone(),
+                content: system.content.clone(),
+                content_sources: OpenAiCompatibleModelProvider::text_sources(system, false),
+            });
+        }
+        if let Some(user) = messages.iter().rfind(|message| message.role == "user") {
+            selected.push(Message {
+                role: user.role.clone(),
+                content: user.content.clone(),
+                content_sources: OpenAiCompatibleModelProvider::text_sources(user, false),
+            });
+        } else {
+            selected.push(Message {
+                role: "user".into(),
+                content: String::new(),
+                content_sources: Vec::new(),
+            });
+        }
+        self.chat_with_projected_messages(selected, model, temperature)
+            .await
     }
 
     async fn chat(
@@ -605,10 +690,21 @@ impl ModelProvider for OpenAiModelProvider {
 
         let mut observation = begin_request(&self.response_observer);
         let response = crate::extra_headers::apply_extra_headers(
-            self.http_client()
-                .post(format!("{}/chat/completions", self.base_url))
-                .header("Authorization", format!("Bearer {credential}"))
-                .json(&native_request),
+            request_with_sources(
+                &self.request_headers,
+                crate::extra_headers::ReservedHeaders::OPENAI,
+                &[],
+                self.http_client()
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .header("Authorization", format!("Bearer {credential}")),
+                &native_request,
+                projected_sources(
+                    native_request
+                        .messages
+                        .iter()
+                        .map(|message| &message.content_sources),
+                ),
+            )?,
             &self.extra_headers,
         )
         .send()
@@ -695,10 +791,21 @@ impl ModelProvider for OpenAiModelProvider {
 
         let mut observation = begin_request(&self.response_observer);
         let response = crate::extra_headers::apply_extra_headers(
-            self.http_client()
-                .post(format!("{}/chat/completions", self.base_url))
-                .header("Authorization", format!("Bearer {credential}"))
-                .json(&native_request),
+            request_with_sources(
+                &self.request_headers,
+                crate::extra_headers::ReservedHeaders::OPENAI,
+                &[],
+                self.http_client()
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .header("Authorization", format!("Bearer {credential}")),
+                &native_request,
+                projected_sources(
+                    native_request
+                        .messages
+                        .iter()
+                        .map(|message| &message.content_sources),
+                ),
+            )?,
             &self.extra_headers,
         )
         .send()
@@ -2157,10 +2264,12 @@ mod tests {
             model: "gpt-4o".to_string(),
             messages: vec![
                 Message {
+                    content_sources: Vec::new(),
                     role: "system".to_string(),
                     content: "You are ZeroClaw".to_string(),
                 },
                 Message {
+                    content_sources: Vec::new(),
                     role: "user".to_string(),
                     content: "hello".to_string(),
                 },
@@ -2179,6 +2288,7 @@ mod tests {
         let req = ChatRequest {
             model: "gpt-4o".to_string(),
             messages: vec![Message {
+                content_sources: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
@@ -2489,8 +2599,47 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_preserves_raw_envelope_sources() {
+        use zeroclaw_api::model_provider::MessageContentField;
+
+        let text = "查\\\r\n\"结果\"";
+        for (role, value) in [
+            (
+                "assistant",
+                serde_json::json!({"content":text,"tool_calls":[]}),
+            ),
+            (
+                "tool",
+                serde_json::json!({"content":text,"tool_call_id":"call_1"}),
+            ),
+        ] {
+            let content = value.to_string();
+            let message = ChatMessage {
+                content_sources: vec![MessageContentSource {
+                    source_id: 7,
+                    field: MessageContentField::Text,
+                    range: 0..content.len(),
+                }],
+                role: role.into(),
+                content,
+            };
+            let native = OpenAiModelProvider::convert_messages(&[message]);
+            assert_eq!(native[0].content.as_deref(), Some(text));
+            assert_eq!(
+                native[0].content_sources,
+                vec![MessageContentSource {
+                    source_id: 7,
+                    field: MessageContentField::Text,
+                    range: 0..text.len(),
+                }]
+            );
+        }
+    }
+
+    #[test]
     fn native_message_omits_reasoning_content_when_none() {
         let msg = NativeMessage {
+            content_sources: Vec::new(),
             role: "assistant".to_string(),
             content: Some("hi".to_string()),
             tool_call_id: None,
@@ -2504,6 +2653,7 @@ mod tests {
     #[test]
     fn native_message_includes_reasoning_content_when_some() {
         let msg = NativeMessage {
+            content_sources: Vec::new(),
             role: "assistant".to_string(),
             content: Some("hi".to_string()),
             tool_call_id: None,

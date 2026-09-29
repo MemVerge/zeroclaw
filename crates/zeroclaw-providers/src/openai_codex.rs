@@ -2551,18 +2551,22 @@ data: [DONE]
     fn build_responses_input_maps_content_types_by_role() {
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "system".into(),
                 content: "You are helpful.".into(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".into(),
                 content: "Hi".into(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".into(),
                 content: "Hello!".into(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".into(),
                 content: "Thanks".into(),
             },
@@ -2586,6 +2590,7 @@ data: [DONE]
     #[test]
     fn build_responses_input_uses_default_instructions_without_system() {
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "user".into(),
             content: "Hello".into(),
         }];
@@ -2598,10 +2603,12 @@ data: [DONE]
     fn build_responses_input_maps_tool_outputs() {
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "tool".into(),
                 content: r#"{"tool_call_id":"call_123","content":"result"}"#.into(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".into(),
                 content: "Go".into(),
             },
@@ -2618,6 +2625,7 @@ data: [DONE]
     #[test]
     fn build_responses_input_replays_plain_tool_text_without_synthetic_call_id() {
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "tool".into(),
             content: "legacy plain text result".into(),
         }];
@@ -2638,6 +2646,7 @@ data: [DONE]
     #[test]
     fn build_responses_input_replays_tool_json_without_call_id_as_text() {
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "tool".into(),
             content: r#"{"content":"legacy result","status":"ok"}"#.into(),
         }];
@@ -2660,6 +2669,7 @@ data: [DONE]
     fn build_responses_input_replays_blank_tool_call_id_as_legacy_text() {
         for raw_id in ["", "   "] {
             let messages = vec![ChatMessage {
+                content_sources: Vec::new(),
                 role: "tool".into(),
                 content: serde_json::json!({
                     "tool_call_id": raw_id,

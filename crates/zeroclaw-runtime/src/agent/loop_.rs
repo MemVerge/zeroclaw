@@ -1871,6 +1871,7 @@ pub async fn run(
                         config.channels.show_tool_calls,
                         thinking_params.system_prompt_prefix.as_deref(),
                     )?;
+                    sys_msg.content_sources.clear();
                 }
                 match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .scope(
@@ -2415,6 +2416,7 @@ pub async fn run(
                             config.channels.show_tool_calls,
                             thinking_params.system_prompt_prefix.as_deref(),
                         )?;
+                        sys_msg.content_sources.clear();
                     }
                     match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .scope(
@@ -5758,7 +5760,14 @@ mod tests {
             origin: zeroclaw_api::ingress::TurnOrigin,
         ) -> (String, Vec<(Option<String>, bool)>) {
             let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
-            let mut history = vec![ChatMessage::user("what server?".to_string())];
+            let mut history = vec![ChatMessage {
+                content_sources: vec![zeroclaw_api::model_provider::MessageContentSource {
+                    source_id: 42,
+                    field: zeroclaw_api::model_provider::MessageContentField::Text,
+                    range: 0.."what server?".len(),
+                }],
+                ..ChatMessage::user("what server?")
+            }];
             let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
             let observer = RecallCountingObserver::default();
             let turn_id = uuid::Uuid::new_v4().to_string();
@@ -5819,11 +5828,17 @@ mod tests {
             .await
             .expect("turn should complete");
 
-            let user_msg = history
+            let user = history
                 .iter()
                 .find(|m| m.role == "user")
-                .map(|m| m.content.clone())
-                .unwrap_or_default();
+                .expect("the user message survives the turn");
+            assert_eq!(user.content_sources.len(), 1);
+            assert_eq!(user.content_sources[0].source_id, 42);
+            assert_eq!(
+                &user.content[user.content_sources[0].range.clone()],
+                "what server?",
+            );
+            let user_msg = user.content.clone();
             let recalls = observer
                 .recalls
                 .lock()
@@ -14397,6 +14412,7 @@ Let me check the result."#;
             ChatMessage {
                 role: "tool".to_string(),
                 content: "ok".to_string(),
+                content_sources: Vec::new(),
             },
         ]
     }

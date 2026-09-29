@@ -277,6 +277,7 @@ mod tests {
         ChatMessage {
             role: role.into(),
             content: content.into(),
+            content_sources: Vec::new(),
         }
     }
 

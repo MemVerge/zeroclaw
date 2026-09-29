@@ -671,6 +671,7 @@ mod tests {
             ChatMessage {
                 role: "tool".into(),
                 content: "Error: connection refused".into(),
+                content_sources: Vec::new(),
             },
         ];
         let executions = extract_skill_executions_from_history(&history);

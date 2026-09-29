@@ -7609,6 +7609,7 @@ mod tests {
                     ConversationMessage::Chat(ChatMessage {
                         role: "user".into(),
                         content: "hello from prior turn".into(),
+                        content_sources: Vec::new(),
                     }),
                     ConversationMessage::AssistantToolCalls {
                         text: Some("let me check the logs".into()),
@@ -7643,6 +7644,7 @@ mod tests {
                     ConversationMessage::Chat(ChatMessage {
                         role: "assistant".into(),
                         content: "ack from prior turn".into(),
+                        content_sources: Vec::new(),
                     }),
                 ],
             )

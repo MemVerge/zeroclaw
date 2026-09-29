@@ -22,6 +22,60 @@ pub struct NativeThinkingParams {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip)]
+    pub content_sources: Vec<MessageContentSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageContentField {
+    /// UTF-8 offsets in `ChatMessage::content`.
+    Text,
+    /// UTF-8 offsets in the decoded `content` string of a tool/reasoning JSON envelope.
+    JsonContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageContentSource {
+    pub source_id: usize,
+    pub field: MessageContentField,
+    pub range: std::ops::Range<usize>,
+}
+
+/// UTF-8 coordinates in final content, joining text parts with a newline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedMessageSource {
+    pub source_id: usize,
+    pub message_index: usize,
+    pub range: std::ops::Range<usize>,
+}
+
+/// Apply the same retained text slices as the content transformation.
+pub fn remap_content_sources(
+    sources: &[MessageContentSource],
+    field: MessageContentField,
+    retained: &[std::ops::Range<usize>],
+) -> Vec<MessageContentSource> {
+    let mut result = sources
+        .iter()
+        .filter(|source| source.field != field)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut offset = 0;
+    for kept in retained {
+        for source in sources.iter().filter(|source| source.field == field) {
+            let start = source.range.start.max(kept.start);
+            let end = source.range.end.min(kept.end);
+            if start < end {
+                result.push(MessageContentSource {
+                    source_id: source.source_id,
+                    field,
+                    range: offset + start - kept.start..offset + end - kept.start,
+                });
+            }
+        }
+        offset += kept.len();
+    }
+    result
 }
 
 pub const PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX: &str = "[Tool exchange:";
@@ -48,6 +102,7 @@ impl ChatMessage {
         Self {
             role: "system".into(),
             content: content.into(),
+            content_sources: Vec::new(),
         }
     }
 
@@ -55,6 +110,7 @@ impl ChatMessage {
         Self {
             role: "user".into(),
             content: content.into(),
+            content_sources: Vec::new(),
         }
     }
 
@@ -62,6 +118,7 @@ impl ChatMessage {
         Self {
             role: "assistant".into(),
             content: content.into(),
+            content_sources: Vec::new(),
         }
     }
 
@@ -69,6 +126,7 @@ impl ChatMessage {
         Self {
             role: "tool".into(),
             content: content.into(),
+            content_sources: Vec::new(),
         }
     }
 

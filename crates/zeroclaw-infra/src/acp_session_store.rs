@@ -472,7 +472,11 @@ impl AcpSessionStore {
 
             if ins.is_empty() && outs.is_empty() {
                 // Pure chat message.
-                out.push(ConversationMessage::Chat(ChatMessage { role, content }));
+                out.push(ConversationMessage::Chat(ChatMessage {
+                    role,
+                    content,
+                    content_sources: Vec::new(),
+                }));
             } else {
                 if !ins.is_empty() {
                     // Assistant turn that issued tool calls. The text may be empty.

@@ -1104,6 +1104,7 @@ mod tests {
             .credential(None)
             .build();
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "user".into(),
             content: "hello".into(),
         }];
@@ -1145,6 +1146,7 @@ mod tests {
             .credential(Some("key"))
             .build();
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "user".into(),
             content: "hello".into(),
         }];
@@ -1270,10 +1272,12 @@ mod tests {
             .build();
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "system".into(),
                 content: "be concise".into(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".into(),
                 content: "hello".into(),
             },
@@ -1319,10 +1323,12 @@ mod tests {
     fn chat_request_serializes_history_messages() {
         let messages = [
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".into(),
                 content: "Previous answer".into(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".into(),
                 content: "Follow-up".into(),
             },
@@ -1406,6 +1412,7 @@ mod tests {
             .credential(None)
             .build();
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "user".into(),
             content: "What is the date?".into(),
         }];
@@ -1500,6 +1507,7 @@ mod tests {
     #[test]
     fn convert_messages_parses_assistant_tool_call_payload() {
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "assistant".into(),
             content: r#"{"content":"Using tool","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
                 .into(),
@@ -1529,6 +1537,7 @@ mod tests {
     #[test]
     fn convert_messages_parses_tool_result_payload() {
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "tool".into(),
             content: r#"{"tool_call_id":"call_xyz","content":"done"}"#.into(),
         }];
@@ -1652,10 +1661,12 @@ mod tests {
     fn full_native_request_serializes_system_as_blocks_user_as_string() {
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "system".into(),
                 content: "Be helpful".into(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "user".into(),
                 content: "Hi".into(),
             },
@@ -1836,6 +1847,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "assistant".into(),
             content: history_json.to_string(),
         }];
@@ -1859,6 +1871,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "assistant".into(),
             content: history_json.to_string(),
         }];
@@ -1875,6 +1888,7 @@ mod tests {
         // of `sanitize_tool_arguments` is wired in; the helper contract itself
         // is covered in `compatible::tests::sanitize_tool_arguments_*`.
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "assistant".into(),
             content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
                 .into(),
@@ -1894,6 +1908,7 @@ mod tests {
         // so the openrouter call site cannot accidentally re-encode or strip
         // good payloads.
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "assistant".into(),
             content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
                 .into(),
@@ -1910,6 +1925,7 @@ mod tests {
         // object for tool-call arguments. Null, arrays, strings, numbers, and
         // booleans are valid JSON but must not reach the upstream.
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "assistant".into(),
             content: r#"{"content":"testing","tool_calls":[{"id":"c1","name":"f","arguments":"null"},{"id":"c2","name":"g","arguments":"[]"},{"id":"c3","name":"h","arguments":"42"}]}"#
                 .into(),

@@ -1768,6 +1768,7 @@ mod tests {
     fn convert_messages_parses_native_assistant_tool_calls() {
         let model_provider = OllamaModelProvider::builder("test").build();
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "assistant".into(),
             content: r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"ls\"}"}]}"#.into(),
         }];
@@ -1792,10 +1793,12 @@ mod tests {
         let model_provider = OllamaModelProvider::builder("test").build();
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".into(),
                 content: r#"{"content":null,"tool_calls":[{"id":"call_7","name":"file_read","arguments":"{\"path\":\"README.md\"}"}]}"#.into(),
             },
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "tool".into(),
                 content: r#"{"tool_call_id":"call_7","content":"ok"}"#.into(),
             },
@@ -1814,6 +1817,7 @@ mod tests {
     fn convert_messages_extracts_images_from_user_marker() {
         let model_provider = OllamaModelProvider::builder("test").build();
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "user".into(),
             content: "Inspect this screenshot [IMAGE:data:image/png;base64,abcd==]".into(),
         }];

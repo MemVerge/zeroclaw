@@ -1,4 +1,5 @@
-use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::model_provider::{ChatMessage, MessageContentField, remap_content_sources};
+use zeroclaw_providers::compatible::decoded_json_content_sources;
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -182,15 +183,24 @@ pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatM
             .filter(|id| !seen_tool_ids.contains(id))
             .collect();
 
+        let mut content_sources = decoded_json_content_sources(&messages[idx]);
         if paired_calls.is_empty() {
             let salvaged_text = value
                 .get("content")
                 .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .map(ToString::to_string);
+                .filter(|text| !text.trim().is_empty());
             match salvaged_text {
-                Some(text) => messages[idx].content = text,
+                Some(text) => {
+                    let trimmed = text.trim();
+                    let start = text.len() - text.trim_start().len();
+                    let message = &mut messages[idx];
+                    message.content_sources = remap_content_sources(
+                        &content_sources,
+                        MessageContentField::Text,
+                        std::slice::from_ref(&(start..start + trimmed.len())),
+                    );
+                    message.content = trimmed.to_string();
+                }
                 None => {
                     messages.remove(idx);
                 }
@@ -202,6 +212,10 @@ pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatM
                     serde_json::Value::Array(paired_calls),
                 );
             }
+            for source in &mut content_sources {
+                source.field = MessageContentField::JsonContent;
+            }
+            messages[idx].content_sources = content_sources;
             messages[idx].content = value.to_string();
         }
         stripped += 1;
@@ -225,11 +239,115 @@ pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatM
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::model_provider::MessageContentSource;
+
+    #[test]
+    fn orphan_tool_salvage_preserves_raw_envelope_sources() {
+        let content = r#"{ "tool_calls": [{"id":"orphan"},{"id":"kept"}], "content": " \n前\"后\uD83D\uDE00\t " }"#;
+        let prose = " \n前\"后😀\t ";
+        let encoded_partial = r#"\"后\uD83D\uDE00"#;
+        let partial_start = content.find(encoded_partial).unwrap();
+        let tool_start = content.find("orphan").unwrap();
+        for keep_paired_call in [false, true] {
+            let mut messages = vec![ChatMessage {
+                content_sources: [
+                    (9, 0..content.len()),
+                    (10, partial_start..partial_start + encoded_partial.len()),
+                    (11, tool_start..tool_start + "orphan".len()),
+                ]
+                .into_iter()
+                .map(|(source_id, range)| MessageContentSource {
+                    source_id,
+                    field: MessageContentField::Text,
+                    range,
+                })
+                .collect(),
+                ..ChatMessage::assistant(content)
+            }];
+            if keep_paired_call {
+                messages.push(ChatMessage::tool(
+                    r#"{"tool_call_id":"kept","content":"ok"}"#,
+                ));
+            }
+
+            assert_eq!(strip_orphaned_tool_calls_from_assistants(&mut messages), 1);
+            let message = &messages[0];
+            let (field, expected, partial_offset) = if keep_paired_call {
+                let envelope: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+                assert_eq!(envelope["content"], prose);
+                assert_eq!(envelope["tool_calls"], serde_json::json!([{"id": "kept"}]));
+                (MessageContentField::JsonContent, prose, " \n前".len())
+            } else {
+                assert_eq!(message.content, prose.trim());
+                (MessageContentField::Text, prose.trim(), "前".len())
+            };
+            assert_eq!(
+                message.content_sources,
+                [
+                    MessageContentSource {
+                        source_id: 9,
+                        field,
+                        range: 0..expected.len(),
+                    },
+                    MessageContentSource {
+                        source_id: 10,
+                        field,
+                        range: partial_offset..partial_offset + "\"后😀".len(),
+                    },
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn orphan_tool_salvage_preserves_decoded_prose_sources() {
+        let prose = " \n前\"后\t ";
+        for keep_paired_call in [false, true] {
+            let mut messages = vec![
+                ChatMessage::user("question"),
+                ChatMessage {
+                    content_sources: vec![MessageContentSource {
+                        source_id: 9,
+                        field: MessageContentField::JsonContent,
+                        range: 0..prose.len(),
+                    }],
+                    ..ChatMessage::assistant(
+                        serde_json::json!({
+                            "content": prose,
+                            "tool_calls": [{"id": "orphan"}, {"id": "kept"}],
+                        })
+                        .to_string(),
+                    )
+                },
+            ];
+            if keep_paired_call {
+                messages.push(ChatMessage::tool(
+                    r#"{"tool_call_id":"kept","content":"ok"}"#,
+                ));
+            }
+            assert_eq!(strip_orphaned_tool_calls_from_assistants(&mut messages), 1);
+            let message = &messages[1];
+            let source = &message.content_sources[0];
+            assert_eq!(source.source_id, 9);
+            if keep_paired_call {
+                let envelope: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+                assert_eq!(envelope["content"], prose);
+                assert_eq!(envelope["tool_calls"], serde_json::json!([{"id": "kept"}]));
+                assert_eq!(source.field, MessageContentField::JsonContent);
+                assert_eq!(source.range, 0..prose.len());
+            } else {
+                assert_eq!(message.content, prose.trim());
+                assert_eq!(source.field, MessageContentField::Text);
+                assert_eq!(source.range, 0..prose.trim().len());
+            }
+        }
+    }
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_string(),
             content: content.to_string(),
+            content_sources: Vec::new(),
         }
     }
 
@@ -260,6 +378,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&messages[1].content).is_err(),
             "salvaged text must not parse back as a JSON object"
         );
+        assert!(messages[1].content_sources.is_empty());
     }
 
     #[test]
@@ -332,6 +451,7 @@ mod tests {
             Some("toolu_OK")
         );
         assert!(!messages[1].content.contains("toolu_ORPHAN"));
+        assert!(messages[1].content_sources.is_empty());
     }
 
     #[test]

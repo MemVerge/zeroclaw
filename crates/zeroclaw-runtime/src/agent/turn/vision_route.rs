@@ -140,10 +140,7 @@ pub(crate) async fn prepare_messages_for_iteration(
         // (captions, tool metadata) survives.
         let stripped: Vec<ChatMessage> = history
             .iter()
-            .map(|m| ChatMessage {
-                role: m.role.clone(),
-                content: multimodal::strip_media_markers(&m.content),
-            })
+            .map(multimodal::strip_media_markers_with_sources)
             .collect();
         match image_cache {
             Some(cache) => {
@@ -170,6 +167,91 @@ pub(crate) async fn prepare_messages_for_iteration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::model_provider::{MessageContentField, MessageContentSource};
+
+    #[tokio::test]
+    async fn prepare_preserves_sources_when_history_and_tool_continuation_change_positions() {
+        let sourced = |message: ChatMessage, source_id| ChatMessage {
+            content_sources: vec![MessageContentSource {
+                source_id,
+                field: MessageContentField::Text,
+                range: 0..message.content.len(),
+            }],
+            ..message
+        };
+        let history = vec![
+            ChatMessage::system("sys"),
+            sourced(ChatMessage::assistant("dropped leading turn"), 1),
+            sourced(ChatMessage::user("same"), 2),
+            sourced(ChatMessage::assistant("same"), 3),
+            ChatMessage::tool("result"),
+            ChatMessage::user("continue with the tool result"),
+        ];
+        let prepared =
+            prepare_messages_for_iteration(&history, &MultimodalConfig::default(), false, None)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&prepared.messages).unwrap(),
+            serde_json::to_value([
+                &history[0],
+                &history[2],
+                &history[3],
+                &history[4],
+                &history[5],
+            ])
+            .unwrap(),
+        );
+        assert_eq!(
+            prepared.messages[1].content_sources,
+            history[2].content_sources
+        );
+        assert_eq!(
+            prepared.messages[2].content_sources,
+            history[3].content_sources
+        );
+        assert!(prepared.messages[3].content_sources.is_empty());
+        assert!(prepared.messages[4].content_sources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_media_degrade_preserves_full_source_as_rendered() {
+        let content = "前 [IMAGE:/tmp/missing.png] 后";
+        let history = vec![ChatMessage {
+            content_sources: vec![MessageContentSource {
+                source_id: 7,
+                field: MessageContentField::Text,
+                range: 0..content.len(),
+            }],
+            ..ChatMessage::user(content)
+        }];
+        let prepared =
+            prepare_messages_for_iteration(&history, &MultimodalConfig::default(), true, None)
+                .await
+                .unwrap();
+        let message = &prepared.messages[0];
+        assert_eq!(message.content, "前 [media attachment] 后");
+        assert!(
+            message
+                .content_sources
+                .iter()
+                .all(|source| source.source_id == 7)
+        );
+        assert!(
+            message
+                .content_sources
+                .windows(2)
+                .all(|pair| { pair[0].range.end == pair[1].range.start })
+        );
+        assert_eq!(
+            message
+                .content_sources
+                .iter()
+                .map(|source| &message.content[source.range.clone()])
+                .collect::<String>(),
+            message.content,
+        );
+    }
 
     #[tokio::test]
     async fn prepare_messages_for_iteration_populates_and_reuses_image_cache() {

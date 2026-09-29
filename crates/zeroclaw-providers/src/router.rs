@@ -807,6 +807,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "user".to_string(),
             content: "use tools".to_string(),
         }];
@@ -838,6 +839,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage {
+            content_sources: Vec::new(),
             role: "user".to_string(),
             content: "reason about this".to_string(),
         }];

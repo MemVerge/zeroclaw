@@ -4,6 +4,9 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::model_provider::{
+    MessageContentField, MessageContentSource, remap_content_sources,
+};
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
@@ -174,16 +177,24 @@ fn collapse_wrapped_marker(raw: &str) -> String {
 }
 
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
+    let (text, refs, _) = image_marker_projection(content);
+    (text, refs)
+}
+
+fn image_marker_projection(content: &str) -> (String, Vec<String>, Vec<std::ops::Range<usize>>) {
+    let mut retained = Vec::new();
     let mut refs = Vec::new();
     let mut cleaned = String::with_capacity(content.len());
     let mut cursor = 0usize;
 
     while let Some(rel_start) = content[cursor..].find(IMAGE_MARKER_PREFIX) {
         let start = cursor + rel_start;
+        retained.push(cursor..start);
         cleaned.push_str(&content[cursor..start]);
 
         let marker_start = start + IMAGE_MARKER_PREFIX.len();
         let Some(rel_end) = content[marker_start..].find(']') else {
+            retained.push(start..content.len());
             cleaned.push_str(&content[start..]);
             cursor = content.len();
             break;
@@ -196,6 +207,7 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
             // Preserve the original marker text (placeholders like
             // `[IMAGE:...]` or `[IMAGE:<path>]` should survive as prose
             // rather than triggering a loader error).
+            retained.push(start..end + 1);
             cleaned.push_str(&content[start..=end]);
         } else {
             refs.push(candidate);
@@ -205,10 +217,47 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     }
 
     if cursor < content.len() {
+        retained.push(cursor..content.len());
         cleaned.push_str(&content[cursor..]);
     }
 
-    (cleaned.trim().to_string(), refs)
+    let trim_start = cleaned.len() - cleaned.trim_start().len();
+    let trim_end = cleaned.trim_end().len();
+    let mut offset = 0;
+    retained = retained
+        .into_iter()
+        .filter_map(|range| {
+            let start = trim_start.max(offset);
+            let end = trim_end.min(offset + range.len());
+            let mapped =
+                (start < end).then(|| range.start + start - offset..range.start + end - offset);
+            offset += range.len();
+            mapped
+        })
+        .collect();
+    (cleaned.trim().to_string(), refs, retained)
+}
+
+pub(crate) fn image_text_sources(
+    content: &str,
+    sources: &[MessageContentSource],
+) -> Vec<MessageContentSource> {
+    image_sources(content, sources, MessageContentField::Text)
+}
+
+fn image_sources(
+    content: &str,
+    sources: &[MessageContentSource],
+    field: MessageContentField,
+) -> Vec<MessageContentSource> {
+    if sources.is_empty() {
+        return Vec::new();
+    }
+    let (_, refs, retained) = image_marker_projection(content);
+    if refs.is_empty() {
+        return sources.to_vec();
+    }
+    remap_content_sources(sources, field, &retained)
 }
 
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
@@ -276,15 +325,124 @@ const MEDIA_MARKER_KINDS: &[&str] = &[
 /// document and file delivery.
 const AUDIO_MARKER_KINDS: &[&str] = &["VOICE", "AUDIO"];
 
+static MEDIA_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(&format!(
+        r"(?i)\[(?:{}):[^\]]*\]",
+        MEDIA_MARKER_KINDS.join("|")
+    ))
+    .unwrap()
+});
 pub fn strip_media_markers(text: &str) -> String {
-    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(&format!(
-            r"(?i)\[(?:{}):[^\]]*\]",
-            MEDIA_MARKER_KINDS.join("|")
-        ))
-        .unwrap()
-    });
-    RE.replace_all(text, "[media attachment]").into_owned()
+    MEDIA_MARKER_RE
+        .replace_all(text, "[media attachment]")
+        .into_owned()
+}
+
+fn replaced_sources(
+    text: &str,
+    sources: &[MessageContentSource],
+    field: MessageContentField,
+    replacements: impl IntoIterator<Item = std::ops::Range<usize>>,
+) -> Vec<MessageContentSource> {
+    if sources.is_empty() {
+        return Vec::new();
+    }
+    let mut output = sources
+        .iter()
+        .filter(|source| source.field != field)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut cursor = 0;
+    let mut output_offset = 0;
+    let ranges = replacements
+        .into_iter()
+        .chain(std::iter::once(text.len()..text.len()));
+    for replacement in ranges {
+        output.extend(
+            remap_content_sources(
+                sources,
+                field,
+                std::slice::from_ref(&(cursor..replacement.start)),
+            )
+            .into_iter()
+            .filter(|source| source.field == field)
+            .map(|mut source| {
+                source.range.start += output_offset;
+                source.range.end += output_offset;
+                source
+            }),
+        );
+        output_offset += replacement.start - cursor;
+        if !replacement.is_empty() {
+            output.extend(
+                sources
+                    .iter()
+                    .filter(|source| {
+                        source.field == field
+                            && source.range.start <= replacement.start
+                            && source.range.end >= replacement.end
+                    })
+                    .cloned()
+                    .map(|mut source| {
+                        source.range = output_offset..output_offset + "[media attachment]".len();
+                        source
+                    }),
+            );
+            output_offset += "[media attachment]".len();
+        }
+        cursor = replacement.end;
+    }
+    output
+}
+
+fn media_sources(
+    message: &ChatMessage,
+    markers: &regex::Regex,
+    loadable_only: bool,
+) -> Vec<MessageContentSource> {
+    let mut sources = message.content_sources.clone();
+    for field in [MessageContentField::Text, MessageContentField::JsonContent] {
+        if !sources.iter().any(|source| source.field == field) {
+            continue;
+        }
+        let decoded = if field == MessageContentField::JsonContent {
+            serde_json::from_str::<serde_json::Value>(&message.content)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+        } else {
+            None
+        };
+        let text = decoded.as_deref().unwrap_or(&message.content);
+        sources = replaced_sources(
+            text,
+            &sources,
+            field,
+            markers
+                .captures_iter(text)
+                .filter(|caps| {
+                    if !loadable_only {
+                        return true;
+                    }
+                    let payload = collapse_wrapped_marker(&caps[1]);
+                    !payload.is_empty() && is_loadable_image_reference(&payload)
+                })
+                .filter_map(|caps| caps.get(0).map(|matched| matched.range())),
+        );
+    }
+    sources
+}
+
+pub fn strip_media_markers_with_sources(message: &ChatMessage) -> ChatMessage {
+    ChatMessage {
+        role: message.role.clone(),
+        content: strip_media_markers(&message.content),
+        content_sources: media_sources(message, &MEDIA_MARKER_RE, false),
+    }
 }
 
 /// Matches the audio-kind markers ([`AUDIO_MARKER_KINDS`]), capturing the
@@ -353,9 +511,11 @@ pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
         .map(|m| {
             let (content, n) = strip_unplayable_audio_markers(&m.content);
             stripped += n;
+            let content_sources = media_sources(m, &AUDIO_MARKER_RE, true);
             ChatMessage {
                 role: m.role.clone(),
                 content,
+                content_sources,
             }
         })
         .collect();
@@ -463,12 +623,18 @@ fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
 
         obj.insert("content".to_string(), serde_json::Value::String(stripped));
         return ChatMessage {
+            content_sources: image_sources(
+                &inner,
+                &message.content_sources,
+                MessageContentField::JsonContent,
+            ),
             role: message.role.clone(),
             content: serde_json::Value::Object(obj).to_string(),
         };
     }
 
     ChatMessage {
+        content_sources: image_text_sources(&message.content, &message.content_sources),
         role: message.role.clone(),
         content: stripped_image_marker_text(&message.content),
     }
@@ -614,6 +780,21 @@ async fn prepare_messages_inner(
             .await
         {
             normalized_messages.push(ChatMessage {
+                content_sources: serde_json::from_str::<serde_json::Value>(&message.content)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|inner| {
+                                image_sources(
+                                    inner,
+                                    &message.content_sources,
+                                    MessageContentField::JsonContent,
+                                )
+                            })
+                    })
+                    .unwrap_or_else(|| message.content_sources.clone()),
                 role: message.role.clone(),
                 content: prepared,
             });
@@ -647,6 +828,7 @@ async fn prepare_messages_inner(
         );
         has_successful_images |= !normalized.data_uris.is_empty();
         normalized_messages.push(ChatMessage {
+            content_sources: image_text_sources(&message.content, &message.content_sources),
             role: message.role.clone(),
             content,
         });
@@ -735,6 +917,7 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
                     cleaned
                 };
                 ChatMessage {
+                    content_sources: image_text_sources(&m.content, &m.content_sources),
                     role: m.role.clone(),
                     content: text,
                 }
@@ -788,6 +971,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
                     cleaned
                 };
                 ChatMessage {
+                    content_sources: image_text_sources(&m.content, &m.content_sources),
                     role: m.role.clone(),
                     content: text,
                 }
@@ -1826,6 +2010,7 @@ mod tests {
         let messages = vec![
             ChatMessage::tool(native_tool_content),
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: "I generated the screenshot.".to_string(),
             },
@@ -1874,6 +2059,7 @@ mod tests {
                 image_path.display()
             )),
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: "I generated the screenshot.".to_string(),
             },
@@ -1914,6 +2100,7 @@ mod tests {
         let messages = vec![
             ChatMessage::tool(native_tool_content),
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: "I generated the screenshot.".to_string(),
             },
@@ -1956,6 +2143,7 @@ mod tests {
         let messages = vec![
             ChatMessage::tool("[IMAGE:/tmp/stale-tool.png]\nGenerated".to_string()),
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: "Done.".to_string(),
             },
@@ -1982,6 +2170,7 @@ mod tests {
         let just_sent = vec![
             ChatMessage::user("hi".to_string()),
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: "hello".to_string(),
             },
@@ -2081,6 +2270,7 @@ mod tests {
         // Assistant messages with image markers should not be counted or stripped.
         let messages = vec![
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: "[IMAGE:/tmp/assistant.png]\nAssistant generated".to_string(),
             },
@@ -2154,11 +2344,13 @@ mod tests {
         let messages = vec![
             ChatMessage::user("[IMAGE:/tmp/1.png]\nLook at this".to_string()),
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: "I see a photo.".to_string(),
             },
             ChatMessage::user("[IMAGE:/tmp/2.png]\nWhat about this?".to_string()),
             ChatMessage {
+                content_sources: Vec::new(),
                 role: "assistant".to_string(),
                 content: "That's a chart.".to_string(),
             },
