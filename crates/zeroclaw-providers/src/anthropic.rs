@@ -454,6 +454,13 @@ struct NativeToolSpec {
     /// is required — serialized transparently, deep-cloned only for schemas
     /// the Anthropic cleaner actually rewrites
     input_schema: std::sync::Arc<serde_json::Value>,
+    /// Stream each tool parameter as it is generated.
+    ///
+    /// Anthropic's default buffers a parameter until it is complete and sends
+    /// no SSE bytes during that time. A large argument then exceeds
+    /// [`SSE_IDLE_TIMEOUT`] and the stream is aborted while the model is
+    /// still writing.
+    eager_input_streaming: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
 }
@@ -1143,6 +1150,7 @@ impl AnthropicModelProvider {
                     &tool.parameters,
                     zeroclaw_api::schema::CleaningStrategy::Anthropic,
                 ),
+                eager_input_streaming: true,
                 cache_control: None,
             })
             .collect();
@@ -4106,6 +4114,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             name: "get_weather".to_string(),
             description: "Get weather info".to_string(),
             input_schema: schema.into(),
+            eager_input_streaming: true,
             cache_control: None,
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -4120,6 +4129,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             name: "get_weather".to_string(),
             description: "Get weather info".to_string(),
             input_schema: schema.into(),
+            eager_input_streaming: true,
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -4437,6 +4447,21 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(native_tools.len(), 2);
         assert!(native_tools[0].cache_control.is_none());
         assert!(native_tools[1].cache_control.is_some());
+        assert!(native_tools.iter().all(|tool| tool.eager_input_streaming));
+    }
+
+    #[test]
+    fn convert_tools_streams_tool_input_as_it_is_generated() {
+        let tools = vec![ToolSpec::new(
+            "run_javascript",
+            "Run a program",
+            serde_json::json!({"type": "object"}),
+        )];
+
+        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let json = serde_json::to_value(&native_tools[0]).unwrap();
+
+        assert_eq!(json["eager_input_streaming"], true);
     }
 
     #[test]
@@ -4811,6 +4836,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             api_tools[0]["input_schema"].is_object(),
             "Missing input_schema"
         );
+        assert_eq!(api_tools[0]["eager_input_streaming"], true);
 
         server_handle.abort();
     }
