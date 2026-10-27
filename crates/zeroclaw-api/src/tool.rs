@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+mod execution;
+pub use execution::{ToolCallCorrelation, ToolExecutionContext};
+
 #[macro_export]
 macro_rules! tool_attribution {
     ($ty:ty, $kind:expr) => {
@@ -344,6 +347,17 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
 
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
+
+    /// Dispatcher-owned correlation, never an authorization or success receipt.
+    /// Existing tools keep their `execute` behavior. Decorators that need exact
+    /// call attribution may override this method and forward the same context.
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        _context: ToolExecutionContext<'_>,
+    ) -> anyhow::Result<ToolResult> {
+        self.execute(args).await
+    }
 
     fn spec(&self) -> ToolSpec {
         ToolSpec {
