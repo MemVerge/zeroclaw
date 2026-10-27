@@ -1,11 +1,12 @@
 use crate::compatible::{
-    OpenAiCompatibleModelProvider, RequestHeaders, decoded_json_content_sources, projected_sources,
-    request_with_sources,
+    OpenAiCompatibleModelProvider, RequestHeaders, RequestHooks, decoded_json_content_sources,
+    projected_sources, request_with_sources,
 };
 use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
     build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
 };
+use crate::request_observer::RequestObserver;
 use crate::response_metadata::{ResponseMetadataObserver, begin_request, observe_response};
 use crate::stream_guard::{AbortOnDrop, SseFinish};
 use crate::traits::{
@@ -49,6 +50,7 @@ pub struct OpenAiModelProvider {
     extra_headers: Vec<(HeaderName, HeaderValue)>,
     response_observer: Option<ResponseMetadataObserver>,
     request_headers: Option<RequestHeaders>,
+    request_observer: Option<RequestObserver>,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,9 +246,17 @@ pub struct OpenAiBuilder {
     extra_headers: std::collections::HashMap<String, String>,
     response_observer: Option<ResponseMetadataObserver>,
     request_headers: Option<RequestHeaders>,
+    request_observer: Option<RequestObserver>,
 }
 
 impl OpenAiBuilder {
+    /// Opt in to bounded Chat Completions projection samples. This does not
+    /// enable observation on the separate Responses API provider.
+    pub fn request_observer(mut self, observer: Option<RequestObserver>) -> Self {
+        self.request_observer = observer;
+        self
+    }
+
     /// Set the opt-in Chat Completions callback described by [`RequestHeaders`].
     /// This does not enable source projection on [`OpenAiResponsesModelProvider`].
     pub fn request_headers(mut self, callback: Option<RequestHeaders>) -> Self {
@@ -317,11 +327,19 @@ impl OpenAiBuilder {
             ),
             response_observer: self.response_observer,
             request_headers: self.request_headers,
+            request_observer: self.request_observer,
         }
     }
 }
 
 impl OpenAiModelProvider {
+    fn request_hooks(&self) -> RequestHooks<'_> {
+        RequestHooks {
+            headers: self.request_headers.as_ref(),
+            observer: self.request_observer.as_ref(),
+        }
+    }
+
     /// Entry point. Only `alias` is required; every other field is set
     /// via a labelled chain method on the returned [`OpenAiBuilder`].
     pub fn builder(alias: &str) -> OpenAiBuilder {
@@ -334,6 +352,7 @@ impl OpenAiModelProvider {
             extra_headers: std::collections::HashMap::new(),
             response_observer: None,
             request_headers: None,
+            request_observer: None,
         }
     }
 
@@ -523,7 +542,7 @@ impl OpenAiModelProvider {
         let mut observation = begin_request(&self.response_observer);
         let response = crate::extra_headers::apply_extra_headers(
             request_with_sources(
-                &self.request_headers,
+                self.request_hooks(),
                 crate::extra_headers::ReservedHeaders::OPENAI,
                 &[],
                 self.http_client()
@@ -691,7 +710,7 @@ impl ModelProvider for OpenAiModelProvider {
         let mut observation = begin_request(&self.response_observer);
         let response = crate::extra_headers::apply_extra_headers(
             request_with_sources(
-                &self.request_headers,
+                self.request_hooks(),
                 crate::extra_headers::ReservedHeaders::OPENAI,
                 &[],
                 self.http_client()
@@ -792,7 +811,7 @@ impl ModelProvider for OpenAiModelProvider {
         let mut observation = begin_request(&self.response_observer);
         let response = crate::extra_headers::apply_extra_headers(
             request_with_sources(
-                &self.request_headers,
+                self.request_hooks(),
                 crate::extra_headers::ReservedHeaders::OPENAI,
                 &[],
                 self.http_client()

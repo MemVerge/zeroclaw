@@ -4,6 +4,8 @@
 
 use crate::auth::AuthService;
 use crate::multimodal;
+use crate::request_observer::RequestObserver;
+pub(crate) use crate::request_observer::request::{RequestHooks, request_with_sources};
 use crate::response_metadata::{ResponseMetadataObserver, begin_request, observe_response};
 use crate::stream_guard::{AbortOnDrop, SseFinish};
 use crate::traits::{
@@ -74,6 +76,7 @@ pub struct OpenAiCompatibleModelProvider {
     extra_headers: std::collections::HashMap<String, String>,
     response_observer: Option<ResponseMetadataObserver>,
     request_headers: Option<RequestHeaders>,
+    request_observer: Option<RequestObserver>,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
     reasoning_effort: Option<String>,
     /// Whether stored assistant reasoning should be replayed on outbound
@@ -344,6 +347,7 @@ pub struct OpenAiCompatibleBuilder {
     extra_headers: std::collections::HashMap<String, String>,
     response_observer: Option<ResponseMetadataObserver>,
     request_headers: Option<RequestHeaders>,
+    request_observer: Option<RequestObserver>,
     reasoning_effort: Option<String>,
     /// Set to `Some(false)` by
     /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
@@ -363,6 +367,13 @@ pub struct OpenAiCompatibleBuilder {
 }
 
 impl OpenAiCompatibleBuilder {
+    /// Observe bounded samples before transport without requiring a header
+    /// callback. No samples are materialized unless the host selects them.
+    pub fn request_observer(mut self, observer: Option<RequestObserver>) -> Self {
+        self.request_observer = observer;
+        self
+    }
+
     /// Set the opt-in Chat Completions callback described by [`RequestHeaders`].
     pub fn request_headers(mut self, callback: Option<RequestHeaders>) -> Self {
         self.request_headers = callback;
@@ -613,6 +624,7 @@ impl OpenAiCompatibleBuilder {
             extra_headers: self.extra_headers,
             response_observer: self.response_observer,
             request_headers: self.request_headers,
+            request_observer: self.request_observer,
             reasoning_effort: self.reasoning_effort,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
             api_path: self.api_path,
@@ -651,6 +663,7 @@ impl OpenAiCompatibleModelProvider {
             extra_headers: std::collections::HashMap::new(),
             response_observer: None,
             request_headers: None,
+            request_observer: None,
             reasoning_effort: None,
             replay_assistant_reasoning_override: None,
             api_path: None,
@@ -1141,32 +1154,6 @@ pub fn decoded_json_content_sources(message: &ChatMessage) -> Vec<MessageContent
         );
     }
     sources
-}
-
-pub(crate) fn request_with_sources(
-    callback: &Option<RequestHeaders>,
-    reserved: crate::extra_headers::ReservedHeaders,
-    additional_reserved: &[&str],
-    builder: reqwest::RequestBuilder,
-    request: &impl Serialize,
-    sources: Vec<ProjectedMessageSource>,
-) -> anyhow::Result<reqwest::RequestBuilder> {
-    match callback {
-        Some(callback) => {
-            let body = serde_json::to_value(request)?;
-            let mut headers = callback(&body, &sources)?;
-            let owned = headers
-                .keys()
-                .filter(|name| reserved.contains(name.as_str(), additional_reserved))
-                .cloned()
-                .collect::<Vec<_>>();
-            for name in owned {
-                headers.remove(name);
-            }
-            Ok(builder.headers(headers).json(request))
-        }
-        None => Ok(builder.json(request)),
-    }
 }
 
 pub(crate) fn projected_sources<'a>(
@@ -2225,6 +2212,13 @@ fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatRes
 }
 
 impl OpenAiCompatibleModelProvider {
+    fn request_hooks(&self) -> RequestHooks<'_> {
+        RequestHooks {
+            headers: self.request_headers.as_ref(),
+            observer: self.request_observer.as_ref(),
+        }
+    }
+
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
@@ -3050,7 +3044,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = match self
             .apply_auth_header(
                 request_with_sources(
-                    &self.request_headers,
+                    self.request_hooks(),
                     crate::extra_headers::ReservedHeaders::COMPATIBLE,
                     &self.additional_reserved_headers(credential.as_deref(), &[]),
                     self.http_client().post(&url),
@@ -3153,7 +3147,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = match self
             .apply_auth_header(
                 request_with_sources(
-                    &self.request_headers,
+                    self.request_hooks(),
                     crate::extra_headers::ReservedHeaders::COMPATIBLE,
                     &self.additional_reserved_headers(credential.as_deref(), &[]),
                     self.http_client().post(&url),
@@ -3246,7 +3240,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = match self
             .apply_auth_header(
                 request_with_sources(
-                    &self.request_headers,
+                    self.request_hooks(),
                     crate::extra_headers::ReservedHeaders::COMPATIBLE,
                     &self.additional_reserved_headers(credential.as_deref(), &[]),
                     self.http_client().post(&url),
@@ -3382,7 +3376,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = match self
             .apply_auth_header(
                 request_with_sources(
-                    &self.request_headers,
+                    self.request_hooks(),
                     crate::extra_headers::ReservedHeaders::COMPATIBLE,
                     &self.additional_reserved_headers(credential.as_deref(), &[]),
                     self.http_client().post(&url),
@@ -3616,7 +3610,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let targets_mistral_tool_call_contract = provider.targets_mistral_tool_call_contract();
 
             let builder = match request_with_sources(
-                &provider.request_headers,
+                provider.request_hooks(),
                 crate::extra_headers::ReservedHeaders::COMPATIBLE,
                 &provider.additional_reserved_headers(credential.as_deref(), &["accept"]),
                 client.post(&url),
@@ -3781,7 +3775,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             // Build request with auth
             let builder = match request_with_sources(
-                &provider.request_headers,
+                provider.request_hooks(),
                 crate::extra_headers::ReservedHeaders::COMPATIBLE,
                 &provider.additional_reserved_headers(credential.as_deref(), &["accept"]),
                 client.post(&url),
@@ -3923,7 +3917,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let builder = match request_with_sources(
-                &provider.request_headers,
+                provider.request_hooks(),
                 crate::extra_headers::ReservedHeaders::COMPATIBLE,
                 &provider.additional_reserved_headers(credential.as_deref(), &["accept"]),
                 client.post(&url),
