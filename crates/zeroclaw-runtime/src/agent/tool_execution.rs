@@ -15,6 +15,10 @@ use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
 use super::turn::{ModelSwitchCallback, TurnMeta, scope_model_switch_state};
 
+#[cfg(test)]
+#[path = "tool_execution/context_tests.rs"]
+mod context_tests;
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// If a just-completed tool call was a successful `TodoWrite`, build the
@@ -250,7 +254,16 @@ pub(crate) async fn execute_one_tool(
     }
 
     let tool_future = tool
-        .execute(call_arguments.clone())
+        .execute_with_context(
+            call_arguments.clone(),
+            zeroclaw_api::tool::ToolExecutionContext {
+                turn_id: meta.turn_id,
+                call: match tool_call_id_owned.as_deref() {
+                    Some(id) => zeroclaw_api::tool::ToolCallCorrelation::Native(id),
+                    None => zeroclaw_api::tool::ToolCallCorrelation::EventOnly(&event_call_id),
+                },
+            },
+        )
         .instrument(tool_span.clone());
     let execute = async {
         if let Some(token) = cancellation_token {
