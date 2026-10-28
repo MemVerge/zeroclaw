@@ -95,6 +95,9 @@ impl StructuredStreamRetryStrategy {
     }
 
     fn should_retry(&self, error: &StreamError) -> bool {
+        if matches!(error, StreamError::SubmissionDenied(_)) {
+            return false;
+        }
         is_retryable_stream_error(error, self.policy) || self.extension_should_retry(error)
     }
 
@@ -270,6 +273,9 @@ pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
+    if is_local_submission_denied(err) {
+        return true;
+    }
     // Context window errors are NOT non-retryable — they can be recovered
     // by truncating conversation history, so let the retry loop handle them.
     if is_context_window_exceeded(err) {
@@ -332,6 +338,10 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("unsupported")
             || msg_lower.contains("does not exist")
             || msg_lower.contains("invalid"))
+}
+
+pub fn is_local_submission_denied(error: &anyhow::Error) -> bool {
+    zeroclaw_api::model_provider::submission::SubmissionDenied::from_error(error).is_some()
 }
 
 /// Check if an error indicates an authentication/authorization failure.
@@ -1195,7 +1205,9 @@ fn is_broadly_retryable_stream_error(error: &StreamError) -> bool {
         StreamError::Http(message) | StreamError::ModelProvider(message) => {
             !is_non_retryable(&anyhow::Error::msg(message.clone()))
         }
-        StreamError::Json(_) | StreamError::InvalidSse(_) => false,
+        StreamError::Json(_) | StreamError::InvalidSse(_) | StreamError::SubmissionDenied(_) => {
+            false
+        }
     }
 }
 
@@ -1205,7 +1217,9 @@ fn is_connection_retryable_stream_error(error: &StreamError) -> bool {
         StreamError::Http(message) | StreamError::ModelProvider(message) => {
             is_retryable_transport_message(message)
         }
-        StreamError::Json(_) | StreamError::InvalidSse(_) => false,
+        StreamError::Json(_) | StreamError::InvalidSse(_) | StreamError::SubmissionDenied(_) => {
+            false
+        }
     }
 }
 
@@ -1326,7 +1340,10 @@ fn is_context_window_stream_error(error: &StreamError) -> bool {
         StreamError::Http(message) | StreamError::ModelProvider(message) => {
             is_context_window_exceeded(&anyhow::Error::msg(message.clone()))
         }
-        StreamError::Io(_) | StreamError::Json(_) | StreamError::InvalidSse(_) => false,
+        StreamError::Io(_)
+        | StreamError::Json(_)
+        | StreamError::InvalidSse(_)
+        | StreamError::SubmissionDenied(_) => false,
     }
 }
 
@@ -1563,6 +1580,9 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            if is_local_submission_denied(&e) {
+                                return Err(e);
+                            }
                             // Context window exceeded: no history to truncate
                             // in chat_with_system, bail immediately.
                             if is_context_window_exceeded(&e) {
@@ -1763,6 +1783,9 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            if is_local_submission_denied(&e) {
+                                return Err(e);
+                            }
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let dropped = truncate_for_context(&mut effective_messages);
@@ -2013,6 +2036,9 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            if is_local_submission_denied(&e) {
+                                return Err(e);
+                            }
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let dropped = truncate_for_context(&mut effective_messages);
@@ -2224,6 +2250,9 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            if is_local_submission_denied(&e) {
+                                return Err(e);
+                            }
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let dropped = truncate_for_context(&mut effective_messages);
@@ -2628,6 +2657,10 @@ impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "reliable/submission_tests.rs"]
+mod submission_tests;
 
 #[cfg(test)]
 mod tests {
