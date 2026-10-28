@@ -26,6 +26,7 @@ pub mod openrouter_catalog;
 pub mod pricing;
 pub mod reliable;
 pub mod request_observer;
+pub(crate) mod request_submission;
 pub mod response_metadata;
 pub mod router;
 pub(crate) mod stream_guard;

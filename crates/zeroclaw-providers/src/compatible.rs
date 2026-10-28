@@ -5,6 +5,10 @@
 use crate::auth::AuthService;
 use crate::multimodal;
 use crate::request_observer::RequestObserver;
+use crate::request_submission::receipt::from_response as submission_receipt;
+use std::sync::Arc;
+use zeroclaw_api::model_provider::submission::RequestSubmissionAuthorizer;
+mod submission;
 pub(crate) use crate::request_observer::request::{RequestHooks, request_with_sources};
 use crate::response_metadata::{ResponseMetadataObserver, begin_request, observe_response};
 use crate::stream_guard::{AbortOnDrop, SseFinish};
@@ -20,6 +24,9 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
+use submission::{
+    CompleteSubmission, SubmissionMode, SubmissionSendInput, publish_submission_error,
+};
 use zeroclaw_api::StopReason;
 use zeroclaw_api::model_provider::{
     MessageContentField, MessageContentSource, ProjectedMessageSource,
@@ -77,6 +84,7 @@ pub struct OpenAiCompatibleModelProvider {
     response_observer: Option<ResponseMetadataObserver>,
     request_headers: Option<RequestHeaders>,
     request_observer: Option<RequestObserver>,
+    submission_authorizer: Option<Arc<dyn RequestSubmissionAuthorizer>>,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
     reasoning_effort: Option<String>,
     /// Whether stored assistant reasoning should be replayed on outbound
@@ -348,6 +356,7 @@ pub struct OpenAiCompatibleBuilder {
     response_observer: Option<ResponseMetadataObserver>,
     request_headers: Option<RequestHeaders>,
     request_observer: Option<RequestObserver>,
+    submission_authorizer: Option<Arc<dyn RequestSubmissionAuthorizer>>,
     reasoning_effort: Option<String>,
     /// Set to `Some(false)` by
     /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
@@ -367,6 +376,17 @@ pub struct OpenAiCompatibleBuilder {
 }
 
 impl OpenAiCompatibleBuilder {
+    /// Authorize each actual Chat Completions HTTP dispatch with live host
+    /// ownership. This is separate from diagnostic sampling and header callbacks.
+    /// Default None preserves the legacy path. A configured gate fails closed;
+    /// redirects/automatic transport retries are disabled for gated sends.
+    pub fn submission_authorizer(
+        mut self,
+        authorizer: Option<Arc<dyn RequestSubmissionAuthorizer>>,
+    ) -> Self {
+        self.submission_authorizer = authorizer;
+        self
+    }
     /// Observe bounded samples before transport without requiring a header
     /// callback. No samples are materialized unless the host selects them.
     pub fn request_observer(mut self, observer: Option<RequestObserver>) -> Self {
@@ -625,6 +645,7 @@ impl OpenAiCompatibleBuilder {
             response_observer: self.response_observer,
             request_headers: self.request_headers,
             request_observer: self.request_observer,
+            submission_authorizer: self.submission_authorizer,
             reasoning_effort: self.reasoning_effort,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
             api_path: self.api_path,
@@ -664,6 +685,7 @@ impl OpenAiCompatibleModelProvider {
             response_observer: None,
             request_headers: None,
             request_observer: None,
+            submission_authorizer: None,
             reasoning_effort: None,
             replay_assistant_reasoning_override: None,
             api_path: None,
@@ -1895,6 +1917,7 @@ fn sse_bytes_to_chunks(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+    let receipt = submission_receipt(&response);
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
     let handle = ::zeroclaw_spawn::spawn!(async move {
@@ -1979,10 +2002,11 @@ fn sse_bytes_to_chunks(
     });
 
     let guard = AbortOnDrop::new(handle.abort_handle());
-    stream::unfold((rx, guard), |(mut rx, guard)| async {
+    let chunks = stream::unfold((rx, guard), |(mut rx, guard)| async {
         rx.recv().await.map(|chunk| (chunk, (rx, guard)))
     })
-    .boxed()
+    .boxed();
+    submission::observe_chunks(receipt, chunks)
 }
 
 /// Convert SSE byte stream to structured streaming events.
@@ -2011,6 +2035,7 @@ fn sse_bytes_to_events_for_contract(
     count_tokens: bool,
     targets_mistral_tool_call_contract: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+    let receipt = submission_receipt(&response);
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
     let handle = ::zeroclaw_spawn::spawn!(async move {
@@ -2186,10 +2211,11 @@ fn sse_bytes_to_events_for_contract(
     });
 
     let guard = AbortOnDrop::new(handle.abort_handle());
-    stream::unfold((rx, guard), |(mut rx, guard)| async move {
+    let events = stream::unfold((rx, guard), |(mut rx, guard)| async move {
         rx.recv().await.map(|event| (event, (rx, guard)))
     })
-    .boxed()
+    .boxed();
+    submission::observe_events(receipt, events)
 }
 
 fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
@@ -2216,6 +2242,7 @@ impl OpenAiCompatibleModelProvider {
         RequestHooks {
             headers: self.request_headers.as_ref(),
             observer: self.request_observer.as_ref(),
+            submission: self.submission_authorizer.as_deref(),
         }
     }
 
@@ -3038,36 +3065,29 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             max_tokens: self.max_tokens,
         };
 
-        let url = self.chat_completions_url();
-
+        let sources = projected_sources(
+            request
+                .messages
+                .iter()
+                .map(|message| &message.content_sources),
+        );
         let mut observation = begin_request(&self.response_observer);
         let response = match self
-            .apply_auth_header(
-                request_with_sources(
-                    self.request_hooks(),
-                    crate::extra_headers::ReservedHeaders::COMPATIBLE,
-                    &self.additional_reserved_headers(credential.as_deref(), &[]),
-                    self.http_client().post(&url),
-                    &request,
-                    projected_sources(
-                        request
-                            .messages
-                            .iter()
-                            .map(|message| &message.content_sources),
-                    ),
-                )?,
-                credential.as_deref(),
-            )
-            .send()
+            .send_complete(CompleteSubmission {
+                body: &request,
+                sources: &sources,
+                credential: credential.as_deref(),
+            })
             .await
         {
             Ok(response) => response,
             Err(chat_error) => {
-                return Err(chat_error.into());
+                return Err(chat_error.into_anyhow());
             }
         };
 
         observe_response(&mut observation, &response);
+        let receipt = submission_receipt(&response);
         if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await?;
@@ -3077,6 +3097,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
+
+        submission::observe_parsed(receipt.as_ref(), &chat_response);
 
         chat_response
             .choices
@@ -3142,39 +3164,35 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             max_tokens: self.max_tokens,
         };
 
-        let url = self.chat_completions_url();
+        let sources = projected_sources(
+            request
+                .messages
+                .iter()
+                .map(|message| &message.content_sources),
+        );
         let mut observation = begin_request(&self.response_observer);
         let response = match self
-            .apply_auth_header(
-                request_with_sources(
-                    self.request_hooks(),
-                    crate::extra_headers::ReservedHeaders::COMPATIBLE,
-                    &self.additional_reserved_headers(credential.as_deref(), &[]),
-                    self.http_client().post(&url),
-                    &request,
-                    projected_sources(
-                        request
-                            .messages
-                            .iter()
-                            .map(|message| &message.content_sources),
-                    ),
-                )?,
-                credential.as_deref(),
-            )
-            .send()
+            .send_complete(CompleteSubmission {
+                body: &request,
+                sources: &sources,
+                credential: credential.as_deref(),
+            })
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => return Err(chat_error.into()),
+            Err(chat_error) => return Err(chat_error.into_anyhow()),
         };
 
         observe_response(&mut observation, &response);
+        let receipt = submission_receipt(&response);
         if !response.status().is_success() {
             return Err(super::api_error(&self.name, response).await);
         }
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
+
+        submission::observe_parsed(receipt.as_ref(), &chat_response);
 
         chat_response
             .choices
@@ -3235,30 +3253,27 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             !merge,
         );
 
-        let url = self.chat_completions_url();
+        let sources = projected_sources(
+            request
+                .messages
+                .iter()
+                .map(|message| &message.content_sources),
+        );
         let mut observation = begin_request(&self.response_observer);
         let response = match self
-            .apply_auth_header(
-                request_with_sources(
-                    self.request_hooks(),
-                    crate::extra_headers::ReservedHeaders::COMPATIBLE,
-                    &self.additional_reserved_headers(credential.as_deref(), &[]),
-                    self.http_client().post(&url),
-                    &request,
-                    projected_sources(
-                        request
-                            .messages
-                            .iter()
-                            .map(|message| &message.content_sources),
-                    ),
-                )?,
-                credential.as_deref(),
-            )
-            .send()
+            .send_complete(CompleteSubmission {
+                body: &request,
+                sources: &sources,
+                credential: credential.as_deref(),
+            })
             .await
         {
             Ok(response) => response,
             Err(error) => {
+                if !error.is_transport() {
+                    return Err(error.into_anyhow());
+                }
+                let error = error.into_anyhow();
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3280,12 +3295,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         };
 
         observe_response(&mut observation, &response);
+        let receipt = submission_receipt(&response);
         if !response.status().is_success() {
             return Err(super::api_error(&self.name, response).await);
         }
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
+        submission::observe_parsed(receipt.as_ref(), &chat_response);
         let usage = chat_response.usage.map(UsageInfo::into_provider_usage);
         let choice = chat_response.choices.into_iter().next().ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -3371,33 +3388,27 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             );
         }
 
-        let url = self.chat_completions_url();
+        let sources = projected_sources(
+            native_request
+                .messages
+                .iter()
+                .map(|message| &message.content_sources),
+        );
         let mut observation = begin_request(&self.response_observer);
         let response = match self
-            .apply_auth_header(
-                request_with_sources(
-                    self.request_hooks(),
-                    crate::extra_headers::ReservedHeaders::COMPATIBLE,
-                    &self.additional_reserved_headers(credential.as_deref(), &[]),
-                    self.http_client().post(&url),
-                    &native_request,
-                    projected_sources(
-                        native_request
-                            .messages
-                            .iter()
-                            .map(|message| &message.content_sources),
-                    ),
-                )?,
-                credential.as_deref(),
-            )
-            .send()
+            .send_complete(CompleteSubmission {
+                body: &native_request,
+                sources: &sources,
+                credential: credential.as_deref(),
+            })
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => return Err(chat_error.into()),
+            Err(chat_error) => return Err(chat_error.into_anyhow()),
         };
 
         observe_response(&mut observation, &response);
+        let receipt = submission_receipt(&response);
         if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await?;
@@ -3422,6 +3433,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
 
         let native_response: ApiChatResponse = response.json().await?;
+        submission::observe_parsed(receipt.as_ref(), &native_response);
         let usage = native_response.usage.map(UsageInfo::into_provider_usage);
         let message = native_response
             .choices
@@ -3596,7 +3608,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let url = provider.chat_completions_url();
-            let client = provider.streaming_http_client();
+            let client = match provider.submission_request_client(SubmissionMode::Stream) {
+                Ok(client) => client,
+                Err(reason) => {
+                    publish_submission_error(&tx, StreamError::SubmissionDenied(reason)).await;
+                    return;
+                }
+            };
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -3615,13 +3633,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 &provider.additional_reserved_headers(credential.as_deref(), &["accept"]),
                 client.post(&url),
                 &payload,
-                sources,
+                &sources,
             ) {
                 Ok(builder) => builder,
                 Err(error) => {
-                    let _ = tx
-                        .send(Err(StreamError::ModelProvider(error.to_string())))
-                        .await;
+                    publish_submission_error(
+                        &tx,
+                        crate::request_submission::preparation_stream_error(error),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -3631,12 +3651,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             let mut observation = begin_request(&provider.response_observer);
-            let response = match req_builder.send().await {
+            let response = match provider
+                .send_submission(SubmissionSendInput {
+                    builder: req_builder,
+                    sources: &sources,
+                })
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
-                        .await;
+                    publish_submission_error(&tx, e.into_stream_error()).await;
                     return;
                 }
             };
@@ -3761,7 +3785,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let url = provider.chat_completions_url();
-            let client = provider.streaming_http_client();
+            let client = match provider.submission_request_client(SubmissionMode::Stream) {
+                Ok(client) => client,
+                Err(reason) => {
+                    publish_submission_error(&tx, StreamError::SubmissionDenied(reason)).await;
+                    return;
+                }
+            };
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -3774,24 +3804,27 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             // Build request with auth
+            let sources = projected_sources(
+                request
+                    .messages
+                    .iter()
+                    .map(|message| &message.content_sources),
+            );
             let builder = match request_with_sources(
                 provider.request_hooks(),
                 crate::extra_headers::ReservedHeaders::COMPATIBLE,
                 &provider.additional_reserved_headers(credential.as_deref(), &["accept"]),
                 client.post(&url),
                 &request,
-                projected_sources(
-                    request
-                        .messages
-                        .iter()
-                        .map(|message| &message.content_sources),
-                ),
+                &sources,
             ) {
                 Ok(builder) => builder,
                 Err(error) => {
-                    let _ = tx
-                        .send(Err(StreamError::ModelProvider(error.to_string())))
-                        .await;
+                    publish_submission_error(
+                        &tx,
+                        crate::request_submission::preparation_stream_error(error),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -3806,12 +3839,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             // Send request
             let mut observation = begin_request(&provider.response_observer);
-            let response = match req_builder.send().await {
+            let response = match provider
+                .send_submission(SubmissionSendInput {
+                    builder: req_builder,
+                    sources: &sources,
+                })
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
-                        .await;
+                    publish_submission_error(&tx, e.into_stream_error()).await;
                     return;
                 }
             };
@@ -3904,7 +3941,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let url = provider.chat_completions_url();
-            let client = provider.streaming_http_client();
+            let client = match provider.submission_request_client(SubmissionMode::Stream) {
+                Ok(client) => client,
+                Err(reason) => {
+                    publish_submission_error(&tx, StreamError::SubmissionDenied(reason)).await;
+                    return;
+                }
+            };
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -3916,24 +3959,27 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
             };
 
+            let sources = projected_sources(
+                request
+                    .messages
+                    .iter()
+                    .map(|message| &message.content_sources),
+            );
             let builder = match request_with_sources(
                 provider.request_hooks(),
                 crate::extra_headers::ReservedHeaders::COMPATIBLE,
                 &provider.additional_reserved_headers(credential.as_deref(), &["accept"]),
                 client.post(&url),
                 &request,
-                projected_sources(
-                    request
-                        .messages
-                        .iter()
-                        .map(|message| &message.content_sources),
-                ),
+                &sources,
             ) {
                 Ok(builder) => builder,
                 Err(error) => {
-                    let _ = tx
-                        .send(Err(StreamError::ModelProvider(error.to_string())))
-                        .await;
+                    publish_submission_error(
+                        &tx,
+                        crate::request_submission::preparation_stream_error(error),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -3943,12 +3989,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             let mut observation = begin_request(&provider.response_observer);
-            let response = match req_builder.send().await {
+            let response = match provider
+                .send_submission(SubmissionSendInput {
+                    builder: req_builder,
+                    sources: &sources,
+                })
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
-                        .await;
+                    publish_submission_error(&tx, e.into_stream_error()).await;
                     return;
                 }
             };

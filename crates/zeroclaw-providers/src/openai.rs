@@ -337,6 +337,7 @@ impl OpenAiModelProvider {
         RequestHooks {
             headers: self.request_headers.as_ref(),
             observer: self.request_observer.as_ref(),
+            submission: None,
         }
     }
 
@@ -549,7 +550,7 @@ impl OpenAiModelProvider {
                     .post(format!("{}/chat/completions", self.base_url))
                     .header("Authorization", format!("Bearer {credential}")),
                 &request,
-                projected_sources(
+                &projected_sources(
                     request
                         .messages
                         .iter()
@@ -717,7 +718,7 @@ impl ModelProvider for OpenAiModelProvider {
                     .post(format!("{}/chat/completions", self.base_url))
                     .header("Authorization", format!("Bearer {credential}")),
                 &native_request,
-                projected_sources(
+                &projected_sources(
                     native_request
                         .messages
                         .iter()
@@ -818,7 +819,7 @@ impl ModelProvider for OpenAiModelProvider {
                     .post(format!("{}/chat/completions", self.base_url))
                     .header("Authorization", format!("Bearer {credential}")),
                 &native_request,
-                projected_sources(
+                &projected_sources(
                     native_request
                         .messages
                         .iter()
