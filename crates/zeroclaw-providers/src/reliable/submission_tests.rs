@@ -21,7 +21,8 @@ impl ModelProvider for DenyingProvider {
         _: Option<f64>,
     ) -> anyhow::Result<String> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Err(SubmissionDenied::PermitUnavailable.into())
+        Err(anyhow::Error::msg("synthetic owner rejection")
+            .context(SubmissionDenied::PermitUnavailable))
     }
 }
 
@@ -125,6 +126,22 @@ fn local_denial_does_not_trigger_context_truncation_or_transport_recovery() {
 fn typed_local_denial_survives_an_anyhow_stream_error_wrapper() {
     let error = anyhow::Error::new(StreamError::SubmissionDenied(SubmissionDenied::WorkLimit))
         .context("outer caller");
+    assert!(is_local_submission_denied(&error));
+    assert!(is_non_retryable(&error));
+}
+
+#[test]
+fn a_local_denial_in_anyhow_context_remains_terminal() {
+    let error = anyhow::Error::msg("transport failure from owner")
+        .context(SubmissionDenied::BindingChanged);
+    assert!(is_local_submission_denied(&error));
+    assert!(is_non_retryable(&error));
+}
+
+#[test]
+fn a_stream_denial_in_anyhow_context_remains_terminal() {
+    let error = anyhow::Error::msg("transport failure from owner")
+        .context(StreamError::SubmissionDenied(SubmissionDenied::WorkLimit));
     assert!(is_local_submission_denied(&error));
     assert!(is_non_retryable(&error));
 }
