@@ -341,9 +341,7 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
 }
 
 pub fn is_local_submission_denied(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.is::<zeroclaw_api::model_provider::submission::SubmissionDenied>())
+    zeroclaw_api::model_provider::submission::SubmissionDenied::from_error(error).is_some()
 }
 
 /// Check if an error indicates an authentication/authorization failure.

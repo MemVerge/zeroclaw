@@ -31,11 +31,8 @@ impl SubmissionSendError {
 }
 
 pub(crate) fn preparation_stream_error(error: anyhow::Error) -> StreamError {
-    match error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<SubmissionDenied>())
-    {
-        Some(reason) => StreamError::SubmissionDenied(*reason),
+    match SubmissionDenied::from_error(&error) {
+        Some(reason) => StreamError::SubmissionDenied(reason),
         None => StreamError::ModelProvider(error.to_string()),
     }
 }

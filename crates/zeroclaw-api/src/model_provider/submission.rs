@@ -31,6 +31,37 @@ pub enum SubmissionDenied {
     InvalidHeaders,
 }
 
+impl SubmissionDenied {
+    /// Finds typed denial facts in both anyhow context and ordinary sources.
+    /// Display strings never establish a local admission decision.
+    pub fn from_error(error: &anyhow::Error) -> Option<Self> {
+        error
+            .downcast_ref::<Self>()
+            .copied()
+            .or_else(|| {
+                error
+                    .downcast_ref::<super::StreamError>()
+                    .and_then(Self::from_stream)
+            })
+            .or_else(|| error.chain().find_map(Self::from_cause))
+    }
+
+    fn from_cause(error: &(dyn std::error::Error + 'static)) -> Option<Self> {
+        error.downcast_ref::<Self>().copied().or_else(|| {
+            error
+                .downcast_ref::<super::StreamError>()
+                .and_then(Self::from_stream)
+        })
+    }
+
+    fn from_stream(error: &super::StreamError) -> Option<Self> {
+        match error {
+            super::StreamError::SubmissionDenied(reason) => Some(*reason),
+            _ => None,
+        }
+    }
+}
+
 /// Safety caps on host inspection, not model windows or execution budgets. The
 /// existing transport buffer is already serialized before these checks; these
 /// limits do not cap the original DTO/transport allocation or serialization CPU.
@@ -185,5 +216,41 @@ mod tests {
             error.to_string(),
             "local_request_submission_denied:PermitUnavailable"
         );
+    }
+
+    #[test]
+    fn typed_denial_in_anyhow_context_is_found() {
+        let error =
+            anyhow::Error::msg("synthetic owner failure").context(SubmissionDenied::BindingChanged);
+        assert_eq!(
+            SubmissionDenied::from_error(&error),
+            Some(SubmissionDenied::BindingChanged)
+        );
+    }
+
+    #[test]
+    fn stream_denial_in_anyhow_context_is_found() {
+        let error = anyhow::Error::msg("synthetic owner failure").context(
+            super::super::StreamError::SubmissionDenied(SubmissionDenied::WorkLimit),
+        );
+        assert_eq!(
+            SubmissionDenied::from_error(&error),
+            Some(SubmissionDenied::WorkLimit)
+        );
+    }
+
+    #[test]
+    fn typed_denial_below_display_context_is_found() {
+        let error = anyhow::Error::new(SubmissionDenied::PermitUnavailable).context("HTTP 503");
+        assert_eq!(
+            SubmissionDenied::from_error(&error),
+            Some(SubmissionDenied::PermitUnavailable)
+        );
+    }
+
+    #[test]
+    fn a_denial_looking_string_is_not_a_local_authority_fact() {
+        let error = anyhow::Error::msg("local_request_submission_denied:BindingChanged");
+        assert_eq!(SubmissionDenied::from_error(&error), None);
     }
 }

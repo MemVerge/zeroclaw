@@ -1,6 +1,16 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn preparation_preserves_a_local_denial_stored_in_anyhow_context() {
+    let error =
+        anyhow::Error::msg("synthetic owner rejection").context(SubmissionDenied::BindingChanged);
+    assert!(matches!(
+        preparation_stream_error(error),
+        StreamError::SubmissionDenied(SubmissionDenied::BindingChanged)
+    ));
+}
+
 struct Authorizer {
     calls: AtomicUsize,
     deny: Option<SubmissionDenied>,
