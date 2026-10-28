@@ -67,12 +67,13 @@ fn build_request(
         crate::compatible::RequestHooks {
             headers: None,
             observer,
+            submission: None,
         },
         crate::extra_headers::ReservedHeaders::COMPATIBLE,
         &[],
         reqwest::Client::new().post("http://example.invalid"),
         request,
-        Vec::new(),
+        &[],
     )?
     .build()
     .map_err(Into::into)
@@ -183,12 +184,13 @@ fn legacy_header_errors_propagate_and_drop_the_selected_host_reservation() {
         crate::compatible::RequestHooks {
             headers: Some(&callback),
             observer: Some(&observer),
+            submission: None,
         },
         crate::extra_headers::ReservedHeaders::COMPATIBLE,
         &[],
         reqwest::Client::new().post("http://example.invalid"),
         &"test request",
-        Vec::new(),
+        &[],
     );
     assert_eq!(result.err().unwrap().to_string(), "fixture legacy failure");
     assert_eq!(released.load(Ordering::Relaxed), 1);
@@ -202,12 +204,13 @@ fn unsampled_observer_leaves_only_the_original_transport_serialization() {
         crate::compatible::RequestHooks {
             headers: None,
             observer: Some(&observer),
+            submission: None,
         },
         crate::extra_headers::ReservedHeaders::COMPATIBLE,
         &[],
         reqwest::Client::new().post("http://example.invalid"),
         &CountedRequest(&serializations),
-        Vec::new(),
+        &[],
     )
     .unwrap();
     assert!(builder.build().is_ok());
@@ -235,12 +238,13 @@ fn oversized_sample_counts_then_skips_value_materialization_without_rejecting_re
         crate::compatible::RequestHooks {
             headers: None,
             observer: Some(&observer),
+            submission: None,
         },
         crate::extra_headers::ReservedHeaders::COMPATIBLE,
         &[],
         reqwest::Client::new().post("http://example.invalid"),
         &CountedRequest(&serializations),
-        Vec::new(),
+        &[],
     )
     .unwrap();
     assert!(builder.build().is_ok());

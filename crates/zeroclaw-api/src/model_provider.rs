@@ -413,9 +413,16 @@ impl StreamOptions {
 /// Result type for streaming operations.
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
+pub mod submission;
+
 /// Errors that can occur during streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
+    /// Local pre-transport denial. Never classify as a remote provider error,
+    /// retryable connection failure, context overflow or credit-charge response.
+    #[error("{0}")]
+    SubmissionDenied(#[source] submission::SubmissionDenied),
+
     #[error("HTTP error: {0}")]
     Http(String),
 
