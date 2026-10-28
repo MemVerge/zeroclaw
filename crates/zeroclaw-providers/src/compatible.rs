@@ -8,6 +8,7 @@ use crate::request_observer::RequestObserver;
 use crate::request_submission::receipt::from_response as submission_receipt;
 use std::sync::Arc;
 use zeroclaw_api::model_provider::submission::RequestSubmissionAuthorizer;
+mod completion_body;
 mod submission;
 pub(crate) use crate::request_observer::request::{RequestHooks, request_with_sources};
 use crate::response_metadata::{ResponseMetadataObserver, begin_request, observe_response};
@@ -18,6 +19,7 @@ use crate::traits::{
     ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
+pub use completion_body::CompletionBodyLimitExceeded;
 use futures_util::{StreamExt, stream};
 use reqwest::{
     Client, ClientBuilder,
@@ -85,6 +87,8 @@ pub struct OpenAiCompatibleModelProvider {
     request_headers: Option<RequestHeaders>,
     request_observer: Option<RequestObserver>,
     submission_authorizer: Option<Arc<dyn RequestSubmissionAuthorizer>>,
+    completion_body_limit: Option<std::num::NonZeroUsize>,
+    allow_completion_fallbacks: bool,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
     reasoning_effort: Option<String>,
     /// Whether stored assistant reasoning should be replayed on outbound
@@ -357,6 +361,8 @@ pub struct OpenAiCompatibleBuilder {
     request_headers: Option<RequestHeaders>,
     request_observer: Option<RequestObserver>,
     submission_authorizer: Option<Arc<dyn RequestSubmissionAuthorizer>>,
+    completion_body_limit: Option<std::num::NonZeroUsize>,
+    allow_completion_fallbacks: bool,
     reasoning_effort: Option<String>,
     /// Set to `Some(false)` by
     /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
@@ -376,6 +382,21 @@ pub struct OpenAiCompatibleBuilder {
 }
 
 impl OpenAiCompatibleBuilder {
+    /// Bound decoded successful completion and error payload bytes BEFORE full
+    /// allocation/parsing. Does not cap successful SSE streams or model lists.
+    /// None preserves the legacy response reader; no payload is truncated.
+    pub fn completion_body_limit(mut self, maximum: Option<std::num::NonZeroUsize>) -> Self {
+        self.completion_body_limit = maximum;
+        self
+    }
+
+    /// Tools-free bounded compiler callers cannot spend a second physical
+    /// invocation on implicit history/schema fallback. Legacy default is on.
+    pub fn without_completion_fallbacks(mut self) -> Self {
+        self.allow_completion_fallbacks = false;
+        self
+    }
+
     /// Authorize each actual Chat Completions HTTP dispatch with live host
     /// ownership. This is separate from diagnostic sampling and header callbacks.
     /// Default None preserves the legacy path. A configured gate fails closed;
@@ -646,6 +667,8 @@ impl OpenAiCompatibleBuilder {
             request_headers: self.request_headers,
             request_observer: self.request_observer,
             submission_authorizer: self.submission_authorizer,
+            completion_body_limit: self.completion_body_limit,
+            allow_completion_fallbacks: self.allow_completion_fallbacks,
             reasoning_effort: self.reasoning_effort,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
             api_path: self.api_path,
@@ -686,6 +709,8 @@ impl OpenAiCompatibleModelProvider {
             request_headers: None,
             request_observer: None,
             submission_authorizer: None,
+            completion_body_limit: None,
+            allow_completion_fallbacks: true,
             reasoning_effort: None,
             replay_assistant_reasoning_override: None,
             api_path: None,
@@ -3090,12 +3115,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let receipt = submission_receipt(&response);
         if !response.status().is_success() {
             let status = response.status();
-            let error = response.text().await?;
+            let error = self.completion_text(response).await?;
             let sanitized = super::sanitize_api_error(&error);
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
-        let body = response.text().await?;
+        let body = self.completion_text(response).await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
 
         submission::observe_parsed(receipt.as_ref(), &chat_response);
@@ -3186,10 +3211,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         observe_response(&mut observation, &response);
         let receipt = submission_receipt(&response);
         if !response.status().is_success() {
-            return Err(super::api_error(&self.name, response).await);
+            return Err(self.completion_error(response).await);
         }
 
-        let body = response.text().await?;
+        let body = self.completion_text(response).await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
 
         submission::observe_parsed(receipt.as_ref(), &chat_response);
@@ -3270,7 +3295,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         {
             Ok(response) => response,
             Err(error) => {
-                if !error.is_transport() {
+                if !error.is_transport() || !self.allow_completion_fallbacks {
                     return Err(error.into_anyhow());
                 }
                 let error = error.into_anyhow();
@@ -3297,10 +3322,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         observe_response(&mut observation, &response);
         let receipt = submission_receipt(&response);
         if !response.status().is_success() {
-            return Err(super::api_error(&self.name, response).await);
+            return Err(self.completion_error(response).await);
         }
 
-        let body = response.text().await?;
+        let body = self.completion_text(response).await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
         submission::observe_parsed(receipt.as_ref(), &chat_response);
         let usage = chat_response.usage.map(UsageInfo::into_provider_usage);
@@ -3411,10 +3436,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let receipt = submission_receipt(&response);
         if !response.status().is_success() {
             let status = response.status();
-            let error = response.text().await?;
+            let error = self.completion_text(response).await?;
             let sanitized = super::sanitize_api_error(&error);
 
-            if Self::is_native_tool_schema_unsupported(status, &sanitized) {
+            if self.allow_completion_fallbacks
+                && Self::is_native_tool_schema_unsupported(status, &sanitized)
+            {
                 drop(observation);
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
@@ -3432,7 +3459,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
-        let native_response: ApiChatResponse = response.json().await?;
+        let native_response: ApiChatResponse = self.completion_json(response).await?;
         submission::observe_parsed(receipt.as_ref(), &native_response);
         let usage = native_response.usage.map(UsageInfo::into_provider_usage);
         let message = native_response
