@@ -62,12 +62,11 @@ include = [
 [[bin]]
 name = "zeroclaw"
 path = "src/main.rs"
-required-features = ["agent-extras", "builtin-channels"]
 
 [[bin]]
 name = "zeroclaw-acp-bridge"
 path = "src/bin/zeroclaw-acp-bridge.rs"
-required-features = ["acp-bridge", "agent-extras", "builtin-channels"]
+required-features = ["acp-bridge"]
 
 [lib]
 name = "zeroclaw"
@@ -321,8 +320,10 @@ agent-extras = [
 
 # The in-process channel integration (orchestrator + per-channel re-exports).
 # Included in `default`; embedders using only the provider/tool/loop surface
-# leave this off and never compile zeroclaw-channels.
+# leave this off and never compile zeroclaw-channels. Channel features imply
+# this gate so `agent-runtime + channel-<x>` keeps exposing `zeroclaw::channels`.
 builtin-channels = [
+    "dep:zeroclaw-runtime",
     "dep:zeroclaw-channels",
 ]
 
@@ -356,49 +357,50 @@ gateway = [
 schema-export = ["zeroclaw-config/schema-export"]
 acp-bridge = ["dep:tokio-tungstenite"]
 
-# Channels — each forwards to zeroclaw-channels.
-channel-email = ["zeroclaw-channels/channel-email", "zeroclaw-gateway?/channel-email", "dep:lettre", "dep:mail-parser", "dep:async-imap"]
-channel-telegram = ["zeroclaw-channels/channel-telegram"]
-channel-lark = ["zeroclaw-channels/channel-lark"]
-channel-nostr = ["zeroclaw-channels/channel-nostr", "dep:nostr-sdk"]
-channel-matrix = ["zeroclaw-channels/channel-matrix"]
-channel-discord = ["zeroclaw-channels/channel-discord"]
-channel-slack = ["zeroclaw-channels/channel-slack"]
-channel-signal = ["zeroclaw-channels/channel-signal"]
-channel-mattermost = ["zeroclaw-channels/channel-mattermost"]
-channel-irc = ["zeroclaw-channels/channel-irc"]
-channel-twitch = ["zeroclaw-channels/channel-twitch"]
-channel-imessage = ["zeroclaw-channels/channel-imessage"]
-channel-dingtalk = ["zeroclaw-channels/channel-dingtalk"]
-channel-qq = ["zeroclaw-channels/channel-qq"]
-channel-bluesky = ["zeroclaw-channels/channel-bluesky"]
-channel-git = ["zeroclaw-channels/channel-git"]
-provider-github = ["zeroclaw-channels/provider-github"]
-provider-gitea = ["zeroclaw-channels/provider-gitea"]
-channel-twitter = ["zeroclaw-channels/channel-twitter"]
-channel-reddit = ["zeroclaw-channels/channel-reddit"]
-channel-notion = ["zeroclaw-channels/channel-notion"]
-channel-mqtt = ["zeroclaw-channels/channel-mqtt"]
-channel-filesystem = ["zeroclaw-channels/channel-filesystem"]
-channel-amqp = ["zeroclaw-channels/channel-amqp"]
-channel-linq = ["zeroclaw-channels/channel-linq", "zeroclaw-gateway?/channel-linq"]
-channel-wati = ["zeroclaw-channels/channel-wati", "zeroclaw-gateway?/channel-wati"]
-channel-nextcloud = ["zeroclaw-channels/channel-nextcloud", "zeroclaw-gateway?/channel-nextcloud"]
-channel-mochat = ["zeroclaw-channels/channel-mochat"]
-channel-wechat = ["zeroclaw-channels/channel-wechat", "zeroclaw-gateway?/channel-wechat"]
-channel-wecom = ["zeroclaw-channels/channel-wecom"]
-channel-wecom-ws = ["zeroclaw-channels/channel-wecom-ws"]
-channel-clawdtalk = ["zeroclaw-channels/channel-clawdtalk"]
-channel-webhook = ["zeroclaw-channels/channel-webhook"]
-channel-acp-server = ["zeroclaw-channels/channel-acp-server", "zeroclaw-gateway?/channel-acp-server"]
-channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud", "zeroclaw-gateway?/channel-whatsapp-cloud"]
-channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
-channel-line = ["zeroclaw-channels/channel-line"]
+# Channels — each forwards to zeroclaw-channels and implies `builtin-channels`
+# (the facade module + crate dependency).
+channel-email = ["builtin-channels", "zeroclaw-channels/channel-email", "zeroclaw-gateway?/channel-email", "dep:lettre", "dep:mail-parser", "dep:async-imap"]
+channel-telegram = ["builtin-channels", "zeroclaw-channels/channel-telegram"]
+channel-lark = ["builtin-channels", "zeroclaw-channels/channel-lark"]
+channel-nostr = ["builtin-channels", "zeroclaw-channels/channel-nostr", "dep:nostr-sdk"]
+channel-matrix = ["builtin-channels", "zeroclaw-channels/channel-matrix"]
+channel-discord = ["builtin-channels", "zeroclaw-channels/channel-discord"]
+channel-slack = ["builtin-channels", "zeroclaw-channels/channel-slack"]
+channel-signal = ["builtin-channels", "zeroclaw-channels/channel-signal"]
+channel-mattermost = ["builtin-channels", "zeroclaw-channels/channel-mattermost"]
+channel-irc = ["builtin-channels", "zeroclaw-channels/channel-irc"]
+channel-twitch = ["builtin-channels", "zeroclaw-channels/channel-twitch"]
+channel-imessage = ["builtin-channels", "zeroclaw-channels/channel-imessage"]
+channel-dingtalk = ["builtin-channels", "zeroclaw-channels/channel-dingtalk"]
+channel-qq = ["builtin-channels", "zeroclaw-channels/channel-qq"]
+channel-bluesky = ["builtin-channels", "zeroclaw-channels/channel-bluesky"]
+channel-git = ["builtin-channels", "zeroclaw-channels/channel-git"]
+provider-github = ["builtin-channels", "zeroclaw-channels/provider-github"]
+provider-gitea = ["builtin-channels", "zeroclaw-channels/provider-gitea"]
+channel-twitter = ["builtin-channels", "zeroclaw-channels/channel-twitter"]
+channel-reddit = ["builtin-channels", "zeroclaw-channels/channel-reddit"]
+channel-notion = ["builtin-channels", "zeroclaw-channels/channel-notion"]
+channel-mqtt = ["builtin-channels", "zeroclaw-channels/channel-mqtt"]
+channel-filesystem = ["builtin-channels", "zeroclaw-channels/channel-filesystem"]
+channel-amqp = ["builtin-channels", "zeroclaw-channels/channel-amqp"]
+channel-linq = ["builtin-channels", "zeroclaw-channels/channel-linq", "zeroclaw-gateway?/channel-linq"]
+channel-wati = ["builtin-channels", "zeroclaw-channels/channel-wati", "zeroclaw-gateway?/channel-wati"]
+channel-nextcloud = ["builtin-channels", "zeroclaw-channels/channel-nextcloud", "zeroclaw-gateway?/channel-nextcloud"]
+channel-mochat = ["builtin-channels", "zeroclaw-channels/channel-mochat"]
+channel-wechat = ["builtin-channels", "zeroclaw-channels/channel-wechat", "zeroclaw-gateway?/channel-wechat"]
+channel-wecom = ["builtin-channels", "zeroclaw-channels/channel-wecom"]
+channel-wecom-ws = ["builtin-channels", "zeroclaw-channels/channel-wecom-ws"]
+channel-clawdtalk = ["builtin-channels", "zeroclaw-channels/channel-clawdtalk"]
+channel-webhook = ["builtin-channels", "zeroclaw-channels/channel-webhook"]
+channel-acp-server = ["builtin-channels", "zeroclaw-channels/channel-acp-server", "zeroclaw-gateway?/channel-acp-server"]
+channel-whatsapp-cloud = ["builtin-channels", "zeroclaw-channels/channel-whatsapp-cloud", "zeroclaw-gateway?/channel-whatsapp-cloud"]
+channel-voice-call = ["builtin-channels", "zeroclaw-channels/channel-voice-call"]
+channel-line = ["builtin-channels", "zeroclaw-channels/channel-line"]
 # Feishu uses the same channel implementation as Lark; `use_feishu = true`
 # selects Feishu endpoints at runtime.
 channel-feishu = ["channel-lark"]
-whatsapp-web = ["zeroclaw-channels/whatsapp-web", "zeroclaw-gateway?/whatsapp-web"]
-voice-wake = ["zeroclaw-channels/voice-wake"]
+whatsapp-web = ["builtin-channels", "zeroclaw-channels/whatsapp-web", "zeroclaw-gateway?/whatsapp-web"]
+voice-wake = ["builtin-channels", "zeroclaw-channels/voice-wake"]
 memory-postgres = ["zeroclaw-memory/memory-postgres"]
 
 # Backends and platform flags — each forwards to ONE crate

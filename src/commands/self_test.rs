@@ -245,7 +245,10 @@ fn check_channel_config(config: &crate::config::Config) -> CheckResult {
 #[cfg(not(feature = "builtin-channels"))]
 fn check_channel_config(_config: &crate::config::Config) -> CheckResult {
     // Channel integration is not compiled into this build (lean agent-runtime).
-    CheckResult::pass("channels", "channel integration not compiled in this build".to_string())
+    CheckResult::pass(
+        "channels",
+        "channel integration not compiled in this build".to_string(),
+    )
 }
 
 #[cfg(feature = "builtin-channels")]

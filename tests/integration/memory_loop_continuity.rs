@@ -449,6 +449,7 @@ async fn memory_survives_rapid_consolidation() {
 // 7. Session Persistence End-to-End
 // ═════════════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "builtin-channels")]
 #[tokio::test]
 async fn session_backend_persists_messages() {
     use zeroclaw::channels::session_backend::SessionBackend;
@@ -470,6 +471,7 @@ async fn session_backend_persists_messages() {
     assert_eq!(messages.len(), 2, "Both messages should persist");
 }
 
+#[cfg(feature = "builtin-channels")]
 #[tokio::test]
 async fn session_state_transitions() {
     use zeroclaw::channels::session_backend::SessionBackend;
