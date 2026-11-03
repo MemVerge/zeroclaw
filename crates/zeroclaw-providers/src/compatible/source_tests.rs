@@ -198,6 +198,29 @@ async fn request_headers_follow_the_final_body_on_all_chat_paths() {
         }
         Ok(headers)
     });
+    let (sampled_tx, mut sampled_rx) = tokio::sync::mpsc::unbounded_channel();
+    let observer: crate::request_observer::RequestObserver = Arc::new(move || {
+        let sender = sampled_tx.clone();
+        Some(crate::request_observer::RequestSample::new(
+            crate::request_observer::RequestSampleBounds {
+                max_body_bytes: 4096,
+                max_source_spans: 32,
+            },
+            move |outcome| {
+                let crate::request_observer::RequestSampleOutcome::Captured {
+                    body,
+                    sources,
+                    generated_headers,
+                } = outcome
+                else {
+                    panic!("small fixture must fit observation bounds")
+                };
+                assert!(!generated_headers.contains_key("content-type"));
+                assert!(!generated_headers.contains_key("content-length"));
+                sender.send((body.clone(), sources.to_vec())).unwrap();
+            },
+        ))
+    });
     let mut message = ChatMessage::user("host 当前");
     message.content_sources = vec![source(
         7,
@@ -235,6 +258,7 @@ async fn request_headers_follow_the_final_body_on_all_chat_paths() {
                             .base_url(&base)
                             .credential(credential)
                             .request_headers(callback)
+                            .request_observer(Some(observer.clone()))
                             .build(),
                     )
                 } else {
@@ -245,6 +269,7 @@ async fn request_headers_follow_the_final_body_on_all_chat_paths() {
                             .auth_style(auth_style.clone())
                             .credential(credential)
                             .request_headers(callback)
+                            .request_observer(Some(observer.clone()))
                             .build(),
                     )
                 };
@@ -324,6 +349,8 @@ async fn request_headers_follow_the_final_body_on_all_chat_paths() {
                     }
                 }
                 let (headers, body, raw_body) = received.recv().await.unwrap();
+                let (sampled, sampled_sources) = sampled_rx.recv().await.unwrap();
+                assert_eq!(sampled, body);
                 if tagged {
                     assert_eq!(headers.get("x-source-projection").unwrap(), "present");
                     assert_eq!(headers["content-type"], "application/json");
@@ -365,6 +392,7 @@ async fn request_headers_follow_the_final_body_on_all_chat_paths() {
                         assert_eq!(headers[name], expected);
                     }
                     let (observed, spans) = observed_rx.recv().await.unwrap();
+                    assert_eq!(sampled_sources, spans);
                     assert_eq!(observed, body);
                     assert_eq!(previous.as_ref(), Some(&raw_body));
                     if mode >= 6 {
