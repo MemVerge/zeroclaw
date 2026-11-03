@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use zeroclaw::providers::traits::{ChatMessage, ProviderCapabilities, TokenUsage};
 use zeroclaw::providers::{ChatRequest, ChatResponse, ModelProvider, ToolCall};
 
-#[cfg(feature = "agent-extras")]
 use super::trace::{LlmTrace, TraceResponse};
 
 /// Mock model_provider that returns scripted responses in FIFO order.
@@ -153,13 +152,11 @@ impl ::zeroclaw_api::attribution::Attributable for RecordingModelProvider {
 /// ModelProvider that replays responses from an `LlmTrace` fixture.
 /// Each call to `chat()` returns the next step from the trace in FIFO order.
 /// If the agent calls the model_provider more times than there are steps, an error is returned.
-#[cfg(feature = "agent-extras")]
 pub struct TraceLlmModelProvider {
     steps: Mutex<Vec<TraceResponse>>,
     trace_name: String,
 }
 
-#[cfg(feature = "agent-extras")]
 impl TraceLlmModelProvider {
     pub fn from_trace(trace: &LlmTrace) -> Self {
         let mut steps = Vec::new();
@@ -175,7 +172,6 @@ impl TraceLlmModelProvider {
     }
 }
 
-#[cfg(feature = "agent-extras")]
 #[async_trait]
 impl ModelProvider for TraceLlmModelProvider {
     async fn chat_with_system(
@@ -245,7 +241,6 @@ impl ModelProvider for TraceLlmModelProvider {
         }
     }
 }
-#[cfg(feature = "agent-extras")]
 impl ::zeroclaw_api::attribution::Attributable for TraceLlmModelProvider {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
         ::zeroclaw_api::attribution::Role::Provider(

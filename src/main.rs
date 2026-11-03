@@ -349,7 +349,7 @@ mod alias_cli;
 mod approval;
 #[cfg(feature = "agent-runtime")]
 mod auth;
-#[cfg(feature = "builtin-channels")]
+#[cfg(feature = "agent-runtime")]
 mod channels;
 #[cfg(feature = "agent-runtime")]
 mod cli_input;
@@ -512,7 +512,7 @@ impl LogLevel {
 }
 
 /// Subcommands for `zeroclaw eval`.
-#[cfg(feature = "agent-extras")]
+#[cfg(feature = "agent-runtime")]
 #[derive(Subcommand, Debug)]
 enum EvalCommands {
     /// Run a suite of evaluation cases.
@@ -839,7 +839,6 @@ Examples:
   zeroclaw channel remove my-bot
   zeroclaw channel bind-telegram zeroclaw_user
   zeroclaw channel send 'Alert!' --channel-id telegram --recipient 123456789")]
-    #[cfg(feature = "builtin-channels")]
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,
@@ -1060,7 +1059,6 @@ so it can gate CI.
 Examples:
   zeroclaw eval run                                  # replay ./evals
   zeroclaw eval run --suite evals --format json")]
-    #[cfg(feature = "agent-extras")]
     Eval {
         #[command(subcommand)]
         eval_command: EvalCommands,
@@ -3704,7 +3702,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
         }
     }
 
-    #[cfg(all(feature = "agent-runtime", feature = "builtin-channels"))]
+    #[cfg(feature = "agent-runtime")]
     {
         zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
             |config, channel, target, thread_id, output| {
@@ -3760,7 +3758,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
 
             // Wire CLI channel for interactive mode
-            #[cfg(feature = "builtin-channels")]
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
                 Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
@@ -3775,7 +3772,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }));
 
             // Register channel map factory for late-bound tool handle population.
-            #[cfg(feature = "builtin-channels")]
             zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new({
                 let config_clone = config.clone();
                 move || zeroclaw_channels::orchestrator::build_channel_map(&config_clone)
@@ -4130,7 +4126,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
 
             // Wire CLI channel for interactive mode
-            #[cfg(feature = "builtin-channels")]
+            #[cfg(feature = "agent-runtime")]
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
                 Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
@@ -4225,7 +4221,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                #[cfg(feature = "builtin-channels")]
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
@@ -4728,7 +4723,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
             println!();
             println!("{}", t("cli-status-channels", "Channels:"));
             println!("{}", t("cli-status-cli-always", "  CLI:      ✅ always"));
-            #[cfg(feature = "builtin-channels")]
             for entry in zeroclaw_channels::listing::compiled_channels(&config.channels) {
                 let channel_status = if entry.configured {
                     t("cli-status-word-configured", "configured")
@@ -4745,10 +4739,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 );
             }
-            #[cfg(feature = "builtin-channels")]
             let uncompiled =
                 zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
-            #[cfg(feature = "builtin-channels")]
             if !uncompiled.is_empty() {
                 println!(
                     "{}",
@@ -4933,7 +4925,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
             None => doctor::run(&config).await,
         },
 
-        #[cfg(feature = "builtin-channels")]
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => {
                 #[cfg(feature = "hardware")]
@@ -5275,7 +5266,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
             Ok(())
         }
 
-        #[cfg(feature = "agent-extras")]
         Commands::Eval { eval_command } => match eval_command {
             EvalCommands::Run {
                 suite,
@@ -7738,104 +7728,92 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
                 ) as _)
             });
 
-    #[cfg(feature = "builtin-channels")]
-    {
-        let channels = zeroclaw_channels::orchestrator::build_channel_map(config);
-        // Startup validation: this send-only adapter's channel map omits channels that
-        // need runtime SOP handles (e.g. AMQP SOP-dispatch channels). Surface at BOOT any
-        // configured approval route whose channel is absent here, so a `request_route` /
-        // `escalation_route` that would silently fail to deliver at gate time is caught up
-        // front rather than on the first parked gate. This runs BEFORE the empty-map return:
-        // when there are no deliverable channels at all, EVERY configured route is
-        // undeliverable and must still be surfaced.
-        // A route target must be a channel that can actually deliver OUTBOUND; an
-        // inbound-only channel (e.g. AMQP, whose `send` is a no-op) in the map cannot send
-        // an approval notice, so it is not a resolvable route target.
-        let deliverable_keys: std::collections::HashSet<String> = channels
-            .iter()
-            .filter(|(_, ch)| ch.supports_outbound_send())
-            .map(|(key, _)| key.clone())
-            .collect();
-        for issue in zeroclaw_runtime::sop::approval::unresolvable_approval_routes(
-            &config.sop.approval,
-            &deliverable_keys,
-        ) {
-            match issue {
-                zeroclaw_runtime::sop::approval::ApprovalRouteIssue::Malformed {
-                    policy,
-                    route_kind,
-                    route,
-                } => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "policy": policy,
-                                "route_kind": route_kind,
-                                "route": route,
-                            })),
-                        "SOP approval route is malformed; use the required channel:recipient format"
-                    );
-                }
-                zeroclaw_runtime::sop::approval::ApprovalRouteIssue::UndeliverableChannel {
-                    policy,
-                    route_kind,
-                    route,
-                    channel_key,
-                } => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "policy": policy,
-                                "route_kind": route_kind,
-                                "route": route,
-                                "channel": channel_key,
-                            })),
-                        "SOP approval route names a channel the route adapter cannot deliver to; \
-                         its approval notices will not be sent (the channel may require runtime SOP \
-                         handles this send-only adapter lacks)"
-                    );
-                }
+    let channels = zeroclaw_channels::orchestrator::build_channel_map(config);
+    // Startup validation: this send-only adapter's channel map omits channels that
+    // need runtime SOP handles (e.g. AMQP SOP-dispatch channels). Surface at BOOT any
+    // configured approval route whose channel is absent here, so a `request_route` /
+    // `escalation_route` that would silently fail to deliver at gate time is caught up
+    // front rather than on the first parked gate. This runs BEFORE the empty-map return:
+    // when there are no deliverable channels at all, EVERY configured route is
+    // undeliverable and must still be surfaced.
+    // A route target must be a channel that can actually deliver OUTBOUND; an
+    // inbound-only channel (e.g. AMQP, whose `send` is a no-op) in the map cannot send
+    // an approval notice, so it is not a resolvable route target.
+    let deliverable_keys: std::collections::HashSet<String> = channels
+        .iter()
+        .filter(|(_, ch)| ch.supports_outbound_send())
+        .map(|(key, _)| key.clone())
+        .collect();
+    for issue in zeroclaw_runtime::sop::approval::unresolvable_approval_routes(
+        &config.sop.approval,
+        &deliverable_keys,
+    ) {
+        match issue {
+            zeroclaw_runtime::sop::approval::ApprovalRouteIssue::Malformed {
+                policy,
+                route_kind,
+                route,
+            } => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "policy": policy,
+                            "route_kind": route_kind,
+                            "route": route,
+                        })),
+                    "SOP approval route is malformed; use the required channel:recipient format"
+                );
+            }
+            zeroclaw_runtime::sop::approval::ApprovalRouteIssue::UndeliverableChannel {
+                policy,
+                route_kind,
+                route,
+                channel_key,
+            } => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "policy": policy,
+                            "route_kind": route_kind,
+                            "route": route,
+                            "channel": channel_key,
+                        })),
+                    "SOP approval route names a channel the route adapter cannot deliver to; \
+                     its approval notices will not be sent (the channel may require runtime SOP \
+                     handles this send-only adapter lacks)"
+                );
             }
         }
-        if channels.is_empty() {
-            return zeroclaw_runtime::sop::SopEngineAdapters {
-                llm,
-                ..Default::default()
-            };
-        }
-        let handle = tokio::runtime::Handle::current();
-        let route: std::sync::Arc<dyn zeroclaw_runtime::sop::approval::ApprovalRouteAdapter> =
-            std::sync::Arc::new(zeroclaw_runtime::sop::approval::ChannelRouteAdapter::new(
-                channels.clone(),
-                handle.clone(),
-            ));
-        // Only offer the forge adapter when a git channel actually exists, so
-        // `forge.comment` stays fail-closed on daemons without a forge.
-        let has_git = channels.keys().any(|k| k == "git" || k.starts_with("git."));
-        let forge: Option<
-            std::sync::Arc<dyn zeroclaw_runtime::sop::capability::ForgeCommentAdapter>,
-        > = has_git.then(|| {
+    }
+    if channels.is_empty() {
+        return zeroclaw_runtime::sop::SopEngineAdapters {
+            llm,
+            ..Default::default()
+        };
+    }
+    let handle = tokio::runtime::Handle::current();
+    let route: std::sync::Arc<dyn zeroclaw_runtime::sop::approval::ApprovalRouteAdapter> =
+        std::sync::Arc::new(zeroclaw_runtime::sop::approval::ChannelRouteAdapter::new(
+            channels.clone(),
+            handle.clone(),
+        ));
+    // Only offer the forge adapter when a git channel actually exists, so
+    // `forge.comment` stays fail-closed on daemons without a forge.
+    let has_git = channels.keys().any(|k| k == "git" || k.starts_with("git."));
+    let forge: Option<std::sync::Arc<dyn zeroclaw_runtime::sop::capability::ForgeCommentAdapter>> =
+        has_git.then(|| {
             std::sync::Arc::new(zeroclaw_runtime::sop::capability::ChannelForgeAdapter::new(
                 channels,
             )) as _
         });
-        return zeroclaw_runtime::sop::SopEngineAdapters {
-            route: Some(route),
-            forge,
-            llm,
-        };
-    }
-    #[cfg(not(feature = "builtin-channels"))]
-    {
-        let _ = config;
-        zeroclaw_runtime::sop::SopEngineAdapters {
-            llm,
-            ..Default::default()
-        }
+    zeroclaw_runtime::sop::SopEngineAdapters {
+        route: Some(route),
+        forge,
+        llm,
     }
 }
 

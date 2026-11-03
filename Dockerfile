@@ -1,16 +1,16 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # >>> generated:base-arg-node from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c
+ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:235600a8101ab264e117b1768e925532262668dc9b581ef1dd7d96ced463b8e7
 # >>> end generated:base-arg-node <<<
 # >>> generated:base-arg-rust-slim from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
 ARG ZEROCLAW_BASE_RUST_SLIM=rust:1.96-slim@sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523
 # >>> end generated:base-arg-rust-slim <<<
 # >>> generated:base-arg-debian from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_DEBIAN=debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
+ARG ZEROCLAW_BASE_DEBIAN=debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
 # >>> end generated:base-arg-debian <<<
 # >>> generated:base-arg-distroless from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_DISTROLESS=gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
+ARG ZEROCLAW_BASE_DISTROLESS=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
 # >>> end generated:base-arg-distroless <<<
 
 # ── Stage 0: Frontend build ─────────────────────────────────────
@@ -53,7 +53,7 @@ FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_RUST_SLIM} AS builder
 WORKDIR /app
 ARG TARGETARCH
 # >>> generated:docker-features-arg by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-extras,agent-runtime,builtin-channels,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
+ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
 # >>> end generated:docker-features-arg <<<
 
 # Install build dependencies. g++ is required by inkjet (zerocode's syntax
