@@ -7,6 +7,8 @@ use zeroclaw_api::model_provider::ProjectedMessageSource;
 pub(crate) struct RequestHooks<'a> {
     pub(crate) headers: Option<&'a RequestHeaders>,
     pub(crate) observer: Option<&'a RequestObserver>,
+    pub(crate) submission:
+        Option<&'a dyn zeroclaw_api::model_provider::submission::RequestSubmissionAuthorizer>,
 }
 
 pub(crate) fn request_with_sources(
@@ -15,7 +17,40 @@ pub(crate) fn request_with_sources(
     additional_reserved: &[&str],
     builder: reqwest::RequestBuilder,
     request: &impl Serialize,
-    sources: Vec<ProjectedMessageSource>,
+    sources: &[ProjectedMessageSource],
+) -> anyhow::Result<reqwest::RequestBuilder> {
+    if hooks.submission.is_some() {
+        use zeroclaw_api::model_provider::submission::SubmissionDenied;
+        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prepare_request(
+                hooks,
+                reserved,
+                additional_reserved,
+                builder,
+                request,
+                sources,
+            )
+        }))
+        .map_err(|_| SubmissionDenied::HostUnavailable)?
+        .map_err(|_| SubmissionDenied::UnsupportedBody.into());
+    }
+    prepare_request(
+        hooks,
+        reserved,
+        additional_reserved,
+        builder,
+        request,
+        sources,
+    )
+}
+
+fn prepare_request(
+    hooks: RequestHooks<'_>,
+    reserved: crate::extra_headers::ReservedHeaders,
+    additional_reserved: &[&str],
+    builder: reqwest::RequestBuilder,
+    request: &impl Serialize,
+    sources: &[ProjectedMessageSource],
 ) -> anyhow::Result<reqwest::RequestBuilder> {
     let sample = crate::request_observer::prepare(hooks.observer).and_then(|sample| {
         match sample.check(request, sources.len()) {
@@ -42,7 +77,7 @@ pub(crate) fn request_with_sources(
                 }
             };
             let mut headers = match callback {
-                Some(callback) => callback(&body, &sources)?,
+                Some(callback) => callback(&body, sources)?,
                 None => HeaderMap::new(),
             };
             let owned = headers
@@ -56,7 +91,7 @@ pub(crate) fn request_with_sources(
             if let Some(sample) = sample {
                 sample.notify(RequestSampleOutcome::Captured {
                     body: &body,
-                    sources: &sources,
+                    sources,
                     generated_headers: &headers,
                 });
             }
