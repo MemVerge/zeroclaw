@@ -216,6 +216,7 @@ fn check_tool_registry(config: &crate::config::Config) -> CheckResult {
     )
 }
 
+#[cfg(feature = "builtin-channels")]
 fn check_channel_config(config: &crate::config::Config) -> CheckResult {
     let channels = zeroclaw_channels::listing::compiled_channels(&config.channels);
     let configured = channels.iter().filter(|e| e.configured).count();
@@ -241,6 +242,13 @@ fn check_channel_config(config: &crate::config::Config) -> CheckResult {
     )
 }
 
+#[cfg(not(feature = "builtin-channels"))]
+fn check_channel_config(_config: &crate::config::Config) -> CheckResult {
+    // Channel integration is not compiled into this build (lean agent-runtime).
+    CheckResult::pass("channels", "channel integration not compiled in this build".to_string())
+}
+
+#[cfg(feature = "builtin-channels")]
 fn channel_config_uncompiled_detail(
     compiled: usize,
     compiled_configured: usize,

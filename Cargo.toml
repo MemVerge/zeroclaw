@@ -62,11 +62,12 @@ include = [
 [[bin]]
 name = "zeroclaw"
 path = "src/main.rs"
+required-features = ["agent-extras", "builtin-channels"]
 
 [[bin]]
 name = "zeroclaw-acp-bridge"
 path = "src/bin/zeroclaw-acp-bridge.rs"
-required-features = ["acp-bridge"]
+required-features = ["acp-bridge", "agent-extras", "builtin-channels"]
 
 [lib]
 name = "zeroclaw"
@@ -281,6 +282,8 @@ armv7-unknown-linux-gnueabihf = ["observability-prometheus"]
 [features]
 default = [
     "agent-runtime",
+    "agent-extras",
+    "builtin-channels",
     "default-channels",
     "acp-bridge",
     "gateway",
@@ -292,13 +295,35 @@ default = [
 # Without this, you get the kernel: config + providers + memory + CLI chat.
 # Channels are opt-in via the lean `default-channels` bundle, `channels-full`,
 # or individual `channel-*` features.
+#
+# Lean split (memorybox line): `agent-runtime` keeps only what an embedding
+# consumer (MemBox) needs — the runtime, tool and provider crates plus the
+# small support deps validated by upstream v0.8.7. Channel integration,
+# eval, TUI and scheduler-adjacent deps moved to `agent-extras` /
+# `builtin-channels`, both included in `default` so fork builds are unchanged.
 agent-runtime = [
-    "dep:zeroclaw-runtime", "dep:zeroclaw-eval", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
+    "dep:zeroclaw-runtime", "dep:zeroclaw-tools",
     "dep:rusqlite",
-    "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
-    "dep:ratatui", "dep:crossterm",
-    "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
-    "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
+    "dep:ring", "dep:which",
+    "dep:crossterm",
+    "dep:tokio-tungstenite",
+    "dep:rustls",
+]
+
+# Everything the CLI/bins need that embedders do not. Included in `default`.
+agent-extras = [
+    "dep:zeroclaw-eval",
+    "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob",
+    "dep:ratatui",
+    "dep:tokio-socks", "dep:hostname",
+    "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
+]
+
+# The in-process channel integration (orchestrator + per-channel re-exports).
+# Included in `default`; embedders using only the provider/tool/loop surface
+# leave this off and never compile zeroclaw-channels.
+builtin-channels = [
+    "dep:zeroclaw-channels",
 ]
 
 # Lean channel bundle included in `default`. These channels cover local/editor
