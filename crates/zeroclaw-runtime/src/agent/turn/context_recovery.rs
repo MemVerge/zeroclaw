@@ -1,6 +1,7 @@
 //! LLM-failure recording and in-loop context-overflow recovery.
 
 use super::context::TurnCtx;
+use super::knobs::ContextOverflowBehavior;
 use super::outcome::is_tool_loop_cancelled;
 use crate::agent::history::estimate_history_tokens;
 use crate::agent::history_trim::trim_to_recent_turns;
@@ -54,14 +55,29 @@ pub(crate) fn record_llm_failure(
     );
 }
 
-pub(crate) async fn try_recover_context_overflow(
-    history: &mut Vec<ChatMessage>,
-    e: &anyhow::Error,
-    iteration: usize,
-    event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
-    observer: &dyn Observer,
-    context_token_budget: usize,
-) -> bool {
+pub(crate) struct ContextRecoveryInput<'a> {
+    pub history: &'a mut Vec<ChatMessage>,
+    pub error: &'a anyhow::Error,
+    pub iteration: usize,
+    pub event_tx: Option<&'a tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+    pub observer: &'a dyn Observer,
+    pub context_token_budget: usize,
+    pub behavior: ContextOverflowBehavior,
+}
+
+pub(crate) async fn try_recover_context_overflow(input: ContextRecoveryInput<'_>) -> bool {
+    if input.behavior == ContextOverflowBehavior::FailClosed {
+        return false;
+    }
+    let ContextRecoveryInput {
+        history,
+        error: e,
+        iteration,
+        event_tx,
+        observer,
+        context_token_budget,
+        ..
+    } = input;
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
         ::zeroclaw_log::record!(
             WARN,
@@ -177,14 +193,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fail_closed_overflow_preserves_original_history_and_emits_no_trim() {
+        let mut history = overflowing_history();
+        let before = format!("{history:?}");
+        let error = anyhow::Error::msg("maximum context length exceeded");
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let recovered = try_recover_context_overflow(ContextRecoveryInput {
+            history: &mut history,
+            error: &error,
+            iteration: 1,
+            event_tx: Some(&sender),
+            observer: &NoopObserver,
+            context_token_budget: 32_000,
+            behavior: ContextOverflowBehavior::FailClosed,
+        })
+        .await;
+        assert!(!recovered);
+        assert_eq!(format!("{history:?}"), before);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn default_loop_knobs_keep_legacy_context_overflow_recovery() {
+        assert_eq!(
+            super::super::knobs::LoopKnobs::default().context_overflow_behavior,
+            ContextOverflowBehavior::DropOldestTurns
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_emits_history_trimmed_event_on_trim() {
         let mut history = overflowing_history();
         let err = anyhow::Error::msg("maximum context length exceeded");
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
+        let recovered = try_recover_context_overflow(ContextRecoveryInput {
+            history: &mut history,
+            error: &err,
+            iteration: 1,
+            event_tx: Some(&tx),
+            observer: &observer,
+            context_token_budget: 32_000,
+            behavior: ContextOverflowBehavior::DropOldestTurns,
+        })
+        .await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         // The retried history must carry the model-visible breadcrumb after the
@@ -228,8 +281,16 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 100).await;
+        let recovered = try_recover_context_overflow(ContextRecoveryInput {
+            history: &mut history,
+            error: &err,
+            iteration: 1,
+            event_tx: Some(&tx),
+            observer: &observer,
+            context_token_budget: 100,
+            behavior: ContextOverflowBehavior::DropOldestTurns,
+        })
+        .await;
 
         assert!(
             !recovered,
@@ -255,8 +316,16 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
+        let recovered = try_recover_context_overflow(ContextRecoveryInput {
+            history: &mut history,
+            error: &err,
+            iteration: 1,
+            event_tx: Some(&tx),
+            observer: &observer,
+            context_token_budget: 32_000,
+            behavior: ContextOverflowBehavior::DropOldestTurns,
+        })
+        .await;
 
         assert!(!recovered, "a non-overflow error must not trigger recovery");
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
@@ -287,8 +356,16 @@ mod tests {
         // Drain any pre-existing broadcast traffic from parallel tests.
         while rx.try_recv().is_ok() {}
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, None, &observer, budget).await;
+        let recovered = try_recover_context_overflow(ContextRecoveryInput {
+            history: &mut history,
+            error: &err,
+            iteration: 1,
+            event_tx: None,
+            observer: &observer,
+            context_token_budget: budget,
+            behavior: ContextOverflowBehavior::DropOldestTurns,
+        })
+        .await;
         assert!(!recovered, "floor-dominates overflow must not recover");
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s

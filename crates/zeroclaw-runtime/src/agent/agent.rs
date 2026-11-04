@@ -2303,6 +2303,7 @@ impl Agent {
             stream_failure_behavior:
                 crate::agent::loop_::StreamFailureBehavior::FallbackToNonStreaming,
             detect_protocol_without_tools: false,
+            context_overflow_behavior: Default::default(),
         };
         // E3 never had pattern-based loop detection; default pacing turns it
         // on. Keep the embedder contract (an N-step identical-args tool chain
@@ -2648,6 +2649,7 @@ impl Agent {
             stream_failure_behavior:
                 crate::agent::loop_::StreamFailureBehavior::FallbackToNonStreaming,
             detect_protocol_without_tools: false,
+            context_overflow_behavior: Default::default(),
         };
         // The streaming engine never had pattern-based loop detection; default
         // pacing turns it on. Keep the embedder contract until this surface
