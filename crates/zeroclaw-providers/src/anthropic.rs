@@ -130,6 +130,7 @@ impl AnthropicReplayBlock {
 }
 
 pub struct AnthropicModelProvider {
+    completion_control: Option<zeroclaw_api::model_provider::CompletionControl>,
     /// `[providers.models.anthropic.<alias>]` config-key alias.
     alias: String,
     credential: Option<String>,
@@ -651,6 +652,7 @@ impl AnthropicBuilder {
                 crate::extra_headers::ReservedHeaders::ANTHROPIC,
             ),
             response_observer: self.response_observer,
+            completion_control: None,
         }
     }
 }
@@ -1728,22 +1730,42 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "model_provider.anthropic",
-            self.timeout_secs,
-            10,
+    fn http_client(&self) -> anyhow::Result<Client> {
+        if self.completion_control.is_some() {
+            return crate::completion_control::client(
+                Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .timeout(std::time::Duration::from_secs(self.timeout_secs)),
+                "model_provider.anthropic",
+            );
+        }
+        Ok(
+            zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+                "model_provider.anthropic",
+                self.timeout_secs,
+                10,
+            ),
         )
     }
 
-    fn streaming_http_client(&self) -> Client {
+    fn streaming_http_client(&self) -> anyhow::Result<Client> {
+        if self.completion_control.is_some() {
+            return crate::completion_control::client(
+                Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .read_timeout(SSE_IDLE_TIMEOUT),
+                "model_provider.anthropic",
+            );
+        }
         // No total-request timeout: SSE bodies for long-form generations can
         // legitimately stay open for several minutes of active streaming.
         // `SSE_IDLE_TIMEOUT` (per-line, above) already bounds a genuinely
         // stalled connection. See #2404.
-        zeroclaw_config::schema::build_runtime_proxy_streaming_client(
-            "model_provider.anthropic",
-            10,
+        Ok(
+            zeroclaw_config::schema::build_runtime_proxy_streaming_client(
+                "model_provider.anthropic",
+                10,
+            ),
         )
     }
 
@@ -2182,6 +2204,14 @@ impl AnthropicModelProvider {
 
 #[async_trait]
 impl ModelProvider for AnthropicModelProvider {
+    fn configure_completion(
+        &mut self,
+        control: zeroclaw_api::model_provider::CompletionControl,
+    ) -> Result<(), crate::traits::ProviderCapabilityError> {
+        self.completion_control = Some(control);
+        Ok(())
+    }
+
     fn default_temperature(&self) -> f64 {
         TEMPERATURE_DEFAULT
     }
@@ -2246,7 +2276,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         let mut request = self
-            .http_client()
+            .http_client()?
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -2260,10 +2290,16 @@ impl ModelProvider for AnthropicModelProvider {
 
         observe_response(&mut observation, &response);
         if !response.status().is_success() {
-            return Err(super::api_error("Anthropic", response).await);
+            return Err(crate::completion_control::api_error(
+                "Anthropic",
+                response,
+                self.completion_control,
+            )
+            .await);
         }
 
-        let chat_response: NativeChatResponse = response.json().await?;
+        let chat_response: NativeChatResponse =
+            crate::completion_control::json(response, self.completion_control).await?;
         let parsed = Self::parse_native_response(chat_response);
         parsed.text.ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -2366,7 +2402,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         let req = self
-            .http_client()
+            .http_client()?
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -2380,10 +2416,16 @@ impl ModelProvider for AnthropicModelProvider {
         let response = req.send().await?;
         observe_response(&mut observation, &response);
         if !response.status().is_success() {
-            return Err(super::api_error("Anthropic", response).await);
+            return Err(crate::completion_control::api_error(
+                "Anthropic",
+                response,
+                self.completion_control,
+            )
+            .await);
         }
 
-        let native_response: NativeChatResponse = response.json().await?;
+        let native_response: NativeChatResponse =
+            crate::completion_control::json(response, self.completion_control).await?;
         Ok(Self::parse_native_response(native_response))
     }
 
@@ -2459,7 +2501,7 @@ impl ModelProvider for AnthropicModelProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(credential) = self.credential.as_ref() {
             let mut request = self
-                .http_client()
+                .http_client()?
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("anthropic-version", "2023-06-01");
             request = self.apply_auth(request, credential);
@@ -2578,12 +2620,21 @@ impl ModelProvider for AnthropicModelProvider {
                     .boxed();
             }
         };
-        let client = self.streaming_http_client();
+        let client = match self.streaming_http_client() {
+            Ok(client) => client,
+            Err(error) => {
+                return stream::once(
+                    async move { Err(StreamError::ModelProvider(error.to_string())) },
+                )
+                .boxed();
+            }
+        };
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
         let extra_headers = self.extra_headers.clone();
         let response_observer = self.response_observer.clone();
         let emit_tool_input_liveness = self.eager_input_streaming;
+        let completion_control = self.completion_control;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -2632,10 +2683,11 @@ impl ModelProvider for AnthropicModelProvider {
             observe_response(&mut observation, &response);
             if !response.status().is_success() {
                 let status = response.status();
-                let error = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                let error =
+                    match crate::completion_control::text(response, completion_control).await {
+                        Ok(body) => body,
+                        Err(error) => error.to_string(),
+                    };
                 let _ = tx
                     .send(Err(StreamError::ModelProvider(format!(
                         "{status}: {error}"
@@ -3547,6 +3599,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .apply_auth(
                 model_provider
                     .http_client()
+                    .unwrap()
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-oat01-test-token",
             )
@@ -3584,6 +3637,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .apply_auth(
                 model_provider
                     .http_client()
+                    .unwrap()
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-api-key",
             )
@@ -4950,6 +5004,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // Create model_provider pointing at mock server
         let model_provider = AnthropicModelProvider {
+            completion_control: None,
             alias: "test".to_string(),
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),

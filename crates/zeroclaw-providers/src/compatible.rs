@@ -2870,6 +2870,15 @@ impl OpenAiCompatibleModelProvider {
 
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleModelProvider {
+    fn configure_completion(
+        &mut self,
+        control: zeroclaw_api::model_provider::CompletionControl,
+    ) -> Result<(), zeroclaw_api::model_provider::ProviderCapabilityError> {
+        self.completion_body_limit = Some(control.maximum_body_bytes());
+        self.allow_completion_fallbacks = false;
+        Ok(())
+    }
+
     fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
         zeroclaw_api::model_provider::ProviderCapabilities {
             native_tool_calling: self.native_tool_calling,
@@ -3695,8 +3704,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             observe_response(&mut observation, &response);
             if !response.status().is_success() {
                 let status = response.status();
-                let error = match response.text().await {
+                let error = match provider.completion_text(response).await {
                     Ok(text) => text,
+                    Err(error) if provider.completion_body_limit.is_some() => error.to_string(),
                     Err(_) => format!("HTTP error: {}", status),
                 };
                 let _ = tx
@@ -3884,8 +3894,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             observe_response(&mut observation, &response);
             if !response.status().is_success() {
                 let status = response.status();
-                let error = match response.text().await {
+                let error = match provider.completion_text(response).await {
                     Ok(e) => e,
+                    Err(error) if provider.completion_body_limit.is_some() => error.to_string(),
                     Err(_) => format!("HTTP error: {}", status),
                 };
                 let _ = tx
@@ -4033,8 +4044,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             observe_response(&mut observation, &response);
             if !response.status().is_success() {
                 let status = response.status();
-                let error = match response.text().await {
+                let error = match provider.completion_text(response).await {
                     Ok(e) => e,
+                    Err(error) if provider.completion_body_limit.is_some() => error.to_string(),
                     Err(_) => format!("HTTP error: {}", status),
                 };
                 let _ = tx

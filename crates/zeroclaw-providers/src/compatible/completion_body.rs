@@ -1,12 +1,7 @@
 use super::OpenAiCompatibleModelProvider;
+pub use crate::completion_control::CompletionBodyLimitExceeded;
+use crate::completion_control::read_bounded;
 use anyhow::Context;
-use std::num::NonZeroUsize;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("compatible completion response exceeded decoded body limit ({maximum} bytes)")]
-pub struct CompletionBodyLimitExceeded {
-    pub maximum: usize,
-}
 
 impl OpenAiCompatibleModelProvider {
     pub(super) async fn completion_text(
@@ -55,68 +50,5 @@ impl OpenAiCompatibleModelProvider {
             self.name,
             super::super::sanitize_api_error(text)
         ))
-    }
-}
-
-async fn read_bounded(
-    mut response: reqwest::Response,
-    limit: NonZeroUsize,
-) -> anyhow::Result<Vec<u8>> {
-    let maximum = limit.get();
-    if response
-        .content_length()
-        .is_some_and(|length| length > maximum as u64)
-    {
-        return Err(CompletionBodyLimitExceeded { maximum }.into());
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("read bounded compatible completion chunk")?
-    {
-        append_bounded(&mut body, &chunk, maximum)?;
-    }
-    Ok(body)
-}
-
-fn append_bounded(
-    body: &mut Vec<u8>,
-    chunk: &[u8],
-    maximum: usize,
-) -> Result<(), CompletionBodyLimitExceeded> {
-    if chunk.len() > maximum.saturating_sub(body.len()) {
-        return Err(CompletionBodyLimitExceeded { maximum });
-    }
-    body.extend_from_slice(chunk);
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exact_boundary_is_kept_without_truncation() {
-        let mut body = vec![1, 2];
-        append_bounded(&mut body, &[3, 4], 4).unwrap();
-        assert_eq!(body, vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn one_byte_over_limit_does_not_extend_the_buffer() {
-        let mut body = vec![1, 2];
-        assert_eq!(
-            append_bounded(&mut body, &[3, 4, 5], 4),
-            Err(CompletionBodyLimitExceeded { maximum: 4 })
-        );
-        assert_eq!(body, vec![1, 2]);
-    }
-
-    #[test]
-    fn empty_chunks_do_not_spend_capacity() {
-        let mut body = vec![1];
-        append_bounded(&mut body, &[], 1).unwrap();
-        assert_eq!(body, vec![1]);
     }
 }
