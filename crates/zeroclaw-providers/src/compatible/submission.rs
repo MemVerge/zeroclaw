@@ -174,7 +174,7 @@ impl OpenAiCompatibleModelProvider {
         &self,
         mode: SubmissionMode,
     ) -> Result<Client, SubmissionDenied> {
-        if self.submission_authorizer.is_none() {
+        if self.submission_authorizer.is_none() && self.allow_completion_fallbacks {
             return Ok(match mode {
                 SubmissionMode::Complete => self.http_client(),
                 SubmissionMode::Stream => self.streaming_http_client(),

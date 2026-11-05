@@ -450,6 +450,29 @@ pub struct ProviderCapabilityError {
     pub message: String,
 }
 
+/// Opt-in controls for a freshly owned provider, before decorators or sharing.
+/// Complete responses and HTTP error bodies are bounded in decoded bytes;
+/// successful SSE is not capped. Provider-internal completion fallbacks are
+/// disabled, while caller-owned retries remain the caller's responsibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompletionControl {
+    maximum_body_bytes: std::num::NonZeroUsize,
+}
+
+impl CompletionControl {
+    pub fn bounded_single_call(maximum_body_bytes: std::num::NonZeroUsize) -> Self {
+        Self { maximum_body_bytes }
+    }
+
+    pub fn maximum_body_bytes(self) -> std::num::NonZeroUsize {
+        self.maximum_body_bytes
+    }
+}
+
+#[cfg(test)]
+#[path = "model_provider/completion_tests.rs"]
+mod completion_tests;
+
 /// ModelProvider capabilities declaration.
 /// Describes what features a model_provider supports, enabling intelligent
 /// adaptation of tool calling modes and request formatting.
@@ -535,6 +558,19 @@ pub struct ModelInfo {
 
 #[async_trait]
 pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
+    /// Install controls without changing the selected route or request schema.
+    /// Unsupported adapters reject the request before any network activity.
+    fn configure_completion(
+        &mut self,
+        _control: CompletionControl,
+    ) -> Result<(), ProviderCapabilityError> {
+        Err(ProviderCapabilityError {
+            model_provider: self.alias().to_owned(),
+            capability: "bounded_single_completion".to_owned(),
+            message: "completion control is not implemented by this adapter".to_owned(),
+        })
+    }
+
     /// Query model_provider capabilities.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()

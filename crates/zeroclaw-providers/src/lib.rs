@@ -7,6 +7,8 @@ pub mod azure_openai;
 pub mod bedrock;
 pub mod catalog;
 pub mod compatible;
+mod completion_control;
+pub use completion_control::CompletionBodyLimitExceeded;
 pub mod copilot;
 pub mod dispatch;
 pub(crate) mod extra_headers;

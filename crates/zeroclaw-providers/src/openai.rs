@@ -20,7 +20,7 @@ use futures_util::stream;
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use zeroclaw_api::model_provider::MessageContentSource;
+use zeroclaw_api::model_provider::{CompletionControl, MessageContentSource};
 use zeroclaw_api::tool::ToolSpec;
 
 /// OpenAI's public API endpoint.
@@ -38,6 +38,7 @@ const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub struct OpenAiModelProvider {
+    completion_control: Option<CompletionControl>,
     /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
     base_url: String,
@@ -316,6 +317,7 @@ impl OpenAiBuilder {
 
     pub fn build(self) -> OpenAiModelProvider {
         OpenAiModelProvider {
+            completion_control: None,
             alias: self.alias,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
             credential: self.credential,
@@ -546,7 +548,7 @@ impl OpenAiModelProvider {
                 self.request_hooks(),
                 crate::extra_headers::ReservedHeaders::OPENAI,
                 &[],
-                self.http_client()
+                self.http_client()?
                     .post(format!("{}/chat/completions", self.base_url))
                     .header("Authorization", format!("Bearer {credential}")),
                 &request,
@@ -564,10 +566,16 @@ impl OpenAiModelProvider {
 
         observe_response(&mut observation, &response);
         if !response.status().is_success() {
-            return Err(super::api_error("OpenAI", response).await);
+            return Err(crate::completion_control::api_error(
+                "OpenAI",
+                response,
+                self.completion_control,
+            )
+            .await);
         }
 
-        let chat_response: ChatResponse = response.json().await?;
+        let chat_response: ChatResponse =
+            crate::completion_control::json(response, self.completion_control).await?;
 
         chat_response
             .choices
@@ -585,17 +593,35 @@ impl OpenAiModelProvider {
             })
     }
 
-    fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "model_provider.openai",
-            self.timeout_secs,
-            10,
+    fn http_client(&self) -> anyhow::Result<Client> {
+        if self.completion_control.is_some() {
+            return crate::completion_control::client(
+                Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .timeout(std::time::Duration::from_secs(self.timeout_secs)),
+                "model_provider.openai",
+            );
+        }
+        Ok(
+            zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+                "model_provider.openai",
+                self.timeout_secs,
+                10,
+            ),
         )
     }
 }
 
 #[async_trait]
 impl ModelProvider for OpenAiModelProvider {
+    fn configure_completion(
+        &mut self,
+        control: CompletionControl,
+    ) -> Result<(), crate::traits::ProviderCapabilityError> {
+        self.completion_control = Some(control);
+        Ok(())
+    }
+
     // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
         Some(BASE_URL)
@@ -714,7 +740,7 @@ impl ModelProvider for OpenAiModelProvider {
                 self.request_hooks(),
                 crate::extra_headers::ReservedHeaders::OPENAI,
                 &[],
-                self.http_client()
+                self.http_client()?
                     .post(format!("{}/chat/completions", self.base_url))
                     .header("Authorization", format!("Bearer {credential}")),
                 &native_request,
@@ -732,10 +758,16 @@ impl ModelProvider for OpenAiModelProvider {
 
         observe_response(&mut observation, &response);
         if !response.status().is_success() {
-            return Err(super::api_error("OpenAI", response).await);
+            return Err(crate::completion_control::api_error(
+                "OpenAI",
+                response,
+                self.completion_control,
+            )
+            .await);
         }
 
-        let native_response: NativeChatResponse = response.json().await?;
+        let native_response: NativeChatResponse =
+            crate::completion_control::json(response, self.completion_control).await?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -815,7 +847,7 @@ impl ModelProvider for OpenAiModelProvider {
                 self.request_hooks(),
                 crate::extra_headers::ReservedHeaders::OPENAI,
                 &[],
-                self.http_client()
+                self.http_client()?
                     .post(format!("{}/chat/completions", self.base_url))
                     .header("Authorization", format!("Bearer {credential}")),
                 &native_request,
@@ -833,10 +865,16 @@ impl ModelProvider for OpenAiModelProvider {
 
         observe_response(&mut observation, &response);
         if !response.status().is_success() {
-            return Err(super::api_error("OpenAI", response).await);
+            return Err(crate::completion_control::api_error(
+                "OpenAI",
+                response,
+                self.completion_control,
+            )
+            .await);
         }
 
-        let native_response: NativeChatResponse = response.json().await?;
+        let native_response: NativeChatResponse =
+            crate::completion_control::json(response, self.completion_control).await?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -864,7 +902,7 @@ impl ModelProvider for OpenAiModelProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(credential) = self.credential.as_ref() {
             crate::extra_headers::apply_extra_headers(
-                self.http_client()
+                self.http_client()?
                     .get(format!("{}/models", self.base_url))
                     .header("Authorization", format!("Bearer {credential}")),
                 &self.extra_headers,
@@ -1014,12 +1052,22 @@ fn prepare_stream_chunk(chunk: &StreamChunk, count_tokens: bool) -> StreamChunk 
     }
 }
 
+pub(crate) struct ResponsesStreamOptions {
+    pub count_tokens: bool,
+    pub response_observer: Option<ResponseMetadataObserver>,
+    pub completion_control: Option<CompletionControl>,
+}
+
 pub(crate) async fn run_responses_sse(
     request_builder: reqwest::RequestBuilder,
     tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
-    count_tokens: bool,
-    response_observer: Option<ResponseMetadataObserver>,
+    options: ResponsesStreamOptions,
 ) {
+    let ResponsesStreamOptions {
+        count_tokens,
+        response_observer,
+        completion_control,
+    } = options;
     let mut observation = begin_request(&response_observer);
     let http_response = match request_builder.send().await {
         Ok(r) => r,
@@ -1033,13 +1081,10 @@ pub(crate) async fn run_responses_sse(
 
     observe_response(&mut observation, &http_response);
     if !http_response.status().is_success() {
-        let status = http_response.status();
-        let body = http_response.text().await.unwrap_or_default();
-        let sanitized = super::sanitize_api_error(&body);
+        let error =
+            crate::completion_control::api_error("OpenAI", http_response, completion_control).await;
         let _ = tx
-            .send(Err(StreamError::ModelProvider(format!(
-                "OpenAI API error ({status}): {sanitized}"
-            ))))
+            .send(Err(StreamError::ModelProvider(error.to_string())))
             .await;
         return;
     }
@@ -1142,6 +1187,7 @@ fn responses_finish_stop(state: &ResponsesStreamState) -> Option<zeroclaw_api::S
 }
 
 pub struct OpenAiResponsesModelProvider {
+    completion_control: Option<CompletionControl>,
     alias: String,
     responses_url: String,
     credential: Option<String>,
@@ -1164,8 +1210,8 @@ pub struct OpenAiResponsesModelProvider {
 /// not already present so callers can pass either shape. Every runtime
 /// override (`timeout_secs` / `max_tokens` / `reasoning_effort` / `store` /
 /// `extra_headers`) is set via a chain method on this builder before
-/// [`Self::build`] — the built provider itself has no post-construction
-/// mutators.
+/// [`Self::build`]. Shared completion controls may be installed through the
+/// provider trait before wrapping or sharing the instance.
 #[must_use]
 pub struct OpenAiResponsesBuilder {
     alias: String,
@@ -1255,6 +1301,7 @@ impl OpenAiResponsesBuilder {
             })
             .unwrap_or_else(|| RESPONSES_URL.to_string());
         OpenAiResponsesModelProvider {
+            completion_control: None,
             alias: self.alias,
             responses_url,
             credential: self.credential,
@@ -1329,19 +1376,39 @@ impl OpenAiResponsesModelProvider {
         .collect()
     }
 
-    fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "model_provider.openai",
-            self.timeout_secs,
-            10,
+    fn http_client(&self) -> anyhow::Result<Client> {
+        if self.completion_control.is_some() {
+            return crate::completion_control::client(
+                Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .timeout(std::time::Duration::from_secs(self.timeout_secs)),
+                "model_provider.openai",
+            );
+        }
+        Ok(
+            zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+                "model_provider.openai",
+                self.timeout_secs,
+                10,
+            ),
         )
     }
 
-    fn streaming_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_streaming_client_with_read_timeout(
-            "model_provider.openai",
-            10,
-            STREAM_IDLE_TIMEOUT.as_secs(),
+    fn streaming_client(&self) -> anyhow::Result<Client> {
+        if self.completion_control.is_some() {
+            return crate::completion_control::client(
+                Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .read_timeout(STREAM_IDLE_TIMEOUT),
+                "model_provider.openai",
+            );
+        }
+        Ok(
+            zeroclaw_config::schema::build_runtime_proxy_streaming_client_with_read_timeout(
+                "model_provider.openai",
+                10,
+                STREAM_IDLE_TIMEOUT.as_secs(),
+            ),
         )
     }
 
@@ -1352,6 +1419,14 @@ impl OpenAiResponsesModelProvider {
 
 #[async_trait]
 impl ModelProvider for OpenAiResponsesModelProvider {
+    fn configure_completion(
+        &mut self,
+        control: CompletionControl,
+    ) -> Result<(), crate::traits::ProviderCapabilityError> {
+        self.completion_control = Some(control);
+        Ok(())
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
@@ -1408,16 +1483,22 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let req = self.build_request(instructions, input, None, model, temperature, false);
         let mut observation = begin_request(&self.response_observer);
         let response = self
-            .apply_extra_headers(self.http_client().post(&self.responses_url))
+            .apply_extra_headers(self.http_client()?.post(&self.responses_url))
             .header("Authorization", format!("Bearer {credential}"))
             .json(&req)
             .send()
             .await?;
         observe_response(&mut observation, &response);
         if !response.status().is_success() {
-            return Err(super::api_error("OpenAI", response).await);
+            return Err(crate::completion_control::api_error(
+                "OpenAI",
+                response,
+                self.completion_control,
+            )
+            .await);
         }
-        let body: ResponsesApiBody = response.json().await?;
+        let body: ResponsesApiBody =
+            crate::completion_control::json(response, self.completion_control).await?;
         extract_responses_api_text(&body)
             .ok_or_else(|| anyhow::Error::msg("No response from OpenAI"))
     }
@@ -1459,16 +1540,22 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         }
         let mut observation = begin_request(&self.response_observer);
         let response = self
-            .apply_extra_headers(self.http_client().post(&self.responses_url))
+            .apply_extra_headers(self.http_client()?.post(&self.responses_url))
             .header("Authorization", format!("Bearer {credential}"))
             .json(&req)
             .send()
             .await?;
         observe_response(&mut observation, &response);
         if !response.status().is_success() {
-            return Err(super::api_error("OpenAI", response).await);
+            return Err(crate::completion_control::api_error(
+                "OpenAI",
+                response,
+                self.completion_control,
+            )
+            .await);
         }
-        let body: ResponsesApiBody = response.json().await?;
+        let body: ResponsesApiBody =
+            crate::completion_control::json(response, self.completion_control).await?;
         Ok(ProviderChatResponse {
             text: extract_responses_api_text(&body),
             tool_calls: extract_responses_api_tool_calls(&body),
@@ -1504,10 +1591,19 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
         let store = self.store;
-        let client = self.streaming_client();
+        let client = match self.streaming_client() {
+            Ok(client) => client,
+            Err(error) => {
+                return stream::once(
+                    async move { Err(StreamError::ModelProvider(error.to_string())) },
+                )
+                .boxed();
+            }
+        };
         let extra_headers = self.build_streaming_headers();
         let response_observer = self.response_observer.clone();
         let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
+        let completion_control = self.completion_control;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
         let handle = ::zeroclaw_spawn::spawn!(async move {
@@ -1559,7 +1655,16 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 .header("Accept", "text/event-stream")
                 .json(&req);
 
-            run_responses_sse(request_builder, &tx, count_tokens, response_observer).await;
+            run_responses_sse(
+                request_builder,
+                &tx,
+                ResponsesStreamOptions {
+                    count_tokens,
+                    response_observer,
+                    completion_control,
+                },
+            )
+            .await;
         });
 
         let guard = AbortOnDrop::new(handle.abort_handle());
