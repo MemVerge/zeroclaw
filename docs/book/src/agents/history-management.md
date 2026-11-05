@@ -49,6 +49,14 @@ between tool-loop iterations, including reactively when a provider reports that
 the context window was exceeded. It retains whole turns, so it never splits a
 tool exchange.
 
+Embedders that own provider-context projection can select
+`LoopKnobs::context_overflow_behavior = ContextOverflowBehavior::FailClosed`
+for the shared tool loop. A provider overflow then returns the original error
+without discarding whole turns or retrying a smaller history. The default is
+`DropOldestTurns`, preserving existing recovery. This code-only caller policy
+does not disable separate outer-loop or structured `Agent` history limits and
+does not add a config-file, CLI or provider setting.
+
 ## Structured message-count limit
 
 `max_history_messages` is the configured value in the agent's runtime profile.

@@ -957,18 +957,18 @@ async fn agent_turn_with_sop_reassembly(
 // file per step (run sheet in agent/turn/mod.rs). `crate::agent::loop_`
 // stays the canonical public path via these re-exports.
 pub(crate) use super::turn::StreamCancelledAfterOutput;
+pub use super::turn::{
+    ContextOverflowBehavior, DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback,
+    ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ResolvedAgentExecution, ResolvedIo,
+    ResolvedModelAccess, ResolvedRuntimeKnobs, SopStepReassembly, StreamDelta,
+    StreamFailureBehavior, ToolLoop, ToolLoopCancelled, drain_steering_messages,
+    is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
+};
 #[cfg(test)]
 pub(crate) use super::turn::{
     DEFAULT_MAX_TOOL_ITERATIONS, MAX_MALFORMED_TOOL_PROTOCOL_RETRIES,
     build_native_assistant_history, consume_provider_streaming_response,
     maybe_inject_channel_delivery_defaults, resolve_display_text,
-};
-pub use super::turn::{
-    DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
-    PROGRESS_MIN_INTERVAL_MS, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
-    ResolvedRuntimeKnobs, SopStepReassembly, StreamDelta, StreamFailureBehavior, ToolLoop,
-    ToolLoopCancelled, drain_steering_messages, is_model_switch_requested, is_tool_loop_cancelled,
-    run_tool_call_loop, scrub_credentials,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows

@@ -26,7 +26,9 @@ pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
 pub(crate) use context::{TurnCtx, TurnMeta};
-pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
+pub(crate) use context_recovery::{
+    ContextRecoveryInput, record_llm_failure, try_recover_context_overflow,
+};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
@@ -34,7 +36,7 @@ pub use execution::{
     ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
 };
 pub(crate) use history_window::preflight_history_maintenance;
-pub use knobs::{LoopKnobs, MaxIterationBehavior, StreamFailureBehavior};
+pub use knobs::{ContextOverflowBehavior, LoopKnobs, MaxIterationBehavior, StreamFailureBehavior};
 use max_iter::GracefulFinishInput;
 pub(crate) use max_iter::{finish_after_max_iterations, requested_graceful_stop};
 pub(crate) use outcome::StreamCancelledAfterOutput;
@@ -815,14 +817,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
             Err(e) => {
                 record_llm_failure(&ctx, llm_started_at, iteration, &e);
-                let recovered = try_recover_context_overflow(
-                    turn_state.history,
-                    &e,
+                let recovered = try_recover_context_overflow(ContextRecoveryInput {
+                    history: turn_state.history,
+                    error: &e,
                     iteration,
-                    event_tx.as_ref(),
+                    event_tx: event_tx.as_ref(),
                     observer,
                     context_token_budget,
-                )
+                    behavior: knobs.context_overflow_behavior,
+                })
                 .await;
                 if recovered {
                     continue;
