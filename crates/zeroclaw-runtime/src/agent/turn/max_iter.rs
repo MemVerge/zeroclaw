@@ -1,6 +1,6 @@
-//! The max-iteration / host-requested exit: ask the LLM for a tools-free
-//! final summary (with step timeout + cancel select) and return it appended
-//! to the accumulated display text, or bail.
+//! The max-iteration / host-requested exit: one tools-free completion from
+//! the original conversation. A caller-supplied wrap-up is appended only when
+//! present. The model text is kept whole.
 
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
@@ -13,9 +13,6 @@ use zeroclaw_api::GracefulStopReason;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::{ChatMessage, ChatResponse, ModelProvider};
-
-/// ~8k tokens of latin text; truncates pathological finalizer dumps.
-const FINALIZER_OUTPUT_CHAR_CAP: usize = 32_000;
 
 pub(crate) struct GracefulFinishInput<'a> {
     pub model_provider: &'a dyn ModelProvider,
@@ -31,6 +28,8 @@ pub(crate) struct GracefulFinishInput<'a> {
     pub knobs: &'a LoopKnobs,
     pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
     pub reason: GracefulStopReason,
+    /// Caller-owned completion instruction. `None` leaves the task unchanged.
+    pub wrap_up_instruction: Option<String>,
     pub event_tx: Option<&'a Sender<TurnEvent>>,
 }
 
@@ -39,6 +38,17 @@ pub(crate) fn requested_graceful_stop() -> Option<GracefulStopReason> {
         .try_with(|slot| slot.as_ref().and_then(|signal| signal.requested()))
         .ok()
         .flatten()
+}
+
+pub(crate) fn requested_wrap_up_instruction() -> Option<String> {
+    zeroclaw_api::GRACEFUL_STOP
+        .try_with(|slot| {
+            slot.as_ref()
+                .and_then(|signal| signal.wrap_up_instruction())
+        })
+        .ok()
+        .flatten()
+        .filter(|instruction| !instruction.trim().is_empty())
 }
 
 pub(crate) async fn finish_after_max_iterations(
@@ -58,24 +68,23 @@ pub(crate) async fn finish_after_max_iterations(
     }
     log_finalizer_start(&input);
     sanitize_orphaned_tool_history(input.history);
-    let prompt = ChatMessage::user(finalizer_prompt(input.reason));
-    let prompt_mirror = prompt.clone();
-    input.history.push(prompt);
+    let prompt_mirror = push_wrap_up(input.history, input.wrap_up_instruction.take());
+    let pushed = prompt_mirror.is_some();
     match await_finalizer_response(&input).await {
         SummaryCall::Cancelled => {
-            input.history.pop();
+            pop_wrap_up(input.history, pushed);
             Err(ToolLoopCancelled.into())
         }
         SummaryCall::TimedOut(step_secs) => {
-            input.history.pop();
+            pop_wrap_up(input.history, pushed);
             anyhow::bail!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)")
         }
         SummaryCall::Done(result) => {
             // `biased select!` does not re-check cancel if `chat()` cancelled
             // the token during its own poll and then returned Ready.
-            abort_if_cancelled(input.cancellation_token, input.history)?;
+            abort_if_cancelled(input.cancellation_token, input.history, pushed)?;
             match result {
-                Err(error) => fail_finalizer_provider_error(&mut input, error),
+                Err(error) => fail_finalizer_provider_error(&mut input, error, pushed),
                 Ok(resp) => commit_finalizer_response(input, prompt_mirror, resp).await,
             }
         }
@@ -85,9 +94,10 @@ pub(crate) async fn finish_after_max_iterations(
 fn abort_if_cancelled(
     token: Option<&CancellationToken>,
     history: &mut Vec<ChatMessage>,
+    pushed_wrap_up: bool,
 ) -> Result<()> {
     if token.is_some_and(CancellationToken::is_cancelled) {
-        history.pop();
+        pop_wrap_up(history, pushed_wrap_up);
         return Err(ToolLoopCancelled.into());
     }
     Ok(())
@@ -146,6 +156,22 @@ fn log_finalizer_start(input: &GracefulFinishInput<'_>) {
     }
 }
 
+fn push_wrap_up(
+    history: &mut Vec<ChatMessage>,
+    instruction: Option<String>,
+) -> Option<ChatMessage> {
+    let text = instruction.filter(|value| !value.trim().is_empty())?;
+    let prompt = ChatMessage::user(text);
+    history.push(prompt.clone());
+    Some(prompt)
+}
+
+fn pop_wrap_up(history: &mut Vec<ChatMessage>, pushed: bool) {
+    if pushed {
+        history.pop();
+    }
+}
+
 fn sanitize_orphaned_tool_history(history: &mut Vec<ChatMessage>) {
     let tool_calls_stripped =
         crate::agent::history_pruner::strip_orphaned_tool_calls_from_assistants(history);
@@ -164,17 +190,6 @@ fn sanitize_orphaned_tool_history(history: &mut Vec<ChatMessage>) {
             })),
         "Sanitised orphaned tool_use/tool_result pairing before graceful shutdown"
     );
-}
-
-fn finalizer_prompt(reason: GracefulStopReason) -> String {
-    match reason {
-        GracefulStopReason::MaxIterations => {
-            crate::i18n::get_required_cli_string("turn-max-iterations-finalizer-prompt")
-        }
-        GracefulStopReason::NoProgress => {
-            crate::i18n::get_required_cli_string("turn-no-progress-finalizer-prompt")
-        }
-    }
 }
 
 enum SummaryCall {
@@ -258,8 +273,9 @@ fn is_budget_exceeded(error: &anyhow::Error) -> bool {
 fn fail_finalizer_provider_error(
     input: &mut GracefulFinishInput<'_>,
     error: anyhow::Error,
+    pushed_wrap_up: bool,
 ) -> Result<String> {
-    input.history.pop();
+    pop_wrap_up(input.history, pushed_wrap_up);
     if is_budget_exceeded(&error) {
         return Err(error);
     }
@@ -302,59 +318,39 @@ fn finalizer_text_is_usable(knobs: &LoopKnobs, resp: &ChatResponse) -> bool {
     true
 }
 
-fn cap_finalizer_text(text: String) -> String {
-    if text.chars().count() <= FINALIZER_OUTPUT_CHAR_CAP {
-        return text;
-    }
-    let mut capped: String = text.chars().take(FINALIZER_OUTPUT_CHAR_CAP).collect();
-    capped.push('…');
-    capped
-}
-
 async fn commit_finalizer_response(
-    input: GracefulFinishInput<'_>,
-    prompt_mirror: ChatMessage,
+    mut input: GracefulFinishInput<'_>,
+    prompt_mirror: Option<ChatMessage>,
     resp: ChatResponse,
 ) -> Result<String> {
     if !finalizer_text_is_usable(input.knobs, &resp) {
-        input.history.pop();
+        pop_wrap_up(input.history, prompt_mirror.is_some());
         anyhow::bail!(
             "{}",
             finalizer_failure_message(input.reason, input.max_iterations)
         );
     }
-    let text = cap_finalizer_text(resp.text.unwrap_or_default());
-    let summary_msg = ChatMessage::assistant(text.clone());
-    if let Some(out) = input.new_messages_out {
-        out.push(prompt_mirror);
-        out.push(summary_msg.clone());
-    }
-    input.history.push(summary_msg);
+    let text = resp.text.unwrap_or_default();
+    remember_finalizer_text(&mut input, prompt_mirror, &text);
     super::events::emit_posthoc_turn_chunk(input.event_tx, &text).await;
-    Ok(compose_finalizer_display(
-        input.accumulated_display_text,
-        &text,
-        input.reason,
-        input.max_iterations,
-    ))
+    let mut display = input.accumulated_display_text;
+    display.push_str(&text);
+    Ok(display)
 }
 
-fn compose_finalizer_display(
-    mut accumulated: String,
+fn remember_finalizer_text(
+    input: &mut GracefulFinishInput<'_>,
+    prompt_mirror: Option<ChatMessage>,
     text: &str,
-    reason: GracefulStopReason,
-    max_iterations: usize,
-) -> String {
-    accumulated.push_str(text);
-    if reason != GracefulStopReason::MaxIterations {
-        return accumulated;
+) {
+    let summary = ChatMessage::assistant(text.to_string());
+    if let Some(out) = input.new_messages_out.as_mut() {
+        if let Some(prompt) = prompt_mirror {
+            out.push(prompt);
+        }
+        out.push(summary.clone());
     }
-    accumulated.push_str("\n\n");
-    accumulated.push_str(&crate::i18n::get_required_cli_string_with_args(
-        "turn-max-iterations-reached",
-        &[("max_iterations", &max_iterations.to_string())],
-    ));
-    accumulated
+    input.history.push(summary);
 }
 
 #[cfg(test)]
@@ -437,6 +433,7 @@ mod graceful_summary_metering_tests {
             knobs: &knobs,
             new_messages_out: None,
             reason: GracefulStopReason::MaxIterations,
+            wrap_up_instruction: None,
             event_tx: None,
         })
         .await
@@ -460,13 +457,9 @@ mod graceful_summary_metering_tests {
             .expect("graceful summary should succeed");
 
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
-        // The returned display text must carry both the summary and the visible
-        // stop reason — deleting the stop-reason append would leave this green
-        // on `wrap-up summary` alone, so the stop-reason assertion pins the
-        // user-observed contract.
         assert!(
-            out.contains("Turn stopped: reached maximum tool iterations (2)"),
-            "stop reason with iteration count must reach returned output: {out}"
+            !out.contains("Turn stopped"),
+            "the stop notice must stay off the model result: {out}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "provider called once");
         let recorded = *turn_usage.lock();
@@ -609,6 +602,7 @@ mod graceful_summary_metering_tests {
             knobs: &knobs,
             new_messages_out: None,
             reason: GracefulStopReason::MaxIterations,
+            wrap_up_instruction: None,
             event_tx: None,
         })
         .await
@@ -686,6 +680,15 @@ mod graceful_summary_metering_tests {
         reason: GracefulStopReason,
         cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> anyhow::Result<String> {
+        run_with_instruction(provider, reason, cancel, None).await
+    }
+
+    async fn run_with_instruction(
+        provider: &ScriptedProvider,
+        reason: GracefulStopReason,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        instruction: Option<&str>,
+    ) -> anyhow::Result<String> {
         let mut history = vec![ChatMessage::user("do the work")];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -703,13 +706,39 @@ mod graceful_summary_metering_tests {
             knobs: &knobs,
             new_messages_out: None,
             reason,
+            wrap_up_instruction: instruction.map(str::to_string),
             event_tx: None,
         })
         .await
     }
 
     #[tokio::test]
-    async fn no_progress_finalizer_uses_prompt_and_tools_none() {
+    async fn supplied_wrap_up_is_sent_and_long_text_is_kept() {
+        let document = format!("{}]STRUCTURED-END", "测".repeat(32_000));
+        let provider = ScriptedProvider {
+            text: Some(document.clone()),
+            tool_calls: Vec::new(),
+            seen_tools_none: Arc::new(AtomicBool::new(false)),
+            seen_prompt: Arc::new(std::sync::Mutex::new(String::new())),
+        };
+        let prompt = Arc::clone(&provider.seen_prompt);
+        let out = run_with_instruction(
+            &provider,
+            GracefulStopReason::MaxIterations,
+            None,
+            Some("Answer from the gathered evidence."),
+        )
+        .await
+        .expect("supplied wrap-up should still return the model text");
+        assert_eq!(out, document);
+        assert_eq!(
+            prompt.lock().unwrap().as_str(),
+            "Answer from the gathered evidence."
+        );
+    }
+
+    #[tokio::test]
+    async fn no_progress_finalizer_keeps_the_task_and_uses_tools_none() {
         let provider = ScriptedProvider {
             text: Some("here is the answer".to_string()),
             tool_calls: Vec::new(),
@@ -728,9 +757,9 @@ mod graceful_summary_metering_tests {
         );
         assert!(tools_none.load(Ordering::SeqCst));
         let prompt = prompt.lock().unwrap().clone();
-        assert!(
-            prompt.contains("repeated searches") || prompt.contains("evidence already gathered"),
-            "expected no-progress prompt, got: {prompt}"
+        assert_eq!(
+            prompt, "do the work",
+            "finalizer must not invent a wrap-up instruction: {prompt}"
         );
     }
 
@@ -872,6 +901,7 @@ mod graceful_summary_metering_tests {
             knobs: &knobs,
             new_messages_out: None,
             reason: GracefulStopReason::NoProgress,
+            wrap_up_instruction: None,
             event_tx: None,
         })
         .await;
