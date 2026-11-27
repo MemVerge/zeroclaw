@@ -36,7 +36,10 @@ pub use execution::{
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior, StreamFailureBehavior};
 use max_iter::GracefulFinishInput;
-pub(crate) use max_iter::{finish_after_max_iterations, requested_graceful_stop};
+pub(crate) use max_iter::{
+    finish_after_max_iterations, record_loop_stop, requested_graceful_stop,
+    requested_wrap_up_instruction,
+};
 pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
@@ -1267,6 +1270,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let reason = graceful_reason
         .or_else(requested_graceful_stop)
         .unwrap_or(GracefulStopReason::MaxIterations);
+    record_loop_stop(reason);
     finish_after_max_iterations(GracefulFinishInput {
         model_provider,
         history: turn_state.history,
@@ -1281,6 +1285,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         knobs,
         new_messages_out: turn_state.canonical.as_deref_mut(),
         reason,
+        wrap_up_instruction: requested_wrap_up_instruction(),
         event_tx: event_tx.as_ref(),
     })
     .await
